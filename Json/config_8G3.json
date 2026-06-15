@@ -258,9 +258,9 @@
         "com.tencent.mf.uam",
         "com.tencent.nrc"
       ],
-      "freq_min_c0": "1200000",
+      "freq_min_c0": "537600",
       "freq_max_c0": "5000000",
-      "freq_min_c1": "1200000",
+      "freq_min_c1": "537600",
       "freq_max_c1": "5000000",
       "gpu_min_mhz": "160",
       "gpu_max_mhz": "1200",
@@ -275,9 +275,9 @@
         "Core7": "1"
       },
       "freq_max_c2": "5000000",
-      "freq_min_c2": "1200000",
+      "freq_min_c2": "537600",
       "freq_max_c3": "5000000",
-      "freq_min_c3": "1200000",
+      "freq_min_c3": "537600",
       "gov_c0": {
         "governor": ""
       },

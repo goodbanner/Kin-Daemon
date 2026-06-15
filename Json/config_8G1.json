@@ -267,9 +267,9 @@
         "com.tencent.tmgp.codev",
         "com.tencent.tmgp.nz"
       ],
-      "freq_min_c0": "1200000",
+      "freq_min_c0": "384000",
       "freq_max_c0": "5000000",
-      "freq_min_c1": "1200000",
+      "freq_min_c1": "537600",
       "freq_max_c1": "5000000",
       "gpu_min_mhz": "160",
       "gpu_max_mhz": "1200",
@@ -289,7 +289,7 @@
       "gov_c1": {
         "governor": "walt"
       },
-      "freq_min_c2": "1200000",
+      "freq_min_c2": "768000",
       "freq_max_c2": "5000000",
       "gov_c2": {
         "governor": "walt"
