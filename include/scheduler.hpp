@@ -845,15 +845,15 @@ public:
             if (mdl.isGame || mdl.keepAlive) heldPkg = pkg;
         }
 
-        // 无匹配/黑名单 → 应用省电模型(找不到则回落基础档)
+        // 无匹配/黑名单 → 跟随全局:优先用 perapp "*" 行(全局默认),没有再回落基础档。
+        // 不再强制省电;若用户想让无匹配/黑名单应用省电,设 perapp 全局行 "* powersave" 即可。
         int newMatch = matched;
-        bool toPowersave = false;
-        if (newMatch < 0) {
-            int ps = Config::AppProfile::findModelByName("powersave");
-            if (ps >= 0) { newMatch = ps; toPowersave = true; }
+        if (newMatch < 0 && !Config::AppProfile::perAppGlobal.empty()) {
+            int g = Config::AppProfile::findModelByName(Config::AppProfile::perAppGlobal.c_str());
+            if (g >= 0) newMatch = g;
         }
 
-        // 去重：与当前画像相同则跳过(进入游戏/省电的日志即在此打印一次)
+        // 去重：与当前画像相同则跳过(进入游戏/跟随全局的日志即在此打印一次)
         int oldMatch = Config::AppProfile::currentMatch.load();
         if (newMatch != oldMatch) {
             Config::AppProfile::currentMatch.store(newMatch);
@@ -861,9 +861,11 @@ public:
                 const auto& mdl = Config::AppProfile::Models[matched];
                 logger.Info("前台: %s → 档[%s]%s", pkg.c_str(), mdl.modelName.c_str(),
                             mdl.isGame ? (pushMode ? " (游戏)" : " (游戏, 保活至退出)") : "");
+            } else if (newMatch >= 0) {
+                logger.Info("前台: %s → 档[%s] (跟随全局, 无匹配/黑名单)",
+                            pkg.c_str(), Config::AppProfile::Models[newMatch].modelName.c_str());
             } else {
-                logger.Info("前台: %s → %s", pkg.c_str(),
-                            toPowersave ? "省电(无匹配/黑名单)" : "基础档(跟随全局)");
+                logger.Info("前台: %s → 基础档(跟随全局, 无匹配/黑名单)", pkg.c_str());
             }
             applyWithProfile();
         }
