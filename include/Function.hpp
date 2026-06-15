@@ -117,6 +117,54 @@ public:
         logger.Debug("Cpuset OK");
     }
 
+    // 读取 cpuset cpus 节点当前值到 out(去掉首尾空白/换行),成功返回 true。
+    bool readCpusValue(const char* path, char* out, size_t outsz) noexcept {
+        int fd = open(path, O_RDONLY);
+        if (fd < 0) return false;
+        char raw[64] = { 0 };
+        ssize_t n = read(fd, raw, sizeof(raw) - 1);
+        close(fd);
+        if (n <= 0) return false;
+        raw[n] = 0;
+        size_t a = 0;
+        while (raw[a] == ' ' || raw[a] == '\t' || raw[a] == '\n' || raw[a] == '\r') a++;
+        ssize_t b = n - 1;
+        while (b >= (ssize_t)a &&
+               (raw[b] == ' ' || raw[b] == '\t' || raw[b] == '\n' || raw[b] == '\r')) b--;
+        size_t len = (b >= (ssize_t)a) ? (size_t)(b - a + 1) : 0;
+        if (len == 0 || len >= outsz) return false;
+        memcpy(out, raw + a, len);
+        out[len] = 0;
+        return true;
+    }
+
+    // 游戏档 cpuset:仅当 0-7 组(top-app/foreground)当前被限到 0-5(丢大核)或 2-7(丢小核)
+    // 时才拉回 0-7;其它取值(含已是 0-7、或 ROM/其它工具自定义)一律不动,不抢占。
+    // 其余组(background 等不含大核)沿用配置整体下发,保持与基础一致。
+    void gameCpusetRestore() {
+        if (!Cpuset::enable) return;
+        struct { const char* node; const string_t& target; } full[] = {
+            { "/dev/cpuset/top-app/cpus",     Cpuset::top_app    },
+            { "/dev/cpuset/foreground/cpus",  Cpuset::foreground },
+        };
+        for (auto& it : full) {
+            char cur[64];
+            if (!readCpusValue(it.node, cur, sizeof(cur))) {
+                logger.Debug("游戏Cpuset %s: 读取失败,跳过", it.node);
+                continue;
+            }
+            if (strcmp(cur, "0-5") == 0 || strcmp(cur, "2-7") == 0) {
+                utils.FileWrite(it.node, it.target);
+                logger.Debug("游戏Cpuset %s: %s → %s (拉回全核)", it.node, cur, it.target.c_str());
+            } else {
+                logger.Debug("游戏Cpuset %s: 当前[%s] 非0-5/2-7,不拉回", it.node, cur);
+            }
+        }
+        utils.FileWrite("/dev/cpuset/background/cpus", Cpuset::background);
+        utils.FileWrite("/dev/cpuset/system-background/cpus", Cpuset::system_background);
+        utils.FileWrite("/dev/cpuset/restricted/cpus", Cpuset::restricted);
+    }
+
     bool writeSysfs(const char* path, const char* value, int valLen) {
         if (!path || !value || valLen <= 0) return false;
 

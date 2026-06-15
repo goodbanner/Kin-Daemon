@@ -263,12 +263,16 @@ public:
                 if (broughtOnline) {
                     for (int i = 0; i < kCoreCount; i++)
                         if (model.Online[i] == 1) waitClusterReady(policyForCore(i));
-                    function.cpusetFunction();
+                    // 游戏档的 cpuset 改由下方 gameCpusetRestore 处理（仅 0-5/2-7 才拉回 0-7）
+                    if (!model.isGame) function.cpusetFunction();
                 }
             } else {
                 // 画像未定义核心开关 → 跟随基础模式，防止省电档的离线核未被拉回
                 restoreBaseCoresIfNeeded();
             }
+            // 游戏档:仅当 top-app/foreground 被限到 0-5(丢大核)/2-7(丢小核)时拉回 0-7,
+            // 其它取值一律不动。无论本次是否上线核心都校正一次(ROM 可能在游戏中改 cpuset)。
+            if (model.isGame) function.gameCpusetRestore();
         }
 
         for (int i = 0; i < kClusterCount; i++) {
