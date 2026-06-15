@@ -263,16 +263,12 @@ public:
                 if (broughtOnline) {
                     for (int i = 0; i < kCoreCount; i++)
                         if (model.Online[i] == 1) waitClusterReady(policyForCore(i));
-                    // 游戏档的 cpuset 改由下方 gameCpusetRestore 处理（仅 0-5/2-7 才拉回 0-7）
-                    if (!model.isGame) function.cpusetFunction();
+                    function.cpusetFunction();
                 }
             } else {
                 // 画像未定义核心开关 → 跟随基础模式，防止省电档的离线核未被拉回
                 restoreBaseCoresIfNeeded();
             }
-            // 游戏档:仅当 top-app/foreground 被限到 0-5(丢大核)/2-7(丢小核)时拉回 0-7,
-            // 其它取值一律不动。无论本次是否上线核心都校正一次(ROM 可能在游戏中改 cpuset)。
-            if (model.isGame) function.gameCpusetRestore();
         }
 
         for (int i = 0; i < kClusterCount; i++) {
@@ -741,7 +737,9 @@ public:
 
         char now[64] = { 0 };
         readNodeTrim("/dev/cpuset/top-app/cpus", now, sizeof(now));
-        if (strcmp(now, desired) == 0) return;   // 已是全核 → 幂等不写
+        // 仅当被收窄到 0-5(丢大核)或 2-7(丢小核)才矫正回全核;其它取值
+        // (含已是全核 0-7、或 ROM/其它工具自定义)一律不动,不抢占。
+        if (strcmp(now, "0-5") != 0 && strcmp(now, "2-7") != 0) return;
 
         constexpr long long kFixMinMs = 1000;    // 节流：最多每秒矫正一次，防 ping-pong
         long long t = nowMs();
