@@ -10,7 +10,7 @@ const { ensureInit } = require("./init-db");
 
 const app = express();
 app.set("trust proxy", 1); // Koyeb/Render/Vercel 在反代后，限流取真实 IP
-app.use(express.json());
+app.use(express.json({ limit: "12mb" })); // 放宽以容纳买家上传的截图(base64);注:Vercel 平台请求体上限约 4.5MB,前端已压缩
 app.use(express.urlencoded({ extended: false })); // 易支付回调可能是表单 POST
 app.use(express.static(path.join(__dirname, "public")));
 
@@ -469,6 +469,20 @@ async function ensureOrderKey(order) {
   return key;
 }
 
+// 保存买家上传的截图(最多2张)。仅当本次确有传图才替换;不传则保留原有,避免重提时清空
+async function saveOrderImages(orderNo, images) {
+  if (!Array.isArray(images) || !images.length) return;
+  const valid = images
+    .filter((s) => typeof s === "string"
+      && /^data:image\/(png|jpe?g|webp);base64,/.test(s)
+      && s.length <= 7600000) // base64 ≈ 原图×1.37,约 5.5MB 二进制上限
+    .slice(0, 2);
+  await run(`DELETE FROM order_images WHERE out_trade_no=?`, [orderNo]);
+  for (let i = 0; i < valid.length; i++) {
+    await run(`INSERT INTO order_images(out_trade_no, idx, data) VALUES(?,?,?)`, [orderNo, i, valid[i]]);
+  }
+}
+
 app.post("/api/order/submit", verifyLimiter, async (req, res) => {
   let { plan_code, pay_type, order_no, contact, note } = req.body || {};
   order_no = String(order_no || "").trim();
@@ -485,6 +499,9 @@ app.post("/api/order/submit", verifyLimiter, async (req, res) => {
     // 卡密已被卖家删除 → 审核未通过(不再补发)
     return res.json({ code: 403, success: false, message: "审核未通过：该订单的卡密已被卖家撤销，如有疑问请联系卖家" });
   }
+
+  // 保存买家上传的付款/聊天截图(若有),与订单号关联供后台查看
+  await saveOrderImages(order_no, (req.body || {}).images);
 
   // 自动核验：付款单号匹配已导入账单里「未使用、金额达标」的收款 → 直接发卡
   const txn = await get(`SELECT * FROM paid_txns WHERE txn_no=? AND used=0`, [order_no]);
@@ -611,7 +628,9 @@ app.post("/api/order/confirm-all", adminOrApiKey("manage"), async (_req, res) =>
 
 // 删除订单(后台)
 app.post("/api/order/delete", apiLimiter, adminOrApiKey("manage"), async (req, res) => {
-  await run(`DELETE FROM orders WHERE out_trade_no=?`, [(req.body || {}).out_trade_no || ""]);
+  const no = (req.body || {}).out_trade_no || "";
+  await run(`DELETE FROM orders WHERE out_trade_no=?`, [no]);
+  await run(`DELETE FROM order_images WHERE out_trade_no=?`, [no]);
   res.json({ code: 200, success: true, message: "已删除" });
 });
 
@@ -635,11 +654,20 @@ app.get("/api/order/list", apiLimiter, adminOrApiKey("manage"), async (req, res)
   const page = Math.max(parseInt(req.query.page) || 1, 1);
   const limit = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 500);
   const rows = await all(`SELECT o.out_trade_no, o.plan_code, o.days, o.money, o.pay_type, o.status, o.license_key, o.contact, o.note, o.created_at, o.paid_at,
-      (SELECT lk.note FROM license_keys lk WHERE lk.license_key=o.license_key) AS key_note
+      (SELECT lk.note FROM license_keys lk WHERE lk.license_key=o.license_key) AS key_note,
+      (SELECT COUNT(*) FROM order_images oi WHERE oi.out_trade_no=o.out_trade_no) AS img_count
     FROM orders o ORDER BY o.id DESC LIMIT ? OFFSET ?`, [limit, (page - 1) * limit]);
   const total = await get(`SELECT COUNT(*) AS c FROM orders`);
   const paid = await get(`SELECT COUNT(*) AS c FROM orders WHERE status=1`);
   res.json({ code: 200, success: true, data: { list: rows, total: total ? total.c : 0, paid: paid ? paid.c : 0, page, limit } });
+});
+
+// 后台查看某订单的买家上传截图
+app.get("/api/order/images", apiLimiter, adminOrApiKey("manage"), async (req, res) => {
+  const no = String(req.query.out_trade_no || "").trim();
+  if (!no) return res.json({ code: 400, success: false, message: "缺少订单号" });
+  const rows = await all(`SELECT data FROM order_images WHERE out_trade_no=? ORDER BY idx`, [no]);
+  res.json({ code: 200, success: true, data: { images: rows.map((r) => r.data) } });
 });
 
 // 直接运行(Docker/本地)时才监听端口；Vercel 以 serverless 方式 require 本模块

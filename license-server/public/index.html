@@ -108,7 +108,7 @@
       <div class="stat" id="ostat" style="grid-template-columns:repeat(2,1fr);max-width:320px"></div>
       <div style="overflow:auto;margin-top:10px">
         <table id="otbl"><thead><tr>
-          <th>付款单号</th><th>套餐</th><th>金额</th><th>联系</th><th>备注</th><th>状态</th><th>卡密</th><th>时间</th><th>操作</th>
+          <th>付款单号</th><th>套餐</th><th>金额</th><th>联系</th><th>备注</th><th>截图</th><th>状态</th><th>卡密</th><th>时间</th><th>操作</th>
         </tr></thead><tbody></tbody></table>
       </div>
     </div>
@@ -343,12 +343,25 @@ async function loadOrders(){
       <td>¥${o.money||''}</td>
       <td class="muted">${o.contact||'-'}</td>
       <td class="muted">${o.note||'-'}</td>
+      <td>${o.img_count>0?`<button class="sm ghost" onclick="viewImgs('${ono}')">查看(${o.img_count})</button>`:'<span class="muted">-</span>'}</td>
       <td><span class="pill ${o.status==1?'s1':'s0'}">${o.status==1?('已发卡 · '+(/收款码/.test(o.key_note||'')?'人工':(o.key_note?'自动':'人工'))):'待确认'}</span></td>
       <td class="key">${o.license_key?o.license_key+` <button class="sm ghost" onclick="copy('${o.license_key}')">复制</button>`:'-'}</td>
       <td class="muted">${cn(o.paid_at||o.created_at)}</td>
       <td>${o.status==1?'':`<button class="sm" onclick="confirmOrder('${ono}')">确认发卡</button>`}
           <button class="sm ghost" onclick="if(confirm('删除该订单?'))delOrder('${ono}')">删</button></td></tr>`;
   }
+}
+async function viewImgs(no){
+  const j=await api(`/api/order/images?out_trade_no=${encodeURIComponent(no)}`,{headers:authHeaders()});
+  if(!j.success){ toast(j.message||"加载失败"); return; }
+  const imgs=(j.data&&j.data.images)||[];
+  if(!imgs.length){ toast("该订单无截图"); return; }
+  const ov=document.createElement("div");
+  ov.style.cssText="position:fixed;inset:0;background:rgba(0,0,0,.88);z-index:9999;display:flex;flex-wrap:wrap;gap:14px;padding:30px 24px;overflow:auto;align-content:flex-start;justify-content:center";
+  ov.onclick=()=>ov.remove();
+  ov.innerHTML=imgs.map(d=>`<img src="${d}" style="max-width:46%;max-height:88vh;object-fit:contain;border-radius:8px;background:#fff"/>`).join("")
+    +`<div style="position:fixed;top:10px;right:22px;color:#fff;font-size:30px;cursor:pointer;line-height:1">×</div>`;
+  document.body.appendChild(ov);
 }
 async function confirmAll(){
   if(!confirm("把所有【待确认】订单一次性通过并发卡?")) return;

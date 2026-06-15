@@ -29,6 +29,11 @@
   .keybox{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:16px;background:#0e1117;border:1px dashed var(--ok);border-radius:10px;padding:14px;text-align:center;word-break:break-all;}
   .ok{color:var(--ok);} .err{color:#ef4444;} .info{color:var(--ok);font-size:13px;margin-top:8px;}
   ol{padding-left:20px;line-height:1.9;} b{color:var(--fg);}
+  input[type=file]{padding:9px;}
+  .thumbs{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px;}
+  .thumb{position:relative;width:88px;height:88px;border:1px solid var(--line);border-radius:8px;overflow:hidden;background:#0e1117;}
+  .thumb img{width:100%;height:100%;object-fit:cover;}
+  .thumb span{position:absolute;top:2px;right:2px;width:20px;height:20px;line-height:18px;text-align:center;background:rgba(0,0,0,.65);color:#fff;border-radius:50%;cursor:pointer;font-size:14px;}
 </style>
 </head>
 <body>
@@ -76,6 +81,9 @@
     <input id="contact" placeholder="QQ / 微信 / 邮箱,选填" />
     <label>备注(选填)</label>
     <input id="onote" placeholder="给卖家的备注,选填" />
+    <label>上传截图(选填,最多2张,每张≤5MB,方便上传付款/聊天截图)</label>
+    <input id="imgfile" type="file" accept="image/*" multiple onchange="onPickImages(event)" />
+    <div id="imgPrev" class="thumbs"></div>
     <button onclick="submitOrder()">提交订单</button>
     <div id="suberr" class="muted err"></div>
     <div id="subok" class="info"></div>
@@ -122,13 +130,46 @@ async function alipayPay(){
   else document.getElementById("aerr").textContent=j.message||"发起支付失败";
 }
 
+// ---- 截图上传:前端校验≤5MB、压缩缩放后再上传 ----
+let pendingImages=[];
+function compressImage(file){
+  return new Promise((resolve,reject)=>{
+    const img=new Image(); const url=URL.createObjectURL(file);
+    img.onload=()=>{
+      URL.revokeObjectURL(url);
+      let w=img.naturalWidth,h=img.naturalHeight; const MAX=1600;
+      if(w>MAX||h>MAX){ const s=Math.min(MAX/w,MAX/h); w=Math.round(w*s); h=Math.round(h*s); }
+      const c=document.createElement("canvas"); c.width=w; c.height=h;
+      c.getContext("2d").drawImage(img,0,0,w,h);
+      resolve(c.toDataURL("image/jpeg",0.82));
+    };
+    img.onerror=()=>{ URL.revokeObjectURL(url); reject(new Error("图片读取失败")); };
+    img.src=url;
+  });
+}
+async function onPickImages(ev){
+  const files=[...ev.target.files]; ev.target.value="";
+  for(const f of files){
+    if(pendingImages.length>=2){ alert("最多上传 2 张"); break; }
+    if(!/^image\//.test(f.type)){ alert("只能上传图片文件"); continue; }
+    if(f.size>5*1024*1024){ alert(`「${f.name}」超过 5MB,请压缩后再传`); continue; }
+    try{ pendingImages.push(await compressImage(f)); }catch(e){ alert("处理失败:"+e.message); }
+  }
+  renderThumbs();
+}
+function renderThumbs(){
+  document.getElementById("imgPrev").innerHTML=pendingImages.map((d,i)=>
+    `<div class="thumb"><img src="${d}"/><span onclick="rmImg(${i})">×</span></div>`).join("");
+}
+function rmImg(i){ pendingImages.splice(i,1); renderThumbs(); }
+
 async function submitOrder(){
   document.getElementById("suberr").textContent=""; document.getElementById("subok").textContent="";
   if(!selPlan){ document.getElementById("suberr").textContent="请先选套餐"; return; }
   const order_no=document.getElementById("otn").value.trim();
   if(!order_no){ document.getElementById("suberr").textContent="请填付款单号"; return; }
   const j = await (await fetch(API+"/api/order/submit",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({plan_code:selPlan.code,pay_type:payType,order_no,contact:document.getElementById("contact").value.trim(),note:document.getElementById("onote").value.trim()})})).json();
+    body:JSON.stringify({plan_code:selPlan.code,pay_type:payType,order_no,contact:document.getElementById("contact").value.trim(),note:document.getElementById("onote").value.trim(),images:pendingImages})})).json();
   if(j.success && j.data && j.data.license_key){ showKey(j.data.license_key); }
   else if(j.success){ document.getElementById("subok").textContent=j.message; document.getElementById("qotn").value=order_no; }
   else document.getElementById("suberr").textContent=j.message||"提交失败";

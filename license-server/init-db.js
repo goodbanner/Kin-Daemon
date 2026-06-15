@@ -88,6 +88,16 @@ async function main() {
   try { await run(`ALTER TABLE orders ADD COLUMN contact TEXT`); } catch (_) { /* 旧库补列，已存在则忽略 */ }
   try { await run(`ALTER TABLE orders ADD COLUMN note TEXT`); } catch (_) { /* 旧库补列，已存在则忽略 */ }
 
+  // 买家上传的截图(付款/聊天),按订单号关联,最多 2 张,供后台查看。单独建表避免订单列表查询拖入大字段
+  await run(`CREATE TABLE IF NOT EXISTS order_images (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    out_trade_no TEXT NOT NULL,               -- 关联订单的付款单号
+    idx          INTEGER DEFAULT 0,           -- 第几张(0/1)
+    data         TEXT,                         -- data:image/...;base64,xxx
+    created_at   TEXT DEFAULT (datetime('now'))
+  )`);
+  await run(`CREATE INDEX IF NOT EXISTS idx_oimg_no ON order_images(out_trade_no)`);
+
   // 导入的收款账单(微信/支付宝),用于「订单号匹配自动发卡」
   await run(`CREATE TABLE IF NOT EXISTS paid_txns (
     txn_no       TEXT PRIMARY KEY,          -- 交易单号(买家提交的付款单号需与此匹配)
