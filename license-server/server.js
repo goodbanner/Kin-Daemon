@@ -151,6 +151,17 @@ app.post("/api/verify", verifyLimiter, requireApiKey("verify"), async (req, res)
   } else if (status === 1) {
     if (boundDev && boundDev !== device_id) {
       await log("设备不匹配");
+      // 防共享:统计该卡密尝试过的不同设备数(含绑定设备与本次),达阈值自动禁用
+      const MAX_TRY_DEVICES = 3;
+      const dc = await get(
+        `SELECT COUNT(DISTINCT device_id) AS c FROM verify_logs WHERE license_key=? AND device_id<>''`,
+        [license_key]
+      );
+      if (dc && dc.c >= MAX_TRY_DEVICES) {
+        await run(`UPDATE license_keys SET status=3, note=COALESCE(note,'')||' [多设备尝试(${dc.c})自动禁用]' WHERE id=?`, [row.id]);
+        await log("多设备尝试自动禁用");
+        return res.json({ code: 403, success: false, message: "该卡密在多台设备尝试使用，已被自动禁用，请联系作者" });
+      }
       return res.json({ code: 409, success: false, message: "卡密已绑定其它设备，请联系管理员解绑" });
     }
     if (expires_at && Date.now() > new Date(expires_at).getTime()) {
