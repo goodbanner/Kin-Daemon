@@ -49,7 +49,7 @@
     <h2>你的卡密</h2>
     <div id="keyout" class="keybox"></div>
     <div class="muted" style="margin-top:8px">请复制保存,并在 App 里输入激活。每个卡密只能绑定一台设备。</div>
-    <button onclick="copyKey()">复制卡密</button>
+    <button onclick="copyKey(this)">复制卡密</button>
     <div style="text-align:center;margin-top:16px;border-top:1px solid var(--line);padding-top:14px">
       <img src="/wechat-qr.png" alt="作者微信" style="width:200px;max-width:70%;border-radius:10px;background:#fff;padding:6px" />
       <div class="muted" style="margin-top:6px">扫码加作者微信,进捐赠群</div>
@@ -62,16 +62,17 @@
   </div>
 
   <div class="card" id="alipayCard" style="display:none">
-    <h2>② 支付宝自动支付(推荐,秒发卡)</h2>
+    <h2>⚡ 支付宝自动支付(推荐 · 秒发卡)</h2>
     <div class="muted" style="margin-bottom:10px">点下方按钮跳转支付宝付款,付完自动跳回并显示卡密,无需填单号、无需等待。</div>
-    <button onclick="alipayPay()">支付宝付款</button>
+    <button onclick="alipayPay(this)">支付宝付款 <span id="aliAmt"></span></button>
     <div id="aerr" class="muted err"></div>
   </div>
 
   <div class="card">
-    <h2>② 扫码付款(按所选套餐金额)</h2>
+    <h2>② 扫码付款</h2>
+    <div class="muted" style="margin-bottom:8px">应付金额:<b id="payAmt" style="color:var(--ok);font-size:18px">¥—</b> （请务必按此金额付款）</div>
     <div class="qr"><img src="/pay-qr.png" alt="收款码" /></div>
-    <div class="muted" style="margin-top:8px">左=微信,右=支付宝。请按所选套餐的金额付款。</div>
+    <div class="muted" style="margin-top:8px">左=微信,右=支付宝。</div>
   </div>
 
   <div class="card">
@@ -88,7 +89,7 @@
     <label>上传截图(选填,最多2张,每张≤5MB,方便上传付款/聊天截图)</label>
     <input id="imgfile" type="file" accept="image/*" multiple onchange="onPickImages(event)" />
     <div id="imgPrev" class="thumbs"></div>
-    <button onclick="submitOrder()">提交订单</button>
+    <button onclick="submitOrder(this)">提交订单</button>
     <div id="suberr" class="muted err"></div>
     <div id="subok" class="info"></div>
   </div>
@@ -97,7 +98,7 @@
     <h2>④ 取卡(卖家确认后)</h2>
     <div class="muted" style="margin-bottom:8px">卖家确认到账后(通常几分钟),用上面的付款单号点这里取卡。</div>
     <input id="qotn" placeholder="付款单号" />
-    <button onclick="query()">查询取卡</button>
+    <button onclick="query(this)">查询取卡</button>
     <div id="qerr" class="muted err"></div>
   </div>
 </div>
@@ -108,7 +109,33 @@ let plans = [], selPlan = null, payType = "alipay", lastKey = "";
 
 function selPay(t){ payType=t; document.querySelectorAll(".pay .opt").forEach(o=>o.classList.toggle("sel",o.dataset.t===t)); }
 function showKey(k){ lastKey=k; document.getElementById("keyout").textContent=k; document.getElementById("result").style.display="block"; document.getElementById("result").scrollIntoView({behavior:"smooth"}); }
-function copyKey(){ navigator.clipboard.writeText(lastKey).then(()=>alert("已复制")); }
+
+// 应付金额随所选套餐更新
+function updatePayAmt(){
+  const a=document.getElementById("payAmt"); if(a) a.textContent = selPlan ? "¥"+selPlan.price : "¥—";
+  const b=document.getElementById("aliAmt"); if(b) b.textContent = selPlan ? "¥"+selPlan.price : "";
+}
+
+// 按钮忙碌态:防重复点击 + 文案提示,结束后自动还原
+async function busy(btn, label, fn){
+  if(!btn) return await fn();
+  const orig=btn.innerHTML; btn.disabled=true; btn.style.opacity=".6"; btn.textContent=label;
+  try{ return await fn(); }
+  finally{ btn.disabled=false; btn.style.opacity=""; btn.innerHTML=orig; }
+}
+
+function copyKey(btn){
+  const done=()=>{ if(btn){ const o=btn.textContent; btn.textContent="已复制 ✓"; setTimeout(()=>btn.textContent=o,1500); } };
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(lastKey).then(done).catch(()=>fallbackCopy(lastKey,done));
+  } else fallbackCopy(lastKey,done);
+}
+function fallbackCopy(text,cb){
+  const ta=document.createElement("textarea"); ta.value=text; ta.style.position="fixed"; ta.style.opacity="0";
+  document.body.appendChild(ta); ta.select();
+  try{ document.execCommand("copy"); cb&&cb(); }catch(e){ alert("复制失败,请长按卡密手动复制"); }
+  document.body.removeChild(ta);
+}
 
 async function loadPlans(){
   try{
@@ -119,19 +146,23 @@ async function loadPlans(){
     box.innerHTML = plans.map((p,i)=>`<div class="plan${i===0?' sel':''}" data-i="${i}" onclick="selPlanIdx(${i})">
       <div class="nm">${p.name}</div><div class="pr">¥${p.price}</div>
       <div class="muted">${p.days==0?'永久':p.days+' 天'}</div></div>`).join("");
-    selPlan = plans[0];
+    selPlan = plans[0]; updatePayAmt();
     if(j.data && j.data.alipay_enabled){ document.getElementById("alipayCard").style.display="block"; }
-  }catch(e){ document.getElementById("plans").innerHTML='<div class="muted err">加载失败</div>'; }
+  }catch(e){ document.getElementById("plans").innerHTML='<div class="muted err">加载失败,请刷新重试</div>'; }
 }
-function selPlanIdx(i){ selPlan=plans[i]; document.querySelectorAll(".plan").forEach(p=>p.classList.toggle("sel",+p.dataset.i===i)); }
+function selPlanIdx(i){ selPlan=plans[i]; document.querySelectorAll(".plan").forEach(p=>p.classList.toggle("sel",+p.dataset.i===i)); updatePayAmt(); }
 
-async function alipayPay(){
-  document.getElementById("aerr").textContent="";
-  if(!selPlan){ document.getElementById("aerr").textContent="请先选套餐"; return; }
-  const j = await (await fetch(API+"/api/pay/alipay/create",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({plan_code:selPlan.code})})).json();
-  if(j.success && j.data.pay_url){ location.href=j.data.pay_url; }
-  else document.getElementById("aerr").textContent=j.message||"发起支付失败";
+async function alipayPay(btn){
+  const ae=document.getElementById("aerr"); ae.textContent="";
+  if(!selPlan){ ae.textContent="请先选套餐"; return; }
+  await busy(btn,"跳转中…",async()=>{
+    try{
+      const j = await (await fetch(API+"/api/pay/alipay/create",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({plan_code:selPlan.code})})).json();
+      if(j.success && j.data.pay_url){ location.href=j.data.pay_url; }
+      else ae.textContent=j.message||"发起支付失败";
+    }catch(e){ ae.textContent="网络错误,请重试"; }
+  });
 }
 
 // ---- 截图上传:前端校验≤5MB、压缩缩放后再上传 ----
@@ -167,26 +198,35 @@ function renderThumbs(){
 }
 function rmImg(i){ pendingImages.splice(i,1); renderThumbs(); }
 
-async function submitOrder(){
-  document.getElementById("suberr").textContent=""; document.getElementById("subok").textContent="";
-  if(!selPlan){ document.getElementById("suberr").textContent="请先选套餐"; return; }
+async function submitOrder(btn){
+  const se=document.getElementById("suberr"), so=document.getElementById("subok");
+  se.textContent=""; so.textContent="";
+  if(!selPlan){ se.textContent="请先选套餐"; return; }
   const order_no=document.getElementById("otn").value.trim();
-  if(!order_no){ document.getElementById("suberr").textContent="请填付款单号"; return; }
-  const j = await (await fetch(API+"/api/order/submit",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({plan_code:selPlan.code,pay_type:payType,order_no,contact:document.getElementById("contact").value.trim(),note:document.getElementById("onote").value.trim(),images:pendingImages})})).json();
-  if(j.success && j.data && j.data.license_key){ showKey(j.data.license_key); }
-  else if(j.success){ document.getElementById("subok").textContent=j.message; document.getElementById("qotn").value=order_no; }
-  else document.getElementById("suberr").textContent=j.message||"提交失败";
+  if(!order_no){ se.textContent="请填付款单号"; return; }
+  await busy(btn,"提交中…",async()=>{
+    try{
+      const j = await (await fetch(API+"/api/order/submit",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({plan_code:selPlan.code,pay_type:payType,order_no,contact:document.getElementById("contact").value.trim(),note:document.getElementById("onote").value.trim(),images:pendingImages})})).json();
+      if(j.success && j.data && j.data.license_key){ showKey(j.data.license_key); }
+      else if(j.success){ so.textContent=j.message; document.getElementById("qotn").value=order_no; }
+      else se.textContent=j.message||"提交失败";
+    }catch(e){ se.textContent="网络错误,请重试"; }
+  });
 }
 
-async function query(){
-  document.getElementById("qerr").textContent="";
+async function query(btn){
+  const qe=document.getElementById("qerr"); qe.textContent="";
   const otn=(document.getElementById("qotn").value||document.getElementById("otn").value).trim();
-  if(!otn){ document.getElementById("qerr").textContent="请输入付款单号"; return; }
-  const j = await (await fetch(API+"/api/order/query",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({out_trade_no:otn})})).json();
-  if(j.success){ showKey(j.data.license_key); }
-  else document.getElementById("qerr").textContent=j.message||"查询失败";
+  if(!otn){ qe.textContent="请输入付款单号"; return; }
+  await busy(btn,"查询中…",async()=>{
+    try{
+      const j = await (await fetch(API+"/api/order/query",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({out_trade_no:otn})})).json();
+      if(j.success){ showKey(j.data.license_key); }
+      else qe.textContent=j.message||"查询失败";
+    }catch(e){ qe.textContent="网络错误,请重试"; }
+  });
 }
 
 loadPlans();
