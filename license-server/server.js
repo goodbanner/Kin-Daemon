@@ -237,16 +237,18 @@ app.post("/api/license/disable", apiLimiter, adminOrApiKey("manage"), async (req
   res.json({ code: 200, success: true, message: "已禁用" });
 });
 app.post("/api/license/enable", apiLimiter, adminOrApiKey("manage"), async (req, res) => {
-  // 启用：已绑定过的回到 1，未绑定的回到 0
+  // 启用：已绑定过的回到 1，未绑定的回到 0；并清除尝试记录，避免旧的多设备历史让防共享立刻重新禁用
   const { license_key } = req.body || {};
   const row = await get(`SELECT device_id FROM license_keys WHERE license_key=?`, [license_key || ""]);
   if (!row) return res.json({ code: 404, success: false, message: "不存在" });
-  await run(`UPDATE license_keys SET status=? WHERE license_key=?`, [row.device_id ? 1 : 0, license_key]);
-  res.json({ code: 200, success: true, message: "已启用" });
+  await run(`UPDATE license_keys SET status=?, note=REPLACE(COALESCE(note,''),' [多设备尝试(3)自动禁用]','') WHERE license_key=?`, [row.device_id ? 1 : 0, license_key]);
+  await run(`DELETE FROM verify_logs WHERE license_key=?`, [license_key]);
+  res.json({ code: 200, success: true, message: row.device_id ? "已启用(尝试记录已清零;若用户换了设备请改用「解绑」)" : "已启用" });
 });
 app.post("/api/license/unbind", apiLimiter, adminOrApiKey("manage"), async (req, res) => {
   const { license_key } = req.body || {};
-  await run(`UPDATE license_keys SET device_id=NULL, device_info=NULL, status=0, activated_at=NULL, expires_at=NULL WHERE license_key=?`, [license_key || ""]);
+  await run(`UPDATE license_keys SET device_id=NULL, device_info=NULL, status=0, activated_at=NULL, expires_at=NULL, note=REPLACE(COALESCE(note,''),' [多设备尝试(3)自动禁用]','') WHERE license_key=?`, [license_key || ""]);
+  await run(`DELETE FROM verify_logs WHERE license_key=?`, [license_key || ""]);
   res.json({ code: 200, success: true, message: "已解绑(回到未使用，可重新激活绑定新设备)" });
 });
 app.post("/api/license/delete", apiLimiter, adminOrApiKey("manage"), async (req, res) => {
