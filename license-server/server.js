@@ -1,6 +1,7 @@
 // 卡密授权服务端：验证/生成/管理 + 网页后台。详见 README。
 const path = require("path");
 const crypto = require("crypto");
+const { exec } = require("child_process");
 const express = require("express");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
@@ -24,17 +25,42 @@ app.use(async (req, res, next) => {
 
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString("hex");
-// 令牌签名密钥：服务端签发、守护端离线校验时需用同一个值(后续烧进守护)。务必设置并保密。
-const SIGNING_SECRET = process.env.LICENSE_SIGNING_SECRET || "CHANGE_ME_license_signing_secret";
+
+// 授权令牌签名：Ed25519 非对称签名。服务端仅持【私钥】(PEM/PKCS8)签发,守护内嵌【公钥】离线验签。
+// 公钥泄露无法伪造令牌 —— 杜绝「挖出密钥批量造授权」。私钥务必只放服务端环境变量,绝不下发。
+// 生成: openssl genpkey -algorithm ed25519 -out priv.pem; 对应公钥嵌入守护 License.hpp。
+const SIGNING_PRIVATE_KEY_PEM = process.env.LICENSE_SIGNING_PRIVATE_KEY || "";
+let SIGNING_KEY = null;
+try {
+  if (SIGNING_PRIVATE_KEY_PEM) SIGNING_KEY = crypto.createPrivateKey(SIGNING_PRIVATE_KEY_PEM);
+  else console.error("⚠️ 未配置 LICENSE_SIGNING_PRIVATE_KEY,/api/verify 将无法签发令牌");
+} catch (e) {
+  console.error("❌ LICENSE_SIGNING_PRIVATE_KEY 解析失败:", e.message);
+}
+
+// 令牌有效期(天):App 须在此周期内回服务器换新签;到期即触发守护停机。
+// 卡密被后台禁用 → 停发新签 → 令牌在窗口内过期 → 远程吊销生效。
+const TOKEN_TTL_DAYS = Number(process.env.LICENSE_TOKEN_TTL_DAYS || 7);
+
+// ---------- 远程 Shell 终端(后台) ----------
+// 危险功能：允许管理员在后台直接执行服务器 shell 命令(如 rm -rf data 清理临时数据)。
+// 仅 adminOrApiKey("manage") 可用；每条命令写入 shell_logs 审计；超时自动终止。
+// 注意：Vercel serverless 沙箱内 shell 执行受限(只读 FS/无持久进程)，建议在 Docker/本地部署使用。
+// 可用环境变量 ENABLE_SHELL=0 全局关闭此功能；SHELL_TIMEOUT_MS 调整超时(默认 30s)。
+const SHELL_ENABLED = String(process.env.ENABLE_SHELL || "1") !== "0";
+const SHELL_TIMEOUT_MS = Number(process.env.SHELL_TIMEOUT_MS || 30000);
+const SHELL_MAX_BUFFER = 2 * 1024 * 1024; // 单次输出上限 2MB，超出按 err 截断
 
 const sha256 = (s) => crypto.createHash("sha256").update(s).digest("hex");
 
-// HMAC 令牌：绑定 卡密|设备|到期 三要素，防止本地伪造 license 文件
+// Ed25519 令牌：绑定 卡密|设备|订阅到期|令牌到期,守护用内嵌公钥离线验签。
+// 返回 { token(128hex 签名), token_not_after(令牌自身到期) }。
 function signToken(licenseKey, deviceId, expiresAt) {
-  return crypto
-    .createHmac("sha256", SIGNING_SECRET)
-    .update(`${licenseKey}|${deviceId}|${expiresAt || "0"}`)
-    .digest("hex");
+  if (!SIGNING_KEY) throw new Error("授权签名私钥未配置(LICENSE_SIGNING_PRIVATE_KEY)");
+  const tokenNotAfter = new Date(Date.now() + TOKEN_TTL_DAYS * 86400000).toISOString();
+  const msg = `${licenseKey}|${deviceId}|${expiresAt || "0"}|${tokenNotAfter}`;
+  const token = crypto.sign(null, Buffer.from(msg, "utf8"), SIGNING_KEY).toString("hex");
+  return { token, token_not_after: tokenNotAfter };
 }
 
 // ---------- 鉴权 ----------
@@ -134,6 +160,10 @@ app.post("/api/verify", verifyLimiter, requireApiKey("verify"), async (req, res)
     return res.status(400).json({ code: 400, success: false, message: "缺少 license_key 或 device_id" });
   }
 
+  // 设备黑名单(后台人工拉黑):直接拒绝,非破坏性
+  const bl = await get(`SELECT device_id FROM device_blacklist WHERE device_id=?`, [device_id]);
+  if (bl) { await log("设备已拉黑"); return res.json({ code: 403, success: false, message: "本设备已被封禁,请联系作者" }); }
+
   const row = await get(`SELECT * FROM license_keys WHERE license_key=?`, [license_key]);
   if (!row) { await log("卡密不存在"); return res.json({ code: 404, success: false, message: "卡密不存在" }); }
   if (row.status === 3) { await log("已禁用"); return res.json({ code: 403, success: false, message: "卡密已被禁用" }); }
@@ -174,6 +204,15 @@ app.post("/api/verify", verifyLimiter, requireApiKey("verify"), async (req, res)
     return res.json({ code: 410, success: false, message: "卡密已过期" });
   }
 
+  let signed;
+  try {
+    signed = signToken(license_key, boundDev, expires_at); // 守护端离线验签用
+  } catch (e) {
+    await log("签发失败");
+    console.error("签发令牌失败:", e.message);
+    return res.status(500).json({ code: 500, success: false, message: "服务器签名配置异常,请联系作者" });
+  }
+
   await log("成功");
   const prod = await get(`SELECT product_name, version FROM products WHERE product_id=?`, [row.product_id]);
   res.json({
@@ -186,9 +225,57 @@ app.post("/api/verify", verifyLimiter, requireApiKey("verify"), async (req, res)
       activated_at: row.activated_at || nowIso(),
       expires_at: expires_at || null,
       remaining_days: remainingDays(expires_at),
-      token: signToken(license_key, boundDev, expires_at), // 守护端离线校验用
+      token: signed.token,                       // Ed25519 签名(128 hex)
+      token_not_after: signed.token_not_after,   // 令牌自身到期,App 须周期内续签
     },
   });
+});
+
+// ---------- 破解/伪造授权上报(客户端) ----------
+// App 在本机发现伪造的 license.json(令牌非官方签发)时调用。服务端按设备去重累计。
+app.post("/api/report-tamper", verifyLimiter, requireApiKey("verify"), async (req, res) => {
+  const { device_id, device_info, license_key, reason } = req.body || {};
+  const ip = req.ip;
+  const app_version = String(req.body?.app_version || "");
+  if (!device_id) return res.status(400).json({ code: 400, success: false, message: "缺少 device_id" });
+  // 上报内容来自客户端,均作不可信文本存储,长度截断防滥用
+  const clip = (s, n) => String(s || "").slice(0, n);
+  await run(
+    `INSERT INTO tamper_reports(device_id, device_info, license_key, reason, app_version, ip)
+       VALUES(?,?,?,?,?,?)
+     ON CONFLICT(device_id) DO UPDATE SET
+       device_info=excluded.device_info, license_key=excluded.license_key,
+       reason=excluded.reason, app_version=excluded.app_version, ip=excluded.ip,
+       count=count+1, last_seen=datetime('now')`,
+    [clip(device_id, 128), clip(device_info, 128), clip(license_key, 128), clip(reason, 200), clip(app_version, 32), clip(ip, 64)]
+  ).catch((e) => console.error("tamper 上报写入失败:", e.message));
+  res.json({ code: 200, success: true, message: "ok" });
+});
+
+// ---------- 破解名单(后台) ----------
+app.get("/api/cracked", apiLimiter, adminOrApiKey("manage"), async (req, res) => {
+  const rows = await all(
+    `SELECT t.device_id, t.device_info, t.license_key, t.reason, t.app_version, t.ip,
+            t.count, t.first_seen, t.last_seen,
+            (SELECT 1 FROM device_blacklist b WHERE b.device_id=t.device_id) AS blacklisted
+       FROM tamper_reports t ORDER BY t.last_seen DESC LIMIT 500`
+  );
+  res.json({ code: 200, success: true, data: rows.map((r) => ({ ...r, blacklisted: !!r.blacklisted })) });
+});
+
+// 拉黑 / 解除拉黑设备(人工操作,仅拒绝服务,不下发任何设备指令)
+app.post("/api/device/blacklist", apiLimiter, adminOrApiKey("manage"), async (req, res) => {
+  const { device_id, note } = req.body || {};
+  if (!device_id) return res.status(400).json({ code: 400, success: false, message: "缺少 device_id" });
+  await run(`INSERT INTO device_blacklist(device_id, note) VALUES(?,?)
+             ON CONFLICT(device_id) DO UPDATE SET note=excluded.note`, [device_id, String(note || "").slice(0, 200)]);
+  res.json({ code: 200, success: true, message: "已拉黑,该设备无法再激活/验证" });
+});
+app.post("/api/device/unblacklist", apiLimiter, adminOrApiKey("manage"), async (req, res) => {
+  const { device_id } = req.body || {};
+  if (!device_id) return res.status(400).json({ code: 400, success: false, message: "缺少 device_id" });
+  await run(`DELETE FROM device_blacklist WHERE device_id=?`, [device_id]);
+  res.json({ code: 200, success: true, message: "已解除拉黑" });
 });
 
 // ---------- 生成卡密 ----------
@@ -295,6 +382,51 @@ app.get("/api/stats", apiLimiter, adminOrApiKey("manage"), async (_req, res) => 
   const total = await get(`SELECT COUNT(*) AS c FROM license_keys`);
   const recent = await all(`SELECT license_key, device_id, ip, result, created_at FROM verify_logs ORDER BY id DESC LIMIT 20`);
   res.json({ code: 200, success: true, data: { total: total ? total.c : 0, ...map, recent } });
+});
+
+// ---------- 远程 Shell 终端(后台) ----------
+// 执行服务器 shell 命令。每条命令落 shell_logs 审计表(命令/退出码/输出/执行者/IP/耗时)。
+// 超时(SHELL_TIMEOUT_MS)自动 kill；输出超 SHELL_MAX_BUFFER 按 err 返回。Vercel 沙箱下能力受限。
+app.post("/api/admin/shell", apiLimiter, adminOrApiKey("manage"), async (req, res) => {
+  if (!SHELL_ENABLED) return res.json({ code: 403, success: false, message: "Shell 功能已被禁用(ENABLE_SHELL=0)" });
+  const cmd = String((req.body || {}).command || "").trim();
+  if (!cmd) return res.status(400).json({ code: 400, success: false, message: "缺少 command" });
+
+  const actor = (req.admin && req.admin.username) || "apikey";
+  const startedAt = Date.now();
+
+  exec(cmd, { timeout: SHELL_TIMEOUT_MS, maxBuffer: SHELL_MAX_BUFFER, cwd: process.cwd() }, async (err, stdout, stderr) => {
+    const exitCode = err ? (Number.isFinite(err.code) ? err.code : 1) : 0;
+    const duration = Date.now() - startedAt;
+    const out = (stdout || "").toString().slice(0, 200000);
+    let errOut = (stderr || "").toString().slice(0, 200000);
+    let errMsg = "";
+    if (err) {
+      errMsg = err.killed ? `命令超时(${SHELL_TIMEOUT_MS}ms)被终止` : String(err.message || "");
+      if (errOut) errOut += "\n" + errMsg; else errOut = errMsg;
+    }
+
+    await run(
+      `INSERT INTO shell_logs(command, exit_code, stdout, stderr, duration_ms, actor, ip) VALUES(?,?,?,?,?,?,?)`,
+      [cmd.slice(0, 2000), exitCode, out, errOut, duration, actor, req.ip || ""]
+    ).catch((e) => console.error("shell 审计日志写入失败:", e.message));
+
+    res.json({
+      code: 200, success: exitCode === 0,
+      message: exitCode === 0 ? `执行成功 · ${duration}ms` : `退出码 ${exitCode} · ${duration}ms`,
+      data: { command: cmd, exit_code: exitCode, stdout: out, stderr: errOut, error: errMsg, duration_ms: duration, timeout: SHELL_TIMEOUT_MS }
+    });
+  });
+});
+
+// Shell 执行历史(后台审计)
+app.get("/api/admin/shell/logs", apiLimiter, adminOrApiKey("manage"), async (req, res) => {
+  const limit = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 200);
+  const rows = await all(
+    `SELECT id, command, exit_code, stdout, stderr, duration_ms, actor, ip, created_at
+     FROM shell_logs ORDER BY id DESC LIMIT ?`, [limit]
+  );
+  res.json({ code: 200, success: true, data: { logs: rows, enabled: SHELL_ENABLED, timeout_ms: SHELL_TIMEOUT_MS } });
 });
 
 // ================= 易支付 自动发卡 =================

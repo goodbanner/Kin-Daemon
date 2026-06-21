@@ -57,6 +57,27 @@ async function main() {
   await run(`CREATE INDEX IF NOT EXISTS idx_lk_status ON license_keys(status)`);
   await run(`CREATE INDEX IF NOT EXISTS idx_lk_device ON license_keys(device_id)`);
 
+  // 破解/伪造授权上报:App 在本机发现伪造的 license.json(令牌非官方签发/格式非法)时上报。
+  // 按设备去重,记录次数与首末时间,供后台人工查看与拉黑判断。
+  await run(`CREATE TABLE IF NOT EXISTS tamper_reports (
+    device_id   TEXT PRIMARY KEY,
+    device_info TEXT,
+    license_key TEXT,                          -- 伪造文件里写的卡密(常为 "permanent" 等)
+    reason      TEXT,                           -- 检测到的原因
+    app_version TEXT,
+    ip          TEXT,
+    count       INTEGER DEFAULT 1,
+    first_seen  TEXT DEFAULT (datetime('now')),
+    last_seen   TEXT DEFAULT (datetime('now'))
+  )`);
+
+  // 设备黑名单:后台人工拉黑后,该设备无法再激活/验证(非破坏性,仅拒绝服务)。
+  await run(`CREATE TABLE IF NOT EXISTS device_blacklist (
+    device_id   TEXT PRIMARY KEY,
+    note        TEXT,
+    created_at  TEXT DEFAULT (datetime('now'))
+  )`);
+
   // 套餐(售卖的价格/时长，后台可改)
   await run(`CREATE TABLE IF NOT EXISTS plans (
     code        TEXT PRIMARY KEY,           -- 套餐代码
@@ -109,6 +130,20 @@ async function main() {
     imported_at  TEXT DEFAULT (datetime('now'))
   )`);
   await run(`CREATE INDEX IF NOT EXISTS idx_txn_used ON paid_txns(used)`);
+
+  // Shell 命令执行审计日志：后台「远程终端」每条命令均落库，便于追溯谁在何时执行了什么。
+  await run(`CREATE TABLE IF NOT EXISTS shell_logs (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    command      TEXT NOT NULL,               -- 执行的命令(截断 2000 字符)
+    exit_code    INTEGER,                     -- 退出码(0=成功)
+    stdout       TEXT,                         -- 标准输出(截断)
+    stderr       TEXT,                         -- 标准错误/错误信息(截断)
+    duration_ms  INTEGER,                     -- 耗时(毫秒)
+    actor        TEXT,                         -- 执行者(admin 用户名 或 apikey)
+    ip           TEXT,
+    created_at   TEXT DEFAULT (datetime('now'))
+  )`);
+  await run(`CREATE INDEX IF NOT EXISTS idx_shell_created ON shell_logs(id DESC)`);
 
   // 默认产品
   const prod = await get(`SELECT product_id FROM products WHERE product_id='PROD001'`);
