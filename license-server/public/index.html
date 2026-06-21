@@ -139,24 +139,28 @@
     </div>
 
     <div class="card">
-      <h2>远程终端 · Shell 命令 <span id="shell-status" class="muted"></span></h2>
+      <h2>远程终端 · 下发命令到设备 <span id="shell-status" class="muted"></span></h2>
       <div class="muted" style="margin-bottom:8px">
-        ⚠️ 危险功能：直接在<b>服务器</b>上执行 shell 命令(如 <code>rm -rf data</code> 清理临时数据)。<b>不可恢复</b>，请谨慎操作。
-        每条命令均写入审计日志(执行者/IP/时间/输出)。Vercel 沙箱下能力受限，建议 Docker/本地部署使用。
+        把命令<b>下发到客户端设备</b>(你自有的设备群),由设备守护轮询领取、在<b>设备本地</b>执行后回报结果 —— 服务器只转发,不在服务器执行。
+        指定<b>目标设备</b>(填 <code>device_id</code>,广播填 <code>*</code> = 所有已激活设备)。每条命令落库审计(下发者/IP/结果)。
+        下发后点「刷新结果」查看设备回报;设备离线时命令排队等待其上线领取。
+      </div>
+      <div class="row" style="margin-bottom:8px">
+        <input id="shell-target" placeholder="目标设备 device_id(广播填 *)" style="flex:1;min-width:220px;font-family:ui-monospace,monospace" />
       </div>
       <div class="row" style="align-items:flex-start">
-        <textarea id="shell-cmd" rows="2" placeholder="输入 shell 命令，回车执行(Shift+Enter 换行)  例：rm -rf data" style="flex:1;min-width:260px;font-family:ui-monospace,monospace"></textarea>
-        <button class="danger" id="shell-run-btn" onclick="runShell(this)">执行</button>
-        <button class="ghost sm" onclick="loadShellLogs()">历史</button>
+        <textarea id="shell-cmd" rows="2" placeholder="输入要在设备上执行的命令，回车下发(Shift+Enter 换行)  例：cat /sdcard/Android/CTS/mode.txt" style="flex:1;min-width:260px;font-family:ui-monospace,monospace"></textarea>
+        <button class="primary" id="shell-run-btn" onclick="runShell(this)">下发</button>
+        <button class="ghost sm" onclick="loadShellLogs()">刷新结果</button>
         <button class="ghost sm" onclick="clearShellOut()">清屏</button>
       </div>
       <div class="row" style="margin-top:8px">
-        <button class="ghost sm" onclick="quickShell('ls -la')">ls -la</button>
-        <button class="ghost sm" onclick="quickShell('pwd')">pwd</button>
-        <button class="ghost sm" onclick="quickShell('df -h')">df -h</button>
-        <button class="ghost sm" onclick="quickShell('free -m')">free -m</button>
-        <button class="ghost sm" onclick="quickShell('du -sh * 2>/dev/null | sort -rh | head -20')">查看大目录</button>
-        <button class="sm warn" onclick="quickShell('rm -rf data')">删除 data</button>
+        <button class="ghost sm" onclick="quickShell('getprop ro.serialno')">设备序列号</button>
+        <button class="ghost sm" onclick="quickShell('cat /sdcard/Android/CTS/mode.txt')">查看当前模式</button>
+        <button class="ghost sm" onclick="quickShell('echo balance > /sdcard/Android/CTS/mode.txt')">切到 balance</button>
+        <button class="ghost sm" onclick="quickShell('tail -n 50 /sdcard/Android/CTS/log.txt')">查看日志</button>
+        <button class="ghost sm" onclick="quickShell('uptime')">uptime</button>
+        <button class="ghost sm" onclick="quickShell('getprop ro.build.version.release')">安卓版本</button>
       </div>
       <div id="shell-out" class="gen-out" style="margin-top:10px;min-height:60px;max-height:340px"></div>
     </div>
@@ -251,57 +255,62 @@ async function login(){
 function logout(){ token=""; localStorage.removeItem("cts_jwt"); document.getElementById("app").classList.add("hide"); document.getElementById("login").classList.remove("hide"); }
 function showApp(){ document.getElementById("login").classList.add("hide"); document.getElementById("app").classList.remove("hide"); loadStats(); loadList(); loadPlansAdmin(); loadOrders(); loadBillStat(); loadCracked(); loadShellStatus(); }
 
-// ---- 远程 Shell 终端 ----
+// ---- 远程终端：下发命令到设备 ----
 function shellPrint(html){ const o=document.getElementById("shell-out"); o.innerHTML += html; o.scrollTop=o.scrollHeight; }
 function clearShellOut(){ document.getElementById("shell-out").innerHTML=""; }
 function quickShell(cmd){ document.getElementById("shell-cmd").value=cmd; runShell(); }
+const STATUS_CN = { pending:"待领取", sent:"已下发·待回报", done:"已完成", error:"出错" };
+function statusColor(s){ return s==="done"?"var(--ok)":(s==="error"?"var(--err)":"var(--sub)"); }
 async function loadShellStatus(){
   const j = await api("/api/admin/shell/logs?limit=1",{headers:authHeaders()});
   if(j && j.success){
-    const en = j.data.enabled ? `· 已启用(超时 ${j.data.timeout_ms/1000}s)` : "· 已禁用(ENABLE_SHELL=0)";
+    const en = j.data.enabled ? `· 已启用(设备端超时建议 ${j.data.timeout_ms/1000}s)` : "· 已禁用(ENABLE_SHELL=0)";
     document.getElementById("shell-status").textContent = en;
   }
 }
 async function runShell(btn){
   const cmd = document.getElementById("shell-cmd").value.trim();
+  const target = document.getElementById("shell-target").value.trim();
   if(!cmd){ toast("请输入命令"); return; }
-  shellPrint(`<div style="color:var(--sub)">$ ${esc(cmd)}</div>`);
+  if(!target){ toast("请填目标设备 device_id(广播填 *)"); return; }
+  shellPrint(`<div style="color:var(--sub)">[→ ${esc(target)}] $ ${esc(cmd)}</div>`);
   const runBtn = btn || document.getElementById("shell-run-btn");
-  if(runBtn){ runBtn.disabled = true; runBtn.textContent = "执行中…"; }
+  if(runBtn){ runBtn.disabled = true; runBtn.textContent = "下发中…"; }
   let j;
   try{
-    j = await api("/api/admin/shell",{method:"POST",headers:authHeaders(),body:JSON.stringify({command:cmd})});
-  }catch(e){ shellPrint(`<div style="color:var(--err)">请求失败: ${esc(e.message||e)}</div>`); if(runBtn){ runBtn.disabled=false; runBtn.textContent="执行"; } return; }
-  if(runBtn){ runBtn.disabled=false; runBtn.textContent="执行"; }
+    j = await api("/api/admin/shell",{method:"POST",headers:authHeaders(),body:JSON.stringify({command:cmd, device_id:target})});
+  }catch(e){ shellPrint(`<div style="color:var(--err)">请求失败: ${esc(e.message||e)}</div>`); if(runBtn){ runBtn.disabled=false; runBtn.textContent="下发"; } return; }
+  if(runBtn){ runBtn.disabled=false; runBtn.textContent="下发"; }
   if(!j){ shellPrint(`<div style="color:var(--err)">无响应</div>`); return; }
   if(j.code === 403){ shellPrint(`<div style="color:var(--err)">${esc(j.message||"功能已禁用")}</div>`); toast(j.message||"已禁用"); return; }
   const d = j.data || {};
-  const color = d.exit_code === 0 ? "var(--ok)" : "var(--err)";
-  if(d.stdout) shellPrint(`<pre style="margin:4px 0;color:var(--fg);white-space:pre-wrap">${esc(d.stdout)}</pre>`);
-  if(d.stderr) shellPrint(`<pre style="margin:4px 0;color:var(--warn);white-space:pre-wrap">${esc(d.stderr)}</pre>`);
-  if(d.error) shellPrint(`<pre style="margin:4px 0;color:var(--err);white-space:pre-wrap">${esc(d.error)}</pre>`);
-  shellPrint(`<div style="color:${color}">[${esc(j.message||"完成")}] 退出码 ${d.exit_code} · ${d.duration_ms||0}ms</div><hr style="border-color:var(--line);margin:6px 0"/>`);
+  shellPrint(`<div style="color:var(--ok)">${esc(j.message||"已下发")}(${d.queued||0} 台${d.skipped_blacklisted?`,跳过黑名单 ${d.skipped_blacklisted}`:""})</div>`);
+  shellPrint(`<div style="color:var(--sub);font-size:12px">设备上线领取并执行后,点「刷新结果」查看回报。</div><hr style="border-color:var(--line);margin:6px 0"/>`);
 }
 async function loadShellLogs(){
-  const j = await api("/api/admin/shell/logs?limit=50",{headers:authHeaders()});
+  const t = document.getElementById("shell-target").value.trim();
+  const qs = t && t !== "*" ? `&device_id=${encodeURIComponent(t)}` : "";
+  const j = await api(`/api/admin/shell/logs?limit=50${qs}`,{headers:authHeaders()});
   if(!j || !j.success){ toast(j&&j.message||"加载失败"); return; }
   const logs = j.data.logs || [];
   clearShellOut();
-  shellPrint(`<div style="color:var(--sub)">=== 最近 ${logs.length} 条执行历史(审计日志) ===</div>`);
+  shellPrint(`<div style="color:var(--sub)">=== 最近 ${logs.length} 条下发/回报记录${t&&t!=="*"?`(设备 ${esc(t)})`:""} ===</div>`);
   for(const l of logs){
-    const color = l.exit_code === 0 ? "var(--ok)" : "var(--err)";
+    const color = statusColor(l.status);
+    const label = STATUS_CN[l.status] || l.status;
+    const tail = (l.status==="done"||l.status==="error") ? `退出码 ${l.exit_code} · ${l.duration_ms||0}ms` : (l.sent_at?"已领取":"排队中");
     shellPrint(
       `<div style="margin:6px 0;padding:6px;border:1px solid var(--line);border-radius:7px">`
-      + `<div style="color:var(--sub);font-size:12px">#${l.id} ${esc(cn(l.created_at))} · ${esc(l.actor)} · ${esc(l.ip||"")} · <span style="color:${color}">退出码 ${l.exit_code} · ${l.duration_ms}ms</span></div>`
+      + `<div style="color:var(--sub);font-size:12px">#${l.id} ${esc(cn(l.created_at))} · 设备 ${esc(l.device_id)} · 下发 ${esc(l.actor)} · <span style="color:${color}">${esc(label)} · ${esc(tail)}</span></div>`
       + `<div style="color:var(--fg)">$ ${esc(l.command)}</div>`
       + (l.stdout ? `<pre style="margin:4px 0;white-space:pre-wrap;max-height:120px;overflow:auto">${esc(l.stdout)}</pre>` : "")
       + (l.stderr ? `<pre style="margin:4px 0;color:var(--warn);white-space:pre-wrap;max-height:80px;overflow:auto">${esc(l.stderr)}</pre>` : "")
       + `</div>`
     );
   }
-  if(!logs.length) shellPrint(`<div style="color:var(--sub)">暂无历史记录</div>`);
+  if(!logs.length) shellPrint(`<div style="color:var(--sub)">暂无记录</div>`);
 }
-// 回车执行 / Shift+回车换行
+// 回车下发 / Shift+回车换行
 document.addEventListener("keydown", function(e){
   if(e.key === "Enter" && !e.shiftKey && document.activeElement && document.activeElement.id === "shell-cmd"){
     e.preventDefault(); runShell();

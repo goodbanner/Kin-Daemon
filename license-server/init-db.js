@@ -131,19 +131,26 @@ async function main() {
   )`);
   await run(`CREATE INDEX IF NOT EXISTS idx_txn_used ON paid_txns(used)`);
 
-  // Shell 命令执行审计日志：后台「远程终端」每条命令均落库，便于追溯谁在何时执行了什么。
-  await run(`CREATE TABLE IF NOT EXISTS shell_logs (
+  // 设备命令队列：后台「远程终端」把命令下发给【客户端设备】(本人自有设备群),
+  // 由设备上的守护轮询领取、在【设备本地】执行、再回报结果。服务器只入队/转发，不在服务器执行。
+  // 流转：pending(待领取) → sent(已下发待回报) → done/error(已回报)。
+  await run(`CREATE TABLE IF NOT EXISTS device_commands (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    command      TEXT NOT NULL,               -- 执行的命令(截断 2000 字符)
-    exit_code    INTEGER,                     -- 退出码(0=成功)
-    stdout       TEXT,                         -- 标准输出(截断)
-    stderr       TEXT,                         -- 标准错误/错误信息(截断)
-    duration_ms  INTEGER,                     -- 耗时(毫秒)
-    actor        TEXT,                         -- 执行者(admin 用户名 或 apikey)
-    ip           TEXT,
-    created_at   TEXT DEFAULT (datetime('now'))
+    device_id    TEXT NOT NULL,               -- 目标设备(广播时按每台设备各入一行)
+    command      TEXT NOT NULL,               -- 待设备执行的命令(截断 2000 字符)
+    status       TEXT DEFAULT 'pending',      -- pending / sent / done / error
+    exit_code    INTEGER,                     -- 设备回报的退出码(0=成功)
+    stdout       TEXT,                         -- 设备回报的标准输出(截断)
+    stderr       TEXT,                         -- 设备回报的标准错误(截断)
+    duration_ms  INTEGER,                     -- 设备本地执行耗时(毫秒)
+    actor        TEXT,                         -- 下发者(admin 用户名 或 apikey)
+    ip           TEXT,                         -- 下发者 IP
+    created_at   TEXT DEFAULT (datetime('now')),
+    sent_at      TEXT,                         -- 被设备领取的时间
+    done_at      TEXT                          -- 设备回报结果的时间
   )`);
-  await run(`CREATE INDEX IF NOT EXISTS idx_shell_created ON shell_logs(id DESC)`);
+  await run(`CREATE INDEX IF NOT EXISTS idx_devcmd_pending ON device_commands(device_id, status, id)`);
+  await run(`CREATE INDEX IF NOT EXISTS idx_devcmd_created ON device_commands(id DESC)`);
 
   // 默认产品
   const prod = await get(`SELECT product_id FROM products WHERE product_id='PROD001'`);

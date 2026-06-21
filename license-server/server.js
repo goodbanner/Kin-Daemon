@@ -1,7 +1,6 @@
 // 卡密授权服务端：验证/生成/管理 + 网页后台。详见 README。
 const path = require("path");
 const crypto = require("crypto");
-const { exec } = require("child_process");
 const express = require("express");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
@@ -42,14 +41,14 @@ try {
 // 卡密被后台禁用 → 停发新签 → 令牌在窗口内过期 → 远程吊销生效。
 const TOKEN_TTL_DAYS = Number(process.env.LICENSE_TOKEN_TTL_DAYS || 7);
 
-// ---------- 远程 Shell 终端(后台) ----------
-// 危险功能：允许管理员在后台直接执行服务器 shell 命令(如 rm -rf data 清理临时数据)。
-// 仅 adminOrApiKey("manage") 可用；每条命令写入 shell_logs 审计；超时自动终止。
-// 注意：Vercel serverless 沙箱内 shell 执行受限(只读 FS/无持久进程)，建议在 Docker/本地部署使用。
-// 可用环境变量 ENABLE_SHELL=0 全局关闭此功能；SHELL_TIMEOUT_MS 调整超时(默认 30s)。
+// ---------- 远程终端 / 设备命令下发(后台) ----------
+// 命令【不在服务器执行】，而是下发给【客户端设备】(本人自有设备群):
+//   后台入队 → 设备守护轮询 /api/device/commands 领取 → 在【设备本地】执行 → 回报 /api/device/command-result。
+// 适用：自有测试机/设备群的远程运维。命令全程落 device_commands 表(下发者/IP/结果/耗时)便于审计。
+// 环境变量 ENABLE_SHELL=0 可全局关闭下发；SHELL_TIMEOUT_MS 作为给设备端的执行超时建议(默认 30s)。
 const SHELL_ENABLED = String(process.env.ENABLE_SHELL || "1") !== "0";
 const SHELL_TIMEOUT_MS = Number(process.env.SHELL_TIMEOUT_MS || 30000);
-const SHELL_MAX_BUFFER = 2 * 1024 * 1024; // 单次输出上限 2MB，超出按 err 截断
+const OUT_CLIP = 200000; // 设备回报的 stdout/stderr 入库前各截断到 20 万字符
 
 const sha256 = (s) => crypto.createHash("sha256").update(s).digest("hex");
 
@@ -384,48 +383,95 @@ app.get("/api/stats", apiLimiter, adminOrApiKey("manage"), async (_req, res) => 
   res.json({ code: 200, success: true, data: { total: total ? total.c : 0, ...map, recent } });
 });
 
-// ---------- 远程 Shell 终端(后台) ----------
-// 执行服务器 shell 命令。每条命令落 shell_logs 审计表(命令/退出码/输出/执行者/IP/耗时)。
-// 超时(SHELL_TIMEOUT_MS)自动 kill；输出超 SHELL_MAX_BUFFER 按 err 返回。Vercel 沙箱下能力受限。
+// ---------- 远程终端：下发命令到客户端设备(后台) ----------
+// 把命令入队到目标设备(device_id)；广播填 "*" → 给所有「已激活」设备各入一行。
+// 命令不在服务器执行；由设备守护轮询领取并在【设备本地】执行后回报结果。
 app.post("/api/admin/shell", apiLimiter, adminOrApiKey("manage"), async (req, res) => {
-  if (!SHELL_ENABLED) return res.json({ code: 403, success: false, message: "Shell 功能已被禁用(ENABLE_SHELL=0)" });
+  if (!SHELL_ENABLED) return res.json({ code: 403, success: false, message: "命令下发已被禁用(ENABLE_SHELL=0)" });
   const cmd = String((req.body || {}).command || "").trim();
+  const target = String((req.body || {}).device_id || "").trim();
   if (!cmd) return res.status(400).json({ code: 400, success: false, message: "缺少 command" });
+  if (!target) return res.status(400).json({ code: 400, success: false, message: "缺少目标设备 device_id(广播填 *)" });
 
   const actor = (req.admin && req.admin.username) || "apikey";
-  const startedAt = Date.now();
+  const ip = req.ip || "";
 
-  exec(cmd, { timeout: SHELL_TIMEOUT_MS, maxBuffer: SHELL_MAX_BUFFER, cwd: process.cwd() }, async (err, stdout, stderr) => {
-    const exitCode = err ? (Number.isFinite(err.code) ? err.code : 1) : 0;
-    const duration = Date.now() - startedAt;
-    const out = (stdout || "").toString().slice(0, 200000);
-    let errOut = (stderr || "").toString().slice(0, 200000);
-    let errMsg = "";
-    if (err) {
-      errMsg = err.killed ? `命令超时(${SHELL_TIMEOUT_MS}ms)被终止` : String(err.message || "");
-      if (errOut) errOut += "\n" + errMsg; else errOut = errMsg;
-    }
+  // 解析目标设备列表
+  let devices;
+  if (target === "*") {
+    const rows = await all(
+      `SELECT DISTINCT device_id FROM license_keys WHERE device_id IS NOT NULL AND device_id<>'' AND status=1`
+    );
+    devices = rows.map((r) => r.device_id);
+    if (!devices.length) return res.json({ code: 200, success: true, message: "当前无已激活设备", data: { queued: 0, devices: [] } });
+  } else {
+    devices = [target];
+  }
 
+  // 黑名单设备不下发(仅拒绝服务)
+  const blocked = new Set((await all(`SELECT device_id FROM device_blacklist`)).map((r) => r.device_id));
+  const sendTo = devices.filter((d) => !blocked.has(d));
+
+  for (const d of sendTo) {
     await run(
-      `INSERT INTO shell_logs(command, exit_code, stdout, stderr, duration_ms, actor, ip) VALUES(?,?,?,?,?,?,?)`,
-      [cmd.slice(0, 2000), exitCode, out, errOut, duration, actor, req.ip || ""]
-    ).catch((e) => console.error("shell 审计日志写入失败:", e.message));
+      `INSERT INTO device_commands(device_id, command, actor, ip) VALUES(?,?,?,?)`,
+      [d, cmd.slice(0, 2000), actor, ip]
+    ).catch((e) => console.error("命令入队失败:", e.message));
+  }
 
-    res.json({
-      code: 200, success: exitCode === 0,
-      message: exitCode === 0 ? `执行成功 · ${duration}ms` : `退出码 ${exitCode} · ${duration}ms`,
-      data: { command: cmd, exit_code: exitCode, stdout: out, stderr: errOut, error: errMsg, duration_ms: duration, timeout: SHELL_TIMEOUT_MS }
-    });
+  res.json({
+    code: 200, success: true,
+    message: sendTo.length ? `已下发到 ${sendTo.length} 台设备,等待设备回报` : "目标设备均在黑名单,未下发",
+    data: { queued: sendTo.length, devices: sendTo, skipped_blacklisted: devices.length - sendTo.length, timeout_ms: SHELL_TIMEOUT_MS }
   });
 });
 
-// Shell 执行历史(后台审计)
+// 设备守护轮询领取本设备的待执行命令(客户端调用)。领取即标记 sent。
+app.get("/api/device/commands", verifyLimiter, requireApiKey("verify"), async (req, res) => {
+  if (!SHELL_ENABLED) return res.json({ code: 200, success: true, data: { commands: [] } });
+  const device_id = String(req.query.device_id || "").trim();
+  if (!device_id) return res.status(400).json({ code: 400, success: false, message: "缺少 device_id" });
+  // 黑名单设备不下发任何命令
+  const bl = await get(`SELECT 1 AS x FROM device_blacklist WHERE device_id=?`, [device_id]);
+  if (bl) return res.json({ code: 200, success: true, data: { commands: [] } });
+
+  const rows = await all(
+    `SELECT id, command FROM device_commands WHERE device_id=? AND status='pending' ORDER BY id ASC LIMIT 20`,
+    [device_id]
+  );
+  if (rows.length) {
+    const ids = rows.map((r) => r.id);
+    await run(
+      `UPDATE device_commands SET status='sent', sent_at=datetime('now') WHERE id IN (${ids.map(() => "?").join(",")})`,
+      ids
+    );
+  }
+  res.json({ code: 200, success: true, data: { commands: rows, timeout_ms: SHELL_TIMEOUT_MS } });
+});
+
+// 设备回报命令执行结果(客户端调用)。
+app.post("/api/device/command-result", verifyLimiter, requireApiKey("verify"), async (req, res) => {
+  const { id, device_id, exit_code, stdout, stderr, duration_ms } = req.body || {};
+  if (!id) return res.status(400).json({ code: 400, success: false, message: "缺少 id" });
+  const clip = (s, n) => String(s == null ? "" : s).slice(0, n);
+  const code = Number.isFinite(Number(exit_code)) ? Number(exit_code) : null;
+  const status = code === 0 ? "done" : "error";
+  await run(
+    `UPDATE device_commands SET status=?, exit_code=?, stdout=?, stderr=?, duration_ms=?, done_at=datetime('now')
+       WHERE id=? AND device_id=COALESCE(?, device_id) AND status<>'done'`,
+    [status, code, clip(stdout, OUT_CLIP), clip(stderr, OUT_CLIP), Number(duration_ms) || 0, id, device_id || null]
+  ).catch((e) => console.error("命令结果写入失败:", e.message));
+  res.json({ code: 200, success: true, message: "ok" });
+});
+
+// 命令下发/回报历史(后台审计)。可按 device_id 过滤。
 app.get("/api/admin/shell/logs", apiLimiter, adminOrApiKey("manage"), async (req, res) => {
   const limit = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 200);
-  const rows = await all(
-    `SELECT id, command, exit_code, stdout, stderr, duration_ms, actor, ip, created_at
-     FROM shell_logs ORDER BY id DESC LIMIT ?`, [limit]
-  );
+  const device = String(req.query.device_id || "").trim();
+  const cols = `id, device_id, command, status, exit_code, stdout, stderr, duration_ms, actor, ip, created_at, sent_at, done_at`;
+  const rows = device
+    ? await all(`SELECT ${cols} FROM device_commands WHERE device_id=? ORDER BY id DESC LIMIT ?`, [device, limit])
+    : await all(`SELECT ${cols} FROM device_commands ORDER BY id DESC LIMIT ?`, [limit]);
   res.json({ code: 200, success: true, data: { logs: rows, enabled: SHELL_ENABLED, timeout_ms: SHELL_TIMEOUT_MS } });
 });
 

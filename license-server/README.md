@@ -59,6 +59,27 @@ npm start         # http://localhost:3000
 | POST | `/api/license/disable` / `enable` / `unbind` / `delete` | `{license_key}` |
 | GET  | `/api/stats` | 统计 + 最近验证日志 |
 | POST | `/api/admin/login` | 后台登录 `{username,password}`→JWT |
+| POST | `/api/admin/shell` | 后台下发命令到设备 `{device_id,command}`(广播填 `device_id:"*"`) |
+| GET  | `/api/admin/shell/logs?device_id=&limit=` | 命令下发/回报历史(审计) |
+| GET  | `/api/device/commands?device_id=` | 设备守护轮询领取本设备待执行命令 |
+| POST | `/api/device/command-result` | 设备回报结果 `{id,device_id,exit_code,stdout,stderr,duration_ms}` |
+
+### 远程终端:下发命令到设备(自有设备群运维)
+命令**不在服务器执行**,而是入队转发给客户端设备,由设备守护在**设备本地**执行后回报。仅用于本人自有设备群。
+设备守护需实现一个轮询循环(用 `verify` 权限的同一把 `X-API-Key`):
+
+```http
+# 1) 轮询领取(建议 10~30s 一次)。返回 [] 表示无待执行命令。
+GET /api/device/commands?device_id=<ro.serialno>
+X-API-Key: SK_xxx
+→ { "data": { "commands": [ { "id": 12, "command": "cat /sdcard/Android/CTS/mode.txt" } ], "timeout_ms": 30000 } }
+
+# 2) 本地执行(建议套用 timeout_ms 作为超时),再回报:
+POST /api/device/command-result
+X-API-Key: SK_xxx
+{ "id":12, "device_id":"<ro.serialno>", "exit_code":0, "stdout":"balance\n", "stderr":"", "duration_ms":8 }
+```
+被后台拉黑(黑名单)的设备不会收到任何命令。环境变量 `ENABLE_SHELL=0` 可全局关闭下发。
 
 ### 验证请求/响应
 ```http
