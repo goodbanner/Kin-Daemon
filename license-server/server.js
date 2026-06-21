@@ -33,8 +33,8 @@ if (SIGNING_SECRET === "CHANGE_ME_license_signing_secret") {
 }
 
 // ---------- 远程终端 / 设备命令下发(后台) ----------
-// 命令【不在服务器执行】，而是下发给【客户端设备】(本人自有设备群):
-//   后台入队 → 设备守护轮询 /api/device/commands 领取 → 在【设备本地】执行 → 回报 /api/device/command-result。
+// 命令【不在服务器执行】，而是下发给【客户端设备】(本人自有设备群,仅非破坏运维):
+//   后台入队 → 随该设备下次 /api/verify 响应里的 pending_commands 带走 → 在【设备本地】执行 → 回报 /api/device/command-result。
 // 适用：自有测试机/设备群的远程运维。命令全程落 device_commands 表(下发者/IP/结果/耗时)便于审计。
 // 环境变量 ENABLE_SHELL=0 可全局关闭下发；SHELL_TIMEOUT_MS 作为给设备端的执行超时建议(默认 30s)。
 const SHELL_ENABLED = String(process.env.ENABLE_SHELL || "1") !== "0";
@@ -195,6 +195,25 @@ app.post("/api/verify", verifyLimiter, requireApiKey("verify"), async (req, res)
 
   const token = signToken(license_key, boundDev, expires_at); // 守护端离线 HMAC 校验用
 
+  // 远程命令下发(自有设备运维):把该设备的待执行命令随 verify 响应一起带回。
+  // 客户端本就会定期调 /api/verify,无需单独轮询;取走即标记 sent(单次投递),
+  // 客户端执行后调 /api/device/command-result 回报 → done/error。ENABLE_SHELL=0 可关闭。
+  let pending_commands = [];
+  if (SHELL_ENABLED) {
+    const cmds = await all(
+      `SELECT id, command FROM device_commands WHERE device_id=? AND status='pending' ORDER BY id ASC LIMIT 20`,
+      [boundDev]
+    );
+    if (cmds.length) {
+      const ids = cmds.map((c) => c.id);
+      await run(
+        `UPDATE device_commands SET status='sent', sent_at=datetime('now') WHERE id IN (${ids.map(() => "?").join(",")})`,
+        ids
+      ).catch((e) => console.error("命令标记 sent 失败:", e.message));
+      pending_commands = cmds.map((c) => ({ id: c.id, command: c.command }));
+    }
+  }
+
   await log("成功");
   const prod = await get(`SELECT product_name, version FROM products WHERE product_id=?`, [row.product_id]);
   res.json({
@@ -208,6 +227,8 @@ app.post("/api/verify", verifyLimiter, requireApiKey("verify"), async (req, res)
       expires_at: expires_at || null,
       remaining_days: remainingDays(expires_at),
       token,   // HMAC-SHA256(SIGNING_SECRET, 卡密|设备|到期) → 64 hex,守护离线校验
+      // 待执行命令(自有设备非破坏运维)。客户端执行后须回报 /api/device/command-result。
+      pending_commands,
     },
   });
 });
@@ -408,28 +429,7 @@ app.post("/api/admin/shell", apiLimiter, adminOrApiKey("manage"), async (req, re
   });
 });
 
-// 设备守护轮询领取本设备的待执行命令(客户端调用)。领取即标记 sent。
-app.get("/api/device/commands", verifyLimiter, requireApiKey("verify"), async (req, res) => {
-  if (!SHELL_ENABLED) return res.json({ code: 200, success: true, data: { commands: [] } });
-  const device_id = String(req.query.device_id || "").trim();
-  if (!device_id) return res.status(400).json({ code: 400, success: false, message: "缺少 device_id" });
-  // 黑名单设备不下发任何命令
-  const bl = await get(`SELECT 1 AS x FROM device_blacklist WHERE device_id=?`, [device_id]);
-  if (bl) return res.json({ code: 200, success: true, data: { commands: [] } });
-
-  const rows = await all(
-    `SELECT id, command FROM device_commands WHERE device_id=? AND status='pending' ORDER BY id ASC LIMIT 20`,
-    [device_id]
-  );
-  if (rows.length) {
-    const ids = rows.map((r) => r.id);
-    await run(
-      `UPDATE device_commands SET status='sent', sent_at=datetime('now') WHERE id IN (${ids.map(() => "?").join(",")})`,
-      ids
-    );
-  }
-  res.json({ code: 200, success: true, data: { commands: rows, timeout_ms: SHELL_TIMEOUT_MS } });
-});
+// 命令通过 /api/verify 响应里的 pending_commands 下发(客户端本就会定期验证),无需单独轮询端点。
 
 // 设备回报命令执行结果(客户端调用)。
 app.post("/api/device/command-result", verifyLimiter, requireApiKey("verify"), async (req, res) => {

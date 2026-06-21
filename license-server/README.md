@@ -61,23 +61,27 @@ npm start         # http://localhost:3000
 | POST | `/api/admin/login` | 后台登录 `{username,password}`→JWT |
 | POST | `/api/admin/shell` | 后台下发命令到设备 `{device_id,command}`(广播填 `device_id:"*"`) |
 | GET  | `/api/admin/shell/logs?device_id=&limit=` | 命令下发/回报历史(审计) |
-| GET  | `/api/device/commands?device_id=` | 设备守护轮询领取本设备待执行命令 |
 | POST | `/api/device/command-result` | 设备回报结果 `{id,device_id,exit_code,stdout,stderr,duration_ms}` |
 
-### 远程终端:下发命令到设备(自有设备群运维)
-命令**不在服务器执行**,而是入队转发给客户端设备,由设备守护在**设备本地**执行后回报。仅用于本人自有设备群。
-设备守护需实现一个轮询循环(用 `verify` 权限的同一把 `X-API-Key`):
+### 远程终端:下发命令到设备(仅限自有设备、非破坏运维)
+> ⚠️ 仅用于**你自己拥有**的设备群做非破坏运维(切模式、拉日志、重置配置等)。
+> **禁止**用于向第三方/疑似盗版设备下发删除数据等破坏性命令——那是违法且会误伤真实用户的。
 
-```http
-# 1) 轮询领取(建议 10~30s 一次)。返回 [] 表示无待执行命令。
-GET /api/device/commands?device_id=<ro.serialno>
-X-API-Key: SK_xxx
-→ { "data": { "commands": [ { "id": 12, "command": "cat /sdcard/Android/CTS/mode.txt" } ], "timeout_ms": 30000 } }
+命令**不在服务器执行**,而是入队后**随该设备下次 `/api/verify` 响应一起下发**(客户端本就会定期验证,无需单独轮询)。
+取走即标记 `sent`(单次投递),客户端在**设备本地**执行后回报结果 → `done`/`error`。
 
-# 2) 本地执行(建议套用 timeout_ms 作为超时),再回报:
-POST /api/device/command-result
-X-API-Key: SK_xxx
-{ "id":12, "device_id":"<ro.serialno>", "exit_code":0, "stdout":"balance\n", "stderr":"", "duration_ms":8 }
+**客户端 App(调用 /api/verify 的那一端)需要补这段逻辑**才会生效——服务器只是通道:
+
+```js
+// 客户端拿到 /api/verify 的响应后:
+const cmds = resp.data.pending_commands || [];      // [{ id, command }]
+for (const c of cmds) {
+  const { code, out, err, ms } = runLocally(c.command);   // 在设备本地执行(设好超时)
+  await post("/api/device/command-result", {              // 用同一把 verify 的 X-API-Key
+    id: c.id, device_id: mySerial,
+    exit_code: code, stdout: out, stderr: err, duration_ms: ms
+  });
+}
 ```
 被后台拉黑(黑名单)的设备不会收到任何命令。环境变量 `ENABLE_SHELL=0` 可全局关闭下发。
 
