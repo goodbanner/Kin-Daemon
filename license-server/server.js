@@ -25,21 +25,12 @@ app.use(async (req, res, next) => {
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString("hex");
 
-// 授权令牌签名：Ed25519 非对称签名。服务端仅持【私钥】(PEM/PKCS8)签发,守护内嵌【公钥】离线验签。
-// 公钥泄露无法伪造令牌 —— 杜绝「挖出密钥批量造授权」。私钥务必只放服务端环境变量,绝不下发。
-// 生成: openssl genpkey -algorithm ed25519 -out priv.pem; 对应公钥嵌入守护 License.hpp。
-const SIGNING_PRIVATE_KEY_PEM = process.env.LICENSE_SIGNING_PRIVATE_KEY || "";
-let SIGNING_KEY = null;
-try {
-  if (SIGNING_PRIVATE_KEY_PEM) SIGNING_KEY = crypto.createPrivateKey(SIGNING_PRIVATE_KEY_PEM);
-  else console.error("⚠️ 未配置 LICENSE_SIGNING_PRIVATE_KEY,/api/verify 将无法签发令牌");
-} catch (e) {
-  console.error("❌ LICENSE_SIGNING_PRIVATE_KEY 解析失败:", e.message);
+// 授权令牌签名：HMAC-SHA256(对称)。服务端签发、守护端离线校验须用【同一个】 SIGNING_SECRET。
+// 该密钥已烧进守护(include/License.hpp),务必与之保持一致并保密;改了密钥需同步重编译守护。
+const SIGNING_SECRET = process.env.LICENSE_SIGNING_SECRET || "CHANGE_ME_license_signing_secret";
+if (SIGNING_SECRET === "CHANGE_ME_license_signing_secret") {
+  console.error("⚠️ 未配置 LICENSE_SIGNING_SECRET,/api/verify 将签发出与守护不匹配的令牌");
 }
-
-// 令牌有效期(天):App 须在此周期内回服务器换新签;到期即触发守护停机。
-// 卡密被后台禁用 → 停发新签 → 令牌在窗口内过期 → 远程吊销生效。
-const TOKEN_TTL_DAYS = Number(process.env.LICENSE_TOKEN_TTL_DAYS || 7);
 
 // ---------- 远程终端 / 设备命令下发(后台) ----------
 // 命令【不在服务器执行】，而是下发给【客户端设备】(本人自有设备群):
@@ -52,14 +43,13 @@ const OUT_CLIP = 200000; // 设备回报的 stdout/stderr 入库前各截断到 
 
 const sha256 = (s) => crypto.createHash("sha256").update(s).digest("hex");
 
-// Ed25519 令牌：绑定 卡密|设备|订阅到期|令牌到期,守护用内嵌公钥离线验签。
-// 返回 { token(128hex 签名), token_not_after(令牌自身到期) }。
+// HMAC 令牌：绑定 卡密|设备|到期 三要素,守护端用同一 SIGNING_SECRET 离线校验(防伪造 license 文件)。
+// 必须与 include/License.hpp 完全一致：HMAC_SHA256(secret, `${key}|${dev}|${exp||"0"}`) → 64 hex。
 function signToken(licenseKey, deviceId, expiresAt) {
-  if (!SIGNING_KEY) throw new Error("授权签名私钥未配置(LICENSE_SIGNING_PRIVATE_KEY)");
-  const tokenNotAfter = new Date(Date.now() + TOKEN_TTL_DAYS * 86400000).toISOString();
-  const msg = `${licenseKey}|${deviceId}|${expiresAt || "0"}|${tokenNotAfter}`;
-  const token = crypto.sign(null, Buffer.from(msg, "utf8"), SIGNING_KEY).toString("hex");
-  return { token, token_not_after: tokenNotAfter };
+  return crypto
+    .createHmac("sha256", SIGNING_SECRET)
+    .update(`${licenseKey}|${deviceId}|${expiresAt || "0"}`)
+    .digest("hex");
 }
 
 // ---------- 鉴权 ----------
@@ -203,14 +193,7 @@ app.post("/api/verify", verifyLimiter, requireApiKey("verify"), async (req, res)
     return res.json({ code: 410, success: false, message: "卡密已过期" });
   }
 
-  let signed;
-  try {
-    signed = signToken(license_key, boundDev, expires_at); // 守护端离线验签用
-  } catch (e) {
-    await log("签发失败");
-    console.error("签发令牌失败:", e.message);
-    return res.status(500).json({ code: 500, success: false, message: "服务器签名配置异常,请联系作者" });
-  }
+  const token = signToken(license_key, boundDev, expires_at); // 守护端离线 HMAC 校验用
 
   await log("成功");
   const prod = await get(`SELECT product_name, version FROM products WHERE product_id=?`, [row.product_id]);
@@ -224,8 +207,7 @@ app.post("/api/verify", verifyLimiter, requireApiKey("verify"), async (req, res)
       activated_at: row.activated_at || nowIso(),
       expires_at: expires_at || null,
       remaining_days: remainingDays(expires_at),
-      token: signed.token,                       // Ed25519 签名(128 hex)
-      token_not_after: signed.token_not_after,   // 令牌自身到期,App 须周期内续签
+      token,   // HMAC-SHA256(SIGNING_SECRET, 卡密|设备|到期) → 64 hex,守护离线校验
     },
   });
 });
