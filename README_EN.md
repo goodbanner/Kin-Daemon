@@ -1,0 +1,101 @@
+<div align="center">
+
+# Kin
+
+**CPU scheduling daemon**
+
+Battery-first · self-learning smart mode · per-app profiles · governor-driven frequency response
+
+[简体中文](README.md) | English
+
+[![License](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](#license)
+[![Governor](https://img.shields.io/badge/Governor-walt%20·%20schedutil%20·%20hmbird-brightgreen.svg)](#)
+[![App](https://img.shields.io/badge/Front--end-Kin%20Companion-orange)](https://github.com/kktwo2923-creator/CTS)
+
+</div>
+
+---
+
+## What is this
+
+**Kin** is a CPU scheduling daemon for Android. It sets per-mode frequency limits and governor parameters, then leaves the actual up/down-scaling rhythm to the kernel governor (walt / schedutil / hmbird) — power-efficient yet responsive. In smart mode it adds a load state machine and a frame-aware closed loop on top.
+
+Use it standalone by writing `mode.txt`, or pair it with the GUI front-end [Kin Companion](https://github.com/kktwo2923-creator/CTS) for per-app automatic takeover.
+
+- **Multi-SoC**: Snapdragon 8 Elite Gen 5 (8e5/8E) / 8G1 / 8G2 / 8G3 / 8G5 / 7P3 · Dimensity 9300 / 9400 — ships 10 factory configs, auto-selected at flash time.
+
+## Features
+
+- 🪶 **Minimal frequency model** — only limits + governor parameters; frequency response belongs to the governor
+- 🔋 **Five modes** — `powersave / balance / performance / fast (FengChi) / auto (smart)`, switchable with one command
+- 🎯 **Per-app profiles** — match by package name; games ramp up automatically and restore on exit
+- 🧠 **Smart mode (auto)** — six-state load FSM + self-learned power bias + sleep-schedule learning + questionnaire correction; per-state frequency caps (`fsm_policy`) and per-category caps / core parking (`app_policy`)
+- 🎮 **FAS (frame-aware scheduling)** — closed-loop `scaling_max` control from measured FPS while gaming: steady frames → lower clocks to save power, dropped frames → open up instantly
+- 🌀 **FengChi governor switch** — apps profiled as *FengChi game* switch to `hmbird`/`scx` on game entry (fallback `walt`/`sugov_ext`), restored on exit; mutually exclusive with FAS per app
+- 🧵 **Thread allocation** — AppOpt-compatible `applist.prop` per-thread affinity + realtime priority (SCHED_FIFO/RR) + `cpu.shares` weighting + render-thread fast path for the game library + app blacklist
+- 🌐 **System-level tuning (ported from ASB)** — per-mode VM/network/WiFi tuning, boot-time trim, background memory trim
+
+## Quick start
+
+```
+/sdcard/Android/Kin/
+├── config.json      # main config (hot-reloaded)
+├── mode.txt         # current mode
+├── applist.prop     # thread-affinity rules (AppOpt compatible)
+└── log.txt          # runtime log
+```
+
+Switch modes (takes effect immediately):
+
+```bash
+echo "powersave"   > /sdcard/Android/Kin/mode.txt   # maximum battery
+echo "balance"     > /sdcard/Android/Kin/mode.txt   # daily driver ← recommended
+echo "performance" > /sdcard/Android/Kin/mode.txt   # performance first
+echo "fast"        > /sdcard/Android/Kin/mode.txt   # FengChi (hmbird governor)
+echo "auto"        > /sdcard/Android/Kin/mode.txt   # smart self-learning mode
+```
+
+## Smart mode (auto)
+
+The learning/decision algorithm is ported from [AutoSystemBoost](https://github.com/krilikd/AutoSystemBoost)'s Smart Mode (MIT, © Dima Krylov): 12-bucket habit learning, confidence gating, graded fallback, night / thermal-veto / low-battery overrides.
+
+On top of that, a six-state **FSM** (`DEEP_IDLE / LIGHT_IDLE / MODERATE / HEAVY / SUSTAINED / GAMING`) advances every ~2 s from GPU utilization / CPU load / temperature, with hysteresis and minimum dwell times, writing per-state frequency ceilings. Entering **GAMING** is driven by the per-app policy (`game_heavy` / `game_lite` profiles enter instantly) with GPU-threshold and system-category fallbacks.
+
+- **Per-state caps** — override any state's ceiling via `Function.AutoMode.fsm_policy` (edited visually in the app)
+- **Per-category caps** — video/social/music etc. get extra ceilings and optional core parking via `app_policy`
+- **FAS** — in GAMING, `scaling_max` follows measured FPS (ported from [fas-rs](https://github.com/shadow3aaa/fas-rs), P-controller with util ceiling, jank fast-open, target auto-detection)
+- **Questionnaire correction** — the app shows what has been learned (sleep window, power bias, per-state caps) and lets the user confirm or correct; corrections seed the learner via `auto_control.txt`
+
+## Frequency model
+
+Kin does not do scene detection. Three governor parameters do the heavy lifting (written under `gov_cN.params`):
+
+| Parameter | Unit | Meaning |
+|---|---|---|
+| `up_rate_limit_us` | µs | minimum interval between frequency increases — small = snappy, large = calm |
+| `down_rate_limit_us` | µs | minimum interval between decreases — small = drops fast (saves power) |
+| `hispeed_load` | % | load threshold for hispeed boost — high = harder to boost |
+
+Rule of thumb: `down_rate_limit_us ≤ 4000` in powersave/balance is the key to actually seeing clocks drop; `up_rate_limit_us ≤ 5000` in game/performance keeps things smooth.
+
+## Configuration
+
+```json
+{
+    "meta": { ... },            // basic info
+    "Policy": { ... },          // CPU cluster index (c0/c1/... → policyN)
+    "Function": { ... },        // feature switches (AutoMode / ThreadAlloc / SysTune / ...)
+    "package_blacklist": [...], // apps never taken over
+    "models": [ ... ]           // per-profile frequency configs (game_heavy / video / ...)
+}
+```
+
+All values are written as strings (`"true"`, `"75"`); the daemon parses them tolerantly. `config.json`, `applist.prop` and `perapp_powermode.txt` are all hot-reloaded via inotify — no restart needed. See the [Chinese README](README.md) for the full field-by-field reference and FAQ.
+
+## Credits
+
+Design references [yumi](https://github.com/imacte/yumi) and [MW_CpuTurboScheduler](https://github.com/MoWei-2077/MW_CpuTurboScheduler); smart mode ported from [AutoSystemBoost](https://github.com/krilikd/AutoSystemBoost) (MIT); FAS ported from [fas-rs](https://github.com/shadow3aaa/fas-rs); thread templates from SutoLiu's AppOpt / JZzz ecosystem (GPL-3.0); engine thread signatures aligned with Metric.
+
+## License
+
+GPL-3.0. Upstream attributions are kept at the top of the corresponding source files.

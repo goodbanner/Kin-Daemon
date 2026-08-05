@@ -1,0 +1,481 @@
+{
+    "meta": {
+        "name": "Kin-8E5",
+        "version": "Pro",
+        "author": "Ktwo",
+        "loglevel": "INFO"
+    },
+    "Policy": {
+        "c0": "0",
+        "c1": "6",
+        "c2": "-1",
+        "c3": "-1"
+    },
+    "Function": {
+        "Cpuset": {
+            "enable": "true",
+            "top_app": "0-7",
+            "foreground": "0-7",
+            "restricted": "0-5",
+            "system_background": "0-3",
+            "background": "0-2"
+        },
+        "LaunchBoost": {
+            "enable": "false"
+        },
+        "OfficialMode": {
+            "enable": "false"
+        },
+        "Scheduler": {
+            "enable": "true",
+            "sched_energy_aware": "true",
+            "sched_schedstats": "false",
+            "sched_nr_migrate": "32"
+        },
+        "SceneDetect": {
+            "enable": "false"
+        },
+        "AppProfile": {
+            "enable": "true"
+        },
+        "AutoMode": {
+            "app_policy_enable": "true",
+            "app_policy_core_enable": "false",
+            "fsm_sustained_enter": "54",
+            "fsm_sustained_exit": "48",
+            "app_policy": {
+                "game": {
+                    "maxL": "100",
+                    "maxB": "100",
+                    "gpu": "0",
+                    "cores": "11111111"
+                },
+                "audio": {
+                    "maxL": "40",
+                    "maxB": "35",
+                    "gpu": "35",
+                    "cores": "11111111"
+                },
+                "video": {
+                    "maxL": "44",
+                    "maxB": "40",
+                    "gpu": "0",
+                    "cores": "11111111"
+                },
+                "image": {
+                    "maxL": "70",
+                    "maxB": "60",
+                    "gpu": "0",
+                    "cores": "11111111"
+                },
+                "social": {
+                    "maxL": "60",
+                    "maxB": "55",
+                    "gpu": "0",
+                    "cores": "11111111"
+                },
+                "news": {
+                    "maxL": "55",
+                    "maxB": "50",
+                    "gpu": "0",
+                    "cores": "11111111"
+                },
+                "maps": {
+                    "maxL": "90",
+                    "maxB": "85",
+                    "gpu": "0",
+                    "cores": "11111111"
+                },
+                "productivity": {
+                    "maxL": "70",
+                    "maxB": "60",
+                    "gpu": "0",
+                    "cores": "11111111"
+                },
+                "undefined": {
+                    "maxL": "100",
+                    "maxB": "100",
+                    "gpu": "0",
+                    "cores": "11111111"
+                }
+            }
+        }
+    },
+    "package_blacklist": [
+        "com.android.systemui",
+        "com.android.launcher*",
+        "com.miui.home",
+        "com.coloros.launcher",
+        "com.oneplus.launcher",
+        "com.oplus.launcher",
+        "com.baidu.input*",
+        "com.sohu.inputmethod.*",
+        "com.tencent.qqpinyin",
+        "com.iflytek.inputmethod*",
+        "com.google.android.inputmethod.*",
+        "android",
+        "PopupWindow",
+        "NotificationShade",
+        "com.omarea.vtools*",
+        "com.omarea.gesture*",
+        "bin.mt.plus*",
+        "com.ktwo.cts",
+        "com.ktwo.kin"
+    ],
+    "models": [
+        {
+            "model_name": "powersave",
+            "mode": "powersave",
+            "is_game": false,
+            "packages": [],
+            "freq_min_c0": "384000",
+            "freq_max_c0": "2361600",
+            "freq_min_c1": "806400",
+            "freq_max_c1": "1996800",
+            "gpu_min_mhz": "160",
+            "gpu_max_mhz": "500",
+            "CoreOnline": {
+                "Core0": "1",
+                "Core1": "1",
+                "Core2": "1",
+                "Core3": "1",
+                "Core4": "1",
+                "Core5": "1",
+                "Core6": "0",
+                "Core7": "0"
+            },
+            "gov_c0": {
+                "governor": "walt",
+                "params": {
+                    "up_rate_limit_us": "500",
+                    "down_rate_limit_us": "0"
+                }
+            },
+            "gov_c1": {
+                "governor": "walt",
+                "params": {
+                    "up_rate_limit_us": "500",
+                    "down_rate_limit_us": "0"
+                }
+            }
+        },
+        {
+            "model_name": "balance",
+            "mode": "balance",
+            "is_game": false,
+            "packages": [],
+            "freq_min_c0": "556800",
+            "freq_max_c0": "2611200",
+            "freq_min_c1": "806400",
+            "freq_max_c1": "2841600",
+            "gpu_min_mhz": "160",
+            "gpu_max_mhz": "600",
+            "CoreOnline": {
+                "Core0": "1",
+                "Core1": "1",
+                "Core2": "1",
+                "Core3": "1",
+                "Core4": "1",
+                "Core5": "1",
+                "Core6": "1",
+                "Core7": "0"
+            },
+            "gov_c0": {
+                "governor": "walt"
+            },
+            "gov_c1": {
+                "governor": "walt"
+            }
+        },
+        {
+            "model_name": "performance",
+            "mode": "performance",
+            "is_game": false,
+            "packages": [],
+            "freq_min_c0": "806400",
+            "freq_max_c0": "2476800",
+            "freq_min_c1": "921600",
+            "freq_max_c1": "3091200",
+            "gpu_min_mhz": "160",
+            "gpu_max_mhz": "1100",
+            "CoreOnline": {
+                "Core0": "1",
+                "Core1": "1",
+                "Core2": "1",
+                "Core3": "1",
+                "Core4": "1",
+                "Core5": "1",
+                "Core6": "1",
+                "Core7": "1"
+            },
+            "gov_c0": {
+                "governor": "walt"
+            },
+            "gov_c1": {
+                "governor": "walt"
+            }
+        },
+        {
+            "model_name": "fast",
+            "mode": "fast",
+            "is_game": false,
+            "packages": [],
+            "freq_min_c0": "1152000",
+            "freq_max_c0": "3321600",
+            "freq_min_c1": "1248000",
+            "freq_max_c1": "3436800",
+            "gpu_min_mhz": "160",
+            "gpu_max_mhz": "1200",
+            "CoreOnline": {
+                "Core0": "1",
+                "Core1": "1",
+                "Core2": "1",
+                "Core3": "1",
+                "Core4": "1",
+                "Core5": "1",
+                "Core6": "1",
+                "Core7": "1"
+            },
+            "gov_c0": {
+                "governor": "hmbird"
+            },
+            "gov_c1": {
+                "governor": "hmbird"
+            }
+        },
+        {
+            "model_name": "game_heavy",
+            "is_game": true,
+            "packages": [
+                "com.tencent.tmgp.pubgmhd",
+                "com.tencent.tmgp.sgame",
+                "com.tencent.tmgp.cod",
+                "com.tencent.tmgp.dfm",
+                "com.tencent.tmgp.speedmobile",
+                "com.miHoYo.Yuanshen",
+                "com.miHoYo.ys.mi",
+                "com.miHoYo.hkrpg",
+                "com.miHoYo.Nap",
+                "com.miHoYo.bh3",
+                "com.hypergryph.arknights",
+                "com.hypergryph.endfield",
+                "com.kurogame.mingchao",
+                "com.manjuu.promilia",
+                "com.hero.dna.gf",
+                "com.netease.dwrg",
+                "com.netease.l22",
+                "com.netease.nshm",
+                "com.netease.yyslscn",
+                "com.pi.czrxdfirst",
+                "com.pubg.imobile",
+                "com.tencent.KiHan",
+                "com.tencent.jkchess",
+                "com.tencent.mf.uam",
+                "com.tencent.nrc",
+                "com.ea.gp.fifamobile",
+                "com.hottagames.yh.laohu",
+                "com.idreamsky.klbqm",
+                "com.longe.allstarhmt",
+                "com.netease.party",
+                "com.roblox.client",
+                "com.soulgamechst.majsoul",
+                "com.tencent.lolm",
+                "com.tencent.tmgp.cf",
+                "com.tencent.tmgp.codev",
+                "com.tencent.tmgp.nz",
+                "jp.konami.pesam"
+            ],
+            "freq_min_c0": "537600",
+            "freq_max_c0": "5000000",
+            "freq_min_c1": "768000",
+            "freq_max_c1": "5000000",
+            "gpu_min_mhz": "160",
+            "gpu_max_mhz": "1200",
+            "CoreOnline": {
+                "Core0": "1",
+                "Core1": "1",
+                "Core2": "1",
+                "Core3": "1",
+                "Core4": "1",
+                "Core5": "1",
+                "Core6": "1",
+                "Core7": "1"
+            },
+            "gov_c0": {
+                "governor": ""
+            },
+            "gov_c1": {
+                "governor": ""
+            }
+        },
+        {
+            "model_name": "video",
+            "is_game": false,
+            "packages": [
+                "com.ss.android.ugc.aweme",
+                "com.smile.gifmaker",
+                "com.kuaishou.nebula",
+                "tv.danmaku.bili",
+                "com.bilibili.app.in",
+                "com.tencent.qqlive",
+                "com.youku.phone",
+                "com.qiyi.video",
+                "com.hunantv.imgo.video",
+                "com.netflix.mediaclient"
+            ],
+            "freq_min_c0": "384000",
+            "freq_max_c0": "1555200",
+            "freq_min_c1": "768000",
+            "freq_max_c1": "1400000",
+            "gpu_min_mhz": "160",
+            "gpu_max_mhz": "500",
+            "CoreOnline": {
+                "Core0": "1",
+                "Core1": "1",
+                "Core2": "1",
+                "Core3": "1",
+                "Core4": "1",
+                "Core5": "1",
+                "Core6": "0",
+                "Core7": "0"
+            },
+            "gov_c0": {
+                "governor": "walt",
+                "params": {
+                    "up_rate_limit_us": "500",
+                    "down_rate_limit_us": "0"
+                }
+            },
+            "gov_c1": {
+                "governor": "walt",
+                "params": {
+                    "up_rate_limit_us": "500",
+                    "down_rate_limit_us": "0"
+                }
+            }
+        },
+        {
+            "model_name": "social",
+            "is_game": false,
+            "packages": [
+                "com.tencent.mm",
+                "com.tencent.mobileqq",
+                "com.tencent.tim",
+                "com.alibaba.android.rimet",
+                "com.ss.android.lark"
+            ],
+            "freq_min_c0": "384000",
+            "freq_max_c0": "2496000",
+            "freq_min_c1": "768000",
+            "freq_max_c1": "2880000",
+            "gpu_min_mhz": "160",
+            "gpu_max_mhz": "",
+            "CoreOnline": {
+                "Core0": "1",
+                "Core1": "1",
+                "Core2": "1",
+                "Core3": "1",
+                "Core4": "1",
+                "Core5": "1",
+                "Core6": "0",
+                "Core7": "0"
+            },
+            "gov_c0": {
+                "governor": "walt",
+                "params": {
+                    "up_rate_limit_us": "500",
+                    "down_rate_limit_us": "0"
+                }
+            },
+            "gov_c1": {
+                "governor": "walt",
+                "params": {
+                    "up_rate_limit_us": "500",
+                    "down_rate_limit_us": "0"
+                }
+            }
+        },
+        {
+            "model_name": "reading",
+            "is_game": false,
+            "packages": [
+                "com.phoenix.read",
+                "io.legado.app.release",
+                "com.kingsoft.moffice_pro",
+                "com.tencent.weread"
+            ],
+            "freq_min_c0": "384000",
+            "freq_max_c0": "1555200",
+            "freq_min_c1": "537600",
+            "freq_max_c1": "1555200",
+            "gpu_min_mhz": "160",
+            "gpu_max_mhz": "500",
+            "CoreOnline": {
+                "Core0": "1",
+                "Core1": "1",
+                "Core2": "1",
+                "Core3": "1",
+                "Core4": "1",
+                "Core5": "1",
+                "Core6": "0",
+                "Core7": "0"
+            },
+            "gov_c0": {
+                "governor": "walt",
+                "params": {
+                    "up_rate_limit_us": "500",
+                    "down_rate_limit_us": "0"
+                }
+            },
+            "gov_c1": {
+                "governor": "walt",
+                "params": {
+                    "up_rate_limit_us": "500",
+                    "down_rate_limit_us": "0"
+                }
+            }
+        },
+        {
+            "model_name": "music",
+            "is_game": false,
+            "packages": [
+                "com.netease.cloudmusic",
+                "com.tencent.qqmusic",
+                "cn.kuwo.player",
+                "com.kugou.android",
+                "com.spotify.music",
+                "com.apple.android.music"
+            ],
+            "freq_min_c0": "384000",
+            "freq_max_c0": "2496000",
+            "freq_min_c1": "384000",
+            "freq_max_c1": "1300000",
+            "gpu_min_mhz": "160",
+            "gpu_max_mhz": "400",
+            "CoreOnline": {
+                "Core0": "1",
+                "Core1": "1",
+                "Core2": "1",
+                "Core3": "1",
+                "Core4": "1",
+                "Core5": "1",
+                "Core6": "0",
+                "Core7": "0"
+            },
+            "gov_c0": {
+                "governor": "walt",
+                "params": {
+                    "up_rate_limit_us": "500",
+                    "down_rate_limit_us": "0"
+                }
+            },
+            "gov_c1": {
+                "governor": "walt",
+                "params": {
+                    "up_rate_limit_us": "500",
+                    "down_rate_limit_us": "0"
+                }
+            }
+        }
+    ]
+}

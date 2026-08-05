@@ -1,0 +1,194 @@
+name: Build
+
+on:
+  push:
+    branches: [main, "claude/**"]
+    tags: ["v*"]
+    paths-ignore:
+      - "**.md"
+      - "LICENSE"
+  pull_request:
+    branches: [main, "claude/**"]
+    paths-ignore:
+      - "**.md"
+      - "LICENSE"
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: "Build type"
+        required: false
+        default: "Release"
+        type: choice
+        options:
+          - Release
+          - Debug
+      ndk_version:
+        description: "Android NDK version (默认 r26d; 留空则用默认)"
+        required: false
+        default: "r26d"
+
+jobs:
+  build:
+    name: Build (${{ matrix.abi }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        abi: [arm64-v8a]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Android NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: ${{ github.event.inputs.ndk_version || 'r26d' }}
+          add-to-path: false
+
+      - name: Install Ninja
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      # 单一版本:授权校验由 App 端「解锁智能版」驱动(见 include/License.hpp),
+      # 守护无条件运行, 是否付费仅由 App 下发的 auth.json 决定。不再区分捐赠版/公益版。
+      - name: Build
+        env:
+          ANDROID_NDK: ${{ steps.ndk.outputs.ndk-path }}
+          BUILD_TYPE: ${{ github.event.inputs.build_type || 'Release' }}
+          NO_LICENSE: "OFF"
+        run: |
+          chmod +x ./build.sh
+          ./build.sh ${{ matrix.abi }}
+          mkdir -p dist
+          cp "output/${{ matrix.abi }}/Kinetic" "dist/Kinetic"
+
+      - name: Validate JSON configs
+        run: |
+          for f in Json/*.json; do
+            echo "Validating $f"
+            python3 -c "import json; json.load(open('$f'))"
+          done
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        continue-on-error: true       # 产物上传失败(如 Actions 存储配额满)不算编译失败 —— 编译本身已成功
+        with:
+          name: Kin-${{ matrix.abi }}
+          path: dist/Kinetic
+          if-no-files-found: error
+          retention-days: 1          # 仅供下游 bundle/release 用, 1 天即过期, 避免占满 Actions 存储配额
+
+  bundle:
+    name: Bundle artifacts
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Assemble bundle
+        run: |
+          mkdir -p bundle
+          for d in artifacts/Kin-*; do
+            abi="${d##*Kin-}"
+            mkdir -p "bundle/$abi"
+            cp "$d/Kinetic" "bundle/$abi/" 2>/dev/null || true
+          done
+          cp -r Json README.md LICENSE bundle/
+          ls -laR bundle/
+
+      - name: Upload bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kin-bundle
+          path: bundle/
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Pack release archive
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          tag="${GITHUB_REF##*/}"
+          archive="Kin-${tag}.zip"
+          (cd bundle && zip -r "../${archive}" .)
+          sha256sum "${archive}" | tee "${archive}.sha256"
+          ls -la "${archive}" "${archive}.sha256"
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          files: |
+            Kin-*.zip
+            Kin-*.zip.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # 滚动发布(公开 Releases):双版本上线期间改为「仅手动触发」,推送只产内部 artifact,不动公开下载。
+  # 需要对外发布时在 Actions 页手动 Run workflow(workflow_dispatch)即可。
+  rolling-release:
+    name: Rolling release
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Compute tag
+        id: meta
+        run: |
+          echo "tag=nightly-$(echo '${{ github.ref_name }}' | tr '/' '-')" >> "$GITHUB_OUTPUT"
+          echo "short=$(echo '${{ github.sha }}' | cut -c1-7)" >> "$GITHUB_OUTPUT"
+
+      - name: Assemble assets
+        run: |
+          mkdir -p bundle
+          for d in artifacts/Kin-*; do
+            abi="${d##*Kin-}"
+            mkdir -p "bundle/$abi"
+            cp "$d/Kinetic" "bundle/$abi/" 2>/dev/null || true
+          done
+          cp -r Json README.md LICENSE bundle/
+          # 裸二进制(直接替换模块用) + 整包(二进制+Json)
+          cp artifacts/Kin-arm64-v8a/Kinetic ./Kin-arm64-v8a
+          (cd bundle && zip -r ../Kin-nightly.zip .)
+          sha256sum Kin-arm64-v8a Kin-nightly.zip | tee SHA256SUMS.txt
+
+      - name: Publish rolling release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: "最新构建 (${{ github.ref_name }})"
+          prerelease: true
+          body: |
+            分支 `${{ github.ref_name }}` 的最新自动构建(commit ${{ steps.meta.outputs.short }})。
+
+            - **Kin-arm64-v8a** — 裸二进制(授权由 App 端「解锁智能版」驱动)
+            - **Kin-nightly.zip** — 二进制 + Json 整包
+            - **SHA256SUMS.txt** — 校验值
+          files: |
+            Kin-arm64-v8a
+            Kin-nightly.zip
+            SHA256SUMS.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

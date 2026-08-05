@@ -1,0 +1,14 @@
+{
+    "name": "Kin 调度",
+    "author": "Ktwo",
+    "version": "Ⅴ⁰⁵",
+    "versionCode": 260623,
+    "features": {
+        "strict": true,
+        "pedestal": false
+    },
+    "module": "Kin",
+    "state": "/sdcard/Android/Kin/mode.txt",
+    "entry": "/data/powercfg.sh",
+    "projectUrl": ""
+}

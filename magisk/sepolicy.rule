@@ -1,0 +1,18 @@
+# Kin 共享内存零拷贝(Phase 2)SELinux 放行 —— 最大努力, 未命中会自动回退到 socket 文本路径。
+#
+# 守护 Kinetic 由 Magisk/KernelSU 的 service.sh 拉起, 继承其安全域(magisk / su / ksu 之一)。
+# 它用 memfd_create 建共享内存, 经 SCM_RIGHTS 把 fd 发给 App(普通 untrusted_app)。App 要:
+#   ① 使用收到的、属于守护域的 fd:      allow untrusted_app <守护域>:fd use
+#   ② 只读映射该 memfd:                 allow untrusted_app <memfd类型>:file { read map }
+#
+# 不同 ROM 的守护域名与 memfd 类型可能不同。下面覆盖常见组合; magiskpolicy 对不存在的类型会
+# 自动跳过该行, 不影响开机。若某机型仍被拦, 抓 dmesg 里 `avc: denied ... scontext=... tcontext=...`
+# 用真实域名/类型再补一行 allow 即可(补不上也只是回退到文本 socket, 功能不受影响)。
+
+allow untrusted_app magisk fd use
+allow untrusted_app su fd use
+allow untrusted_app ksu fd use
+
+allow untrusted_app magisk file { read map open getattr }
+allow untrusted_app magisk_file file { read map open getattr }
+allow untrusted_app tmpfs file { read map open getattr }

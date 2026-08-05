@@ -1,0 +1,109 @@
+
+##################################################################################
+# Tombstone & Background App Management
+##################################################################################
+
+# 启用墓碑冻结
+persist.sys.oppo.tombstone.enable=1
+sys.oppo.tombstone.status=1
+persist.sys.tombstone.enable=1
+
+# 冻结策略（激进模式）
+sys.oppo.tombstone.freeze_policy=3
+sys.oppo.tombstone.freeze_delay=0
+sys.oppo.tombstone.force_freeze=1
+sys.oppo.tombstone.memory_reclaim=1
+sys.oppo.tombstone.cpu_limit=1
+sys.oppo.tombstone.network_block=1
+sys.oppo.tombstone.location_block=1
+sys.oppo.tombstone.wake_speed=2
+sys.oppo.tombstone.restore_state=1
+
+
+persist.sys.horae.enable=1
+
+# 解除后台应用数量限制
+vendor.perf.background_app_limit=0
+
+##################################################################################
+# VSync & Buffering
+##################################################################################
+
+debug.adreno.disable_vsync=1
+debug.sf.vsync_enabled=0
+debug.sf.triple_buffer=0
+debug.adreno.triple_buffer_disable=1
+
+##################################################################################
+# Logging & Debug
+##################################################################################
+
+debug.atrace.tags.enableflags=0
+persist.sys.oplus.opm.logstart=false
+persist.sys.log.user=0
+persist.sys.log.lfeh=false
+persist.sys.log.cache=false
+persist.bt.iot.enablelogging=false
+
+##################################################################################
+# Thermal & Performance Limits
+##################################################################################
+
+vendor.perf.framepacing.enable=false
+# ro.oplus.radio.hide_nr_switch=0  # ro.* 属性运行时不可修改
+# ro.oplus.audio.thermal_control=0  # ro.* 属性运行时不可修改
+oplus.dex.tempcontrol=false
+# ro.oplus.cpu.thermal.enable=0  # ro.* 属性运行时不可修改
+# ro.oplus.gpu.thermal.enable=0  # ro.* 属性运行时不可修改
+
+##################################################################################
+# Vulkan Safe Mode
+##################################################################################
+
+debug.hwui.vulkan_safe_mode=1
+persist.vulkan.fallback=0
+debug.vulkan.validate=0
+debug.vulkan.force_validation=0
+# Debug/Log
+debug.sf.oplus_display_trace.enable=false
+debug.vendor.perf.smart_touch.trace=false
+persist.sys.oplus.need_log=false
+persist.sys.ostats_pullerd.enable=false
+persist.sys.ostats_tpd.enable=false
+persist.sys.ostatsd.enable=false
+persist.sys.ssr.enable_debug=false
+persist.vendor.corectl.debug.config=false
+persist.vendor.sys.rawdump_copy=false
+persist.vendor.tracing.hsuart.enabled=false
+# ro.oplus.minidump.kernel.log.support=false  # ro.* 属性运行时不可修改
+# ro.oplus.wifi.minidump.enable.state=false  # ro.* 属性运行时不可修改
+# mem
+persist.sys.oplus.lmkd_super_critical_threshold_8g=256
+persist.sys.oplus.lmkd_super_critical_threshold_12g=256
+persist.sys.oplus.lmkd_super_critical_threshold_16g=512
+persist.sys.oplus.lmkd_super_critical_threshold_24g=512
+persist.sys.oplus.lmkd_super_critical_threshold_rus_8g=256
+persist.sys.oplus.lmkd_super_critical_threshold_rus_12g=256
+persist.sys.oplus.lmkd_super_critical_threshold_rus_16g=512
+persist.sys.oplus.lmkd_super_critical_threshold_rus_24g=512
+sys.lmk.oplus.force_use_old_strategy=0
+sys.oplus.vm.oplus_compact_memory=0
+# preload
+
+persist.vendor.enable.preload=false
+# ro.lmk.psi_partial_stall_ms=200  # ro.* 属性运行时不可修改
+# ro.lmk.psi_complete_stall_ms=700  # ro.* 属性运行时不可修改
+# ro.lmk.thrashing_limit=100  # ro.* 属性运行时不可修改
+# ro.lmk.thrashing_limit_decay=10  # ro.* 属性运行时不可修改
+# ro.lmk.thrashing_limit_critical=200  # ro.* 属性运行时不可修改
+# ro.lmk.swap_util_max=100  # ro.* 属性运行时不可修改
+# ro.lmk.kill_heaviest_task=0  # ro.* 属性运行时不可修改
+
+##################################################################################
+# 高刷解禁(移植 ASB FPS): 去掉系统对视频/游戏默认帧率的封顶, 让面板能跑到高刷。
+# 注: 这是"放开上限", 不是强制锁定某个 Hz(强制锁定由 App 的刷新率档位负责)。
+##################################################################################
+vendor.display.enable_optimize_refresh=1
+debug.graphics.video_default_frame_rate.disabled=true
+debug.graphics.game_default_frame_rate.disabled=true
+# ro.lmk.kill_timeout_ms=100  # ro.* 属性运行时不可修改

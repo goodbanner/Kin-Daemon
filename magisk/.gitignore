@@ -1,0 +1,6 @@
+# config.json 仍是构建注入产物(由 build_pack.py 从 ../Json/config.json 复制进来):
+# 模块真正用的多 SoC 配置在 config/ 子目录,照常入库;这个根目录副本不纳入版本控制。
+/config.json
+# 守护二进制 Kin 与随包 App Kin.apk 现已随模块入库
+# (模块需自带它们才能离线安装)。如需改回 CI/构建注入,删掉这两个文件即可;
+# build_pack.py 打包时仍会用 output/ 的新构建覆盖刷新 Kin。
