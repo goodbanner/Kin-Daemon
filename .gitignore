@@ -34,3 +34,8 @@ Makefile
 # 参考资料(不纳入版本控制)
 powerd-uclamp-v1/
 powerd-uclamp-v1.zip
+
+# 本地调试脚本(含服务器凭据,禁止入库)
+_portscan.py
+_ssh_find.py
+_*.py
