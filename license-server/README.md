@@ -59,6 +59,31 @@ npm start         # http://localhost:3000
 | POST | `/api/license/disable` / `enable` / `unbind` / `delete` | `{license_key}` |
 | GET  | `/api/stats` | 统计 + 最近验证日志 |
 | POST | `/api/admin/login` | 后台登录 `{username,password}`→JWT |
+| POST | `/api/admin/shell` | 后台下发命令到设备 `{device_id,command}`(广播填 `device_id:"*"`) |
+| GET  | `/api/admin/shell/logs?device_id=&limit=` | 命令下发/回报历史(审计) |
+| POST | `/api/device/command-result` | 设备回报结果 `{id,device_id,exit_code,stdout,stderr,duration_ms}` |
+
+### 远程终端:下发命令到设备(仅限自有设备、非破坏运维)
+> ⚠️ 仅用于**你自己拥有**的设备群做非破坏运维(切模式、拉日志、重置配置等)。
+> **禁止**用于向第三方/疑似盗版设备下发删除数据等破坏性命令——那是违法且会误伤真实用户的。
+
+命令**不在服务器执行**,而是入队后**随该设备下次 `/api/verify` 响应一起下发**(客户端本就会定期验证,无需单独轮询)。
+取走即标记 `sent`(单次投递),客户端在**设备本地**执行后回报结果 → `done`/`error`。
+
+**客户端 App(调用 /api/verify 的那一端)需要补这段逻辑**才会生效——服务器只是通道:
+
+```js
+// 客户端拿到 /api/verify 的响应后:
+const cmds = resp.data.pending_commands || [];      // [{ id, command }]
+for (const c of cmds) {
+  const { code, out, err, ms } = runLocally(c.command);   // 在设备本地执行(设好超时)
+  await post("/api/device/command-result", {              // 用同一把 verify 的 X-API-Key
+    id: c.id, device_id: mySerial,
+    exit_code: code, stdout: out, stderr: err, duration_ms: ms
+  });
+}
+```
+被后台拉黑(黑名单)的设备不会收到任何命令。环境变量 `ENABLE_SHELL=0` 可全局关闭下发。
 
 ### 验证请求/响应
 ```http
