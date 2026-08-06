@@ -1,6 +1,8 @@
 #!/system/bin/sh
 SKIPMOUNT=false
-PROPFILE=true
+# system.prop 仅限 ColorOS: 关闭 Magisk/KernelSU 的 system.prop 自动应用机制,
+# 属性改由 post-fs-data.sh 按机型判定逐条 resetprop(非 ColorOS 不应用)。
+PROPFILE=false
 POSTFSDATA=true
 LATESTARTSERVICE=true
 

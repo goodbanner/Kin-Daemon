@@ -2,6 +2,38 @@
 
 MODDIR="${0%/*}"
 
+# ── 非 ColorOS 系统不应用 system.prop ──────────────────────────────────────
+# system.prop 里全是 ColorOS/OxygenOS 专属属性(墓碑冻结、oplus lmkd、oplus 日志等),
+# 对其它 ROM 无意义甚至有害。原文件已改名为 system.prop.coloros(Magisk/KernelSU
+# 不再自动应用), 由这里判定机型: 仅 ColorOS 系(有 ro.build.oplus_version)才
+# 逐条 resetprop 应用, 非 ColorOS 跳过。
+apply_coloros_props() {
+    # ColorOS/OxygenOS 判定: 带 ro.build.oplus_version 属性, 或品牌属 OPPO/OnePlus/realme。
+    # 双保险 —— 个别 ColorOS 构建可能缺 oplus_version 而只靠 brand 识别;
+    # brand 取值大小写不统一(oppo/OPPO/Oppo), 统一转小写再比。
+    if [ -z "$(getprop ro.build.oplus_version 2>/dev/null)" ]; then
+        case "$(getprop ro.product.brand 2>/dev/null | tr 'A-Z' 'a-z')" in
+            oppo|oneplus|realme) ;;
+            *) return 0 ;;
+        esac
+    fi
+    [ -f "$MODDIR/system.prop.coloros" ] || return 0
+    local line key val CR
+    CR=$(printf '\r')
+    while IFS= read -r line; do
+        # 去掉行尾 CR: 该文件在 Windows 上编辑过(CRLF), 不剥离会把 \r 带进属性值。
+        line="${line%$CR}"
+        case "$line" in
+            ''|\#*) continue ;;
+        esac
+        key="${line%%=*}"
+        val="${line#*=}"
+        [ -n "$key" ] || continue
+        resetprop "$key" "$val" 2>/dev/null
+    done < "$MODDIR/system.prop.coloros"
+}
+apply_coloros_props
+
 set_shell_temp() {
     [ -e /proc/shell-temp ] || return 0
     for zone in 0 1 2 3 4 5 6 7; do
