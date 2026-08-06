@@ -397,6 +397,8 @@ namespace Config {
         static constexpr int MAX_BLACKLIST = 64;
         inline bool     enable = false;
 
+        inline std::recursive_mutex profileMtx;           // 保护 blacklist/Models 并发读写
+
         inline string_t        packageBlacklist[MAX_BLACKLIST];
         inline int             blacklistCount = 0;
 
@@ -439,6 +441,7 @@ namespace Config {
         }
 
         inline bool isBlacklisted(const char* pkg) {
+            std::lock_guard<std::recursive_mutex> lk(profileMtx);
             for (int i = 0; i < blacklistCount; i++) {
                 if (matchPackage(packageBlacklist[i].c_str(), pkg)) return true;
             }
@@ -461,6 +464,7 @@ namespace Config {
         }
 
         inline int findMatchingModel(const char* pkg, bool useGlobalFallback = true) {
+            std::lock_guard<std::recursive_mutex> lk(profileMtx);  // 保护 blacklist/perApp/Models 并发读
             if (isBlacklisted(pkg)) return -1;
             // perapp 优先：config.json 与 perapp 重复时以 perapp 为准
             for (int i = 0; i < perAppCount; i++) {

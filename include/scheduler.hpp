@@ -1260,6 +1260,8 @@ public:
             gamingGovActive_ = true;                      // 即使一个没切成也置位, 避免每 tick 重试刷日志
             if (entering) gamingGovEngaged_ = present;    // 供 FAS 互斥判定: 仅回退(walt/sugov_ext)不算风驰在位
             else if (present) gamingGovEngaged_ = true;   // 补切成功 → 在位升级(FAS 互斥随之生效)
+            // 进入游戏态: 矫正 cpuset 到全核 (天玑/骁龙通用, 对抗 OEM 收窄大核)
+            if (entering) correctGameTopAppCpus();
             bool pendNow = false;
             for (int i = 0; i < kClusterCount; i++) pendNow = pendNow || gamingGovPend_[i];
             if (entering && !any && !pendNow)
@@ -1908,6 +1910,7 @@ public:
                 // 必须持 applyMtx: fileWatch 线程经 onModeChanged→onlineAll 在锁内写同一数组(避免 data race)。
                 { std::lock_guard<std::recursive_mutex> lk(applyMtx);
                   applyGamingGov(false);   // 退出 auto: 游戏态调速器若在切换态, 条件还原(外部改过则不覆盖)
+                  gamingGovEngaged_ = false;   // 退出 auto: 清原生风驰标记 (active_=false 时 applyGamingGov(false) 为 no-op, 需显式清)
                   applyTopAppUclampMin(0);   // 退出 auto: 还原 top-app uclamp 下限
                   applyPowerBoost(-1);        // 退出 auto: 还原 UCLAMP 各节点到原值
                   pwrParkBig_ = false;        // 退出 auto: 解除功率关核(大核随 onlineAll 重新上线)
@@ -2206,6 +2209,7 @@ public:
                         // 复位 lastGpuMax 强制 FSM 重新下发每状态 GPU max(去重缓存已陈旧)。
                         fengchiActive = false;
                         fengchiGovPending = false;   // 退出沿: 取消待检查(3s 内退出则不切)
+                        gamingGovEngaged_ = false;   // 退出风驰: 清原生 scx 标记 (cpuset 周期检查用)
                         if (Config::GpuFreq::enable) {
                             Config::GpuFreq::min_mhz.store(0, std::memory_order_relaxed);
                             lastGpuMax = -1;
@@ -2319,13 +2323,51 @@ public:
                                 logger.Info("原生风驰启动成功");
                                 // 原生在位: 不调 applyGamingGov(避免覆盖原生设置);
                                 // gamingGovActive_ 保持 false → 退出时 applyGamingGov(false) 为 no-op。
+                                gamingGovEngaged_ = true;  // 标记风驰在位, 供 cpuset 周期检查判定
+                                // cpuset 仍可能被 OEM 收窄, 进入沿矫正一次
+                                correctGameTopAppCpus();
                             } else {
                                 logger.Info("原生风驰启动失败, 强制切换风驰调速器");
                                 applyGamingGov(true);
                             }
                         }
                     } else if (fengchiActive && gamingGovActive_) {
-                        // 已强切(失败路径): 每 tick 继续调 applyGamingGov(true) 补切 pending 簇(边沿驱动, 幂等)
+                        // 已强切: 每 tick 补切 pending 簇, 并周期校验 governor 未被 ROM 改回
+                        // (auto 模式下 enforceState 早退, 此处是唯一的风驰漂移对抗路径)
+                        static int govLostCheckTick = 0;
+                        if (++govLostCheckTick >= 5) {  // ~10s 校验一次
+                            govLostCheckTick = 0;
+                            for (int i = 0; i < kClusterCount; i++) {
+                                if (gamingGovSet_[i].empty()) continue;
+                                int pol = Config::Policy::CpuPolicy[i];
+                                if (pol < 0) continue;
+                                char path[192];
+                                FastSnprintf(path, sizeof(path), GovernorPath, pol);
+                                string_t cur = readSmallFile(path);
+                                if (cur.empty()) continue;
+                                // ROM 可能把 scx 改成 hm/hmbird(同属偏好列表), 只要还是风驰就算在位
+                                bool isGaming = false;
+                                const string_t& prefs = Config::AutoMode::gaming_gov;
+                                // string_t 是 qlib 持有型字符串, 没有 find/substr:
+                                // 手动按逗号切分偏好列表, 逐段与 cur 定长比对(避免切片临时对象)。
+                                const char*  pref = prefs.c_str();
+                                const size_t prefLen = prefs.size();
+                                size_t pos = 0;
+                                while (pos < prefLen) {
+                                    size_t comma = pos;
+                                    while (comma < prefLen && pref[comma] != ',') comma++;
+                                    const size_t len = comma - pos;
+                                    if (len == cur.size() && memcmp(cur.c_str(), pref + pos, len) == 0) {
+                                        isGaming = true; break;
+                                    }
+                                    pos = comma + 1;
+                                }
+                                if (!isGaming) {
+                                    gamingGovActive_ = false;  // 不在偏好列表 → 已被 ROM 改回
+                                    break;
+                                }
+                            }
+                        }
                         applyGamingGov(true);
                     } else if (!fengchiActive) {
                         // 非风驰态: 还原(若我们切过则条件还原, 没切过则 no-op)
@@ -2790,6 +2832,10 @@ public:
             if (m >= 0) {
                 Config::AppProfile::currentMatch.store(m);
                 applyWithProfile();
+                // config 重载后 applyWithProfile 用画像 governor(sugov_ext) 覆盖了 scx,
+                // 必须重切游戏态调速器, 否则游戏在前台但跑在 sugov_ext 下
+                applyGamingGov(strcmp(Config::AppProfile::Models[m].modelName.c_str(),
+                                      "game_heavy") == 0);
                 return;
             }
         }
@@ -3021,6 +3067,11 @@ public:
             logger.Debug("CPU 状态被外部改写 → 强制写回配置");
             invalidateFreqCache();
             applyWithProfile();
+            // applyWithProfile 用画像 governor(sugov_ext) 覆盖了 scx,
+            // 若游戏态调速器在位必须立即重切, 否则 ColorOS 改写后 scx 永久丢失
+            if (gamingGovActive_) {
+                applyGamingGov(true);
+            }
         }
         return drift;
     }
@@ -3031,6 +3082,9 @@ public:
     // 仅作用于 isGame 且该簇配置 governor 为空; 显式配置的簇不动。返回是否写入。
     bool propagateGameGovernor() {
         std::lock_guard<std::recursive_mutex> lk(applyMtx);
+        // 游戏态调速器在位时(sugov_ext → scx 已切换), 镜像逻辑不应覆盖 scx;
+        // 漂移对抗由 enforceState + gamingGovActive_ 补切处理, 此处直接跳过
+        if (gamingGovActive_) return false;
         int cur = Config::AppProfile::currentMatch.load();
         if (cur < 0 || cur >= Config::AppProfile::modelCount) return false;
         const auto& m = Config::AppProfile::Models[cur];
@@ -3076,6 +3130,7 @@ public:
             }
             bool changed = enforceState();
             if (propagateGameGovernor()) changed = true;   // 游戏档留空簇跟随 ROM 风驰
+            correctGameTopAppCpus();   // 游戏态周期性矫正 cpuset (与调速器检测同频, 适配天玑/骁龙)
             if (changed) { interval = 2000; stable = 0; }
             else if (++stable >= 5) interval = 5000;
             if (waitStop(interval)) break;
@@ -3085,9 +3140,11 @@ public:
     void correctGameTopAppCpus() {
         // 读 Models/Cpuset 全局 string，与配置重载互斥
         std::lock_guard<std::recursive_mutex> lk(applyMtx);
+        // 游戏态判定: 手动模式看画像匹配, 自动模式看调速器是否在位 (覆盖手动+智能双模)
         int cur = Config::AppProfile::currentMatch.load();
-        if (cur < 0 || cur >= Config::AppProfile::modelCount
-            || !Config::AppProfile::Models[cur].isGame) return;
+        bool inGame = (cur >= 0 && cur < Config::AppProfile::modelCount
+                       && Config::AppProfile::Models[cur].isGame);
+        if (!inGame && !gamingGovActive_ && !gamingGovEngaged_) return;
 
         // 目标全核范围: 优先用配置的 top_app(游戏档应为 0-7), 否则用当前全部在线 CPU。
         char desired[64] = { 0 };
@@ -3099,9 +3156,8 @@ public:
 
         char now[64] = { 0 };
         readNodeTrim("/dev/cpuset/top-app/cpus", now, sizeof(now));
-        // 仅当被收窄到 0-5(丢大核)或 2-7(丢小核)才矫正回全核;其它取值
-        // (含已是全核 0-7、或 ROM/其它工具自定义)一律不动,不抢占。
-        if (strcmp(now, "0-5") != 0 && strcmp(now, "2-7") != 0) return;
+        // 已是全核范围 → 不矫正 (适配天玑/骁龙, 不在代码里写死 0-7)
+        if (strcmp(now, desired) == 0) return;
 
         constexpr long long kFixMinMs = 1000;    // 节流：最多每秒矫正一次，防 ping-pong
         long long t = nowMs();
@@ -3112,7 +3168,7 @@ public:
         utils.FileWrite("/dev/cpuset/cpus", desired);
         utils.FileWrite("/dev/cpuset/top-app/cpus", desired);
         utils.FileWrite("/dev/cpuset/foreground/cpus", desired);
-        logger.Debug("游戏档: top-app cpuset 被收窄(%s) → 矫正回 %s", now, desired);
+        logger.Info("游戏档: top-app cpuset 被收窄(%s) → 矫正回 %s", now, desired);
     }
 
     std::string getForegroundPkg(bool fresh) {
@@ -3257,6 +3313,9 @@ public:
                 heldPkg.clear();      // 切到"另一个"保活类 App → 移交(走下方重建)
                 lastTopApp.clear();
             } else {
+                // /proc 瞬断去抖: 等 50ms 再查一次, 避免竞态误判游戏退出
+                usleep(50000);
+                if (utils.isPackageRunning(heldPkg.c_str())) return;
                 logger.Info("保活: %s 已退出 → 解除", labelForLog(heldPkg).c_str());  // 退出打印一次
                 heldPkg.clear();
                 Config::AppProfile::currentMatch.store(-1);

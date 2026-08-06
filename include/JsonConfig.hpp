@@ -324,6 +324,7 @@ public:
         AppProfile::blacklistCount  = 0;
         AppProfile::currentMatch.store(-1);
         baseModelIdx = -1;
+        { std::lock_guard<std::recursive_mutex> lk(AppProfile::profileMtx);
         for (int i = 0; i < AppProfile::MAX_BLACKLIST; i++)
             AppProfile::packageBlacklist[i] = "";
         for (int i = 0; i < AppProfile::MAX_MODELS; i++) {
@@ -341,6 +342,7 @@ public:
             m.GpuMinFreq = ""; m.GpuMaxFreq = "";
             for (int j = 0; j < kCoreCount; j++) m.Online[j] = -1;
         }
+        }  // profileMtx
     }
 
     // 发布 GPU 原子快照，供 gpuFreqGuard 跨线程无锁读取
@@ -784,6 +786,7 @@ private:
         try {
             auto& bl = json["package_blacklist"];
             int n = 0;
+            { std::lock_guard<std::recursive_mutex> lk(AppProfile::profileMtx);
             for (int i = 0; i < AppProfile::MAX_BLACKLIST; i++) {
                 try {
                     string_t pkg = bl.array()[i].get<string_t>();
@@ -792,6 +795,7 @@ private:
                 } catch (...) { break; }
             }
             AppProfile::blacklistCount = n;
+            }  // profileMtx
             // 仅在条数变化时打印，避免重载刷屏
             static int lastBlacklistCount = -1;
             if (n > 0 && n != lastBlacklistCount) {
