@@ -309,7 +309,8 @@ public:
         AutoMode::power_enable = true; AutoMode::power_boost_value = 128;
         AutoMode::power_boost_jank_enable = true; AutoMode::power_boost_jank_psi = 20;
         AutoMode::power_boost_jank_busy = 85; AutoMode::power_boost_jank_load = 4.0f;
-        AutoMode::power_boost_cap_pct = 100;
+        AutoMode::power_boost_jank_busy_floor = 45;
+        AutoMode::power_boost_cap_pct = 85;
         AutoMode::power_throttle_w = 7.5f; AutoMode::power_throttle_critical_w = 9.5f;
         AutoMode::power_throttle_big_pct = 80; AutoMode::power_throttle_critical_pct = 60;
         AutoMode::power_throttle_gpu_mhz = 680; AutoMode::power_throttle_critical_gpu_mhz = 460;
@@ -599,6 +600,7 @@ private:
                 readInt (a, "power_boost_jank_psi",      AutoMode::power_boost_jank_psi);
                 readInt (a, "power_boost_jank_busy",     AutoMode::power_boost_jank_busy);
                 readFlt (a, "power_boost_jank_load",     AutoMode::power_boost_jank_load);
+                readInt (a, "power_boost_jank_busy_floor", AutoMode::power_boost_jank_busy_floor);
                 readInt (a, "power_boost_cap_pct",       AutoMode::power_boost_cap_pct);
                 readFlt (a, "power_throttle_w",          AutoMode::power_throttle_w);
                 readFlt (a, "power_throttle_critical_w", AutoMode::power_throttle_critical_w);

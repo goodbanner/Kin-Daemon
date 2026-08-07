@@ -200,7 +200,12 @@ namespace Config {
         inline int      power_boost_jank_psi    = 20;     // PSI cpu some avg10(%) ≥ 此值判卡顿(最准, 任务等 CPU)
         inline int      power_boost_jank_busy   = 85;     // 无 PSI 回退: 能效加权负载% ≥ 此值
         inline float    power_boost_jank_load   = 4.0f;   // 无 PSI 回退: load1 ≥ 此值(busy+load 同时满足才判卡顿)
-        inline int      power_boost_cap_pct     = 100;    // 卡顿 boost 时大核上限抬到 hwmax × 此%(100=满频, 适度抬高给下限留空间)
+        // PSI 分支的【绝对需求下限】(0-100, 0=关闭本确认退回纯 PSI 行为)。
+        // PSI 衡量相对争用, 不等于真需要算力: 低频轻载下几个后台线程在小核排队就能把
+        // some avg10 顶到两位数。故 PSI 过阈后还须 cpuBusyW ≥ 本值(读不到回退 load1)才算
+        // "需要抬频的卡顿" —— 这是低功耗场景被误 boost 的主因所在。默认 45(轻载挡在门外)。
+        inline int      power_boost_jank_busy_floor = 45;
+        inline int      power_boost_cap_pct     = 85;     // 卡顿 boost 时大核上限抬到 hwmax × 此%(留头, 100=满频会把低需求场景直接顶到硬件极限)
         inline float    power_throttle_w        = 7.5f;   // ≥此功率关 boost + 压大核(重载过载)
         inline float    power_throttle_critical_w = 9.5f; // ≥此功率深度压制(临界保命)
         inline int      power_throttle_big_pct  = 80;     // 高功耗大核上限%(本机 hwmax × pct/100)

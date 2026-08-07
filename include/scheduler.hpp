@@ -89,6 +89,10 @@ private:
     std::string lastTopApp;          // 上一次前台应用包名（用于画像切换去重）
     long long   lastGameCpusetFixMs = 0;  // 游戏档 cpuset 矫正节流: 上次矫正时刻(ms), 防 ping-pong
     std::string heldPkg;             // 正在保活的游戏/保活画像包名(进程存活则维持), 空=未保活
+    // 保活解除去抖: 连续 kHeldMissMax 轮都查不到进程才真解除。单次 50ms 复查兜不住应用切换期的
+    // /proc 扫描瞬断, 而误解除代价是"掉档+还原调速器+重建"一整套, 宁可晚解除一两拍。
+    int         heldMissStreak_ = 0;        // 连续未查到保活进程的轮数(查到即清零)
+    static constexpr int kHeldMissMax = 3;  // 达到此轮数才判定游戏真退出
     bool        blacklistReleased = false;  // [真黑名单·方案A] 当前是否已对黑名单前台"释放接管"(交还系统)
 
     // ── 线程分配(AppOpt 式规则引擎)状态; 仅 threadAllocTask 线程访问, 无需加锁 ──
@@ -1177,6 +1181,31 @@ public:
         return string_t();
     }
 
+    // 单个调速器名是否在偏好列表(gaming_gov, 逗号分隔, trim 空白)中。
+    // string_t 是 qlib::string::value<char>, 没有 std::string 的 find/substr —— 手动扫描,
+    // 与 nativeFengchiGovRunning 同 idiom。供风驰漂移检查判定"当前簇是否还是风驰调速器"。
+    bool govInPrefList(const string_t& cur) {
+        if (cur.empty()) return false;
+        const string_t& pref = Config::AutoMode::gaming_gov;
+        if (pref.empty()) return false;
+        const char* csv = pref.c_str();
+        size_t len = strlen(csv);
+        size_t start = 0;
+        while (start <= len) {
+            size_t comma = start;
+            while (comma < len && csv[comma] != ',') comma++;
+            size_t b = start, e = comma;
+            while (b < e && (csv[b] == ' ' || csv[b] == '\t')) b++;
+            while (e > b && (csv[e-1] == ' ' || csv[e-1] == '\t')) e--;
+            if (e > b && cur.size() == (e - b) &&
+                strncmp(cur.c_str(), csv + b, e - b) == 0)
+                return true;
+            if (comma >= len) break;
+            start = comma + 1;
+        }
+        return false;
+    }
+
     // 检查各簇当前调速器是否已有任一为偏好列表(hm/hmbird/scx 等)中的项 —— 即"原生风驰"在位。
     // 供进入风驰游戏态 3s 后检查: ROM/内核已自动切成风驰则无需再切(只记日志"原生风驰启动成功")。
     // 注意: 只比对偏好列表项, 回退项(walt/sugov_ext)不算原生风驰。
@@ -1213,7 +1242,9 @@ public:
     // wantGaming 边沿驱动; 幂等, 每 tick 调也只在状态翻转时动 sysfs。
     // pending 补切: 进入沿时簇离线(节点读不到, 常见于关核停泊后直进游戏)→ 记 pending,
     // 后续 tick 簇上线后补写(仅对 pending 簇, 不重扫全部)。「本机无此调速器」不进 pending(无望目标不重试)。
-    void applyGamingGov(bool wantGaming) {
+    // reason: 调用来源标签, 打进还原日志。还原分支有近十个调用点(前台切换/配置重载/退出 auto/
+    // 黑名单释放/保活解除/线程收尾), 不带来源时日志只有一行"还原 walt", 无法区分是谁触发的。
+    void applyGamingGov(bool wantGaming, const char* reason = "") {
         const string_t& pref = Config::AutoMode::gaming_gov;
         if (pref.empty()) wantGaming = false;             // 功能关: 已切换则还原
         bool pendAny = false;
@@ -1280,7 +1311,8 @@ public:
                         { std::lock_guard<std::mutex> g(mtx);
                           lastGovernor[i] = gamingGovSaved_[i];
                           lastMinFreq[i].clear(); lastMaxFreq[i].clear(); }
-                        logger.Info("游戏态调速器: 簇%d 还原 %s", pol, gamingGovSaved_[i].c_str());
+                        logger.Info("游戏态调速器: 簇%d 还原 %s%s%s", pol, gamingGovSaved_[i].c_str(),
+                                    (reason && *reason) ? " ← " : "", (reason && *reason) ? reason : "");
                     }
                 }
                 gamingGovSaved_[i].clear(); gamingGovSet_[i].clear();
@@ -1361,6 +1393,47 @@ public:
     int  pwrBoostMode_  = 0;             // 0=未探测/无 1=cgroup 2=sysctl 3=boost
     int  pwrBoostState_ = -2;            // 当前已写的档位(-2=从未写过, -1..3=档位)
     bool pwrBoostHeld_  = false;         // 我们是否正持有节点(auto 退出时据此还原)
+    // ── boost 时间门控(防抖 + 防长期钉高) ──
+    // 原实现只有"档位变化才写"的边沿去重, 没有任何时间约束: PSI some avg10 在阈值附近
+    // 抖动时会 L0/L1 反复切, 每次都写 uclamp(+旧版还写 sched_boost), 抬频抖动且开销不小。
+    // 三条约束: ① 进 boost 后至少驻留 min_ms(防抖) ② 单次最长 max_ms(防 PSI 长期高把频率
+    // 永久钉住) ③ 退出后冷却 cool_ms 才允许再进(防紧接着又抬起来)。
+    static constexpr long long kPwrBoostMinMs  = 3000;    // 最短驻留
+    static constexpr long long kPwrBoostMaxMs  = 15000;   // 单次最长
+    static constexpr long long kPwrBoostCoolMs = 10000;   // 退出后冷却
+    long long pwrBoostEnterMs_ = 0;      // 本次进 boost 的时刻(0=当前不在 boost)
+    long long pwrBoostLeaveMs_ = 0;      // 上次离开 boost 的时刻(0=从未)
+    // 记录离开 boost 的时刻(起冷却)。
+    void pwrBoostNoteLeave() {
+        if (pwrBoostEnterMs_ != 0) { pwrBoostLeaveMs_ = nowMs(); pwrBoostEnterMs_ = 0; }
+    }
+    // 给 computePwrLevel 的结果套时间门控, 返回最终档位。
+    //   level>=2(压制): 立即放行并退出 boost —— 功耗安全优先于防抖。
+    //   level<0(旁路):  清进入标记, 由 pwrBoostRestore 还原节点。
+    //   level==0(卡顿): 新进须过冷却; 已在 boost 中超 max_ms 则强制退出起冷却。
+    //   level==1(中性): 若在 boost 中且未满 min_ms, 继续 boost(防 PSI 在阈值附近抖动导致反复切)。
+    int pwrBoostGate(int level) {
+        const long long now = nowMs();
+        if (level >= 2) { pwrBoostNoteLeave(); return level; }
+        if (level < 0)  { pwrBoostEnterMs_ = 0; return level; }
+        if (level == 0) {
+            if (pwrBoostEnterMs_ == 0) {
+                if (pwrBoostLeaveMs_ != 0 && (now - pwrBoostLeaveMs_) < kPwrBoostCoolMs)
+                    return 1;                                  // 冷却未满: 不给 boost
+                pwrBoostEnterMs_ = now;
+                return 0;
+            }
+            if ((now - pwrBoostEnterMs_) >= kPwrBoostMaxMs) {   // 单次超时: 强退 + 起冷却
+                pwrBoostNoteLeave();
+                return 1;
+            }
+            return 0;
+        }
+        // level == 1(中性)
+        if (pwrBoostEnterMs_ != 0 && (now - pwrBoostEnterMs_) < kPwrBoostMinMs) return 0;
+        pwrBoostNoteLeave();
+        return 1;
+    }
     string_t pwrBoostOrig_;              // 接管前主节点原值(cgroup/sysctl 的 uclamp.min)
     string_t pwrBoostSbOrig_;            // sched_boost 原值(cgroup/sysctl 模式下作补充 boost 信号时记)
     static constexpr const char* kPwrCgUclampMin  = "/sys/fs/cgroup/cpu.uclamp.min";
@@ -1414,13 +1487,33 @@ public:
         const float pw = (float)mx.powerW;
         if (pw >= Config::AutoMode::power_throttle_critical_w) return 3;   // 临界: 深压+关核
         if (pw >= Config::AutoMode::power_throttle_w)        return 2;   // 高功耗: 压制(关 boost)
+        // ── boost 前置门控: 没人看屏幕 / FSM 判定空闲 → 永不 boost ──
+        // 压制档(2/3)在上面已 return, 不受本门控影响: 息屏后台重载仍要压。
+        // 息屏时 PSI 极易被几个后台线程(推送/同步/音乐解码)在小核排队顶高, 而此时没有
+        // 任何"响应性"需要补救 —— 抬频纯属浪费。DEEP_IDLE/LIGHT_IDLE 同理(静态阅读/挂机)。
+        if (mx.screenOn == 0) return 1;
+        {
+            const int st = autoFsm_.state();   // state() 返回 int, 枚举值隐式转换比较
+            if (st == AutoFsm::DEEP_IDLE || st == AutoFsm::LIGHT_IDLE) return 1;
+        }
         // 功耗未到压制阈值: 卡顿才开 boost, 否则中性省电
         if (Config::AutoMode::power_boost_jank_enable && detectJank(mx)) return 0;
         return 1;   // 中性: 不 boost, 省电
     }
     // 卡顿检测: PSI 优先(最准, 直接反映任务等 CPU); 无 PSI 回退到 busy+load 双确认。
+    // 绝对需求确认(PSI 分支专用): PSI 衡量的是【相对争用】, 不等于【真需要更多算力】——
+    // 低频/轻载下几个后台线程在小核排队就能把 PSI some avg10 顶到两位数。故 PSI 过阈后
+    // 还须叠加一个绝对需求下限: 能效加权负载 ≥ busy_floor(读不到则回退 load1), 否则不算
+    // "需要抬频的卡顿"。busy_floor=0 表示关掉本确认(退回旧的纯 PSI 行为)。
+    bool jankDemandOk(const AutoModeCtl::Metrics& mx) {
+        const int floorPct = Config::AutoMode::power_boost_jank_busy_floor;
+        if (floorPct <= 0) return true;                          // 0=关闭需求确认
+        if (mx.cpuBusyW >= 0) return mx.cpuBusyW >= floorPct;    // 有加权负载: 用它判
+        return mx.load1 >= Config::AutoMode::power_boost_jank_load;   // 读不到: 回退 load1
+    }
     bool detectJank(const AutoModeCtl::Metrics& mx) {
-        if (mx.cpuPsi >= Config::AutoMode::power_boost_jank_psi) return true;   // PSI 高 = 任务在等 CPU
+        // PSI 优先(最准), 但必须过绝对需求下限, 避免空载高 PSI 把频率抬起来。
+        if (mx.cpuPsi >= Config::AutoMode::power_boost_jank_psi) return jankDemandOk(mx);
         if (mx.cpuPsi < 0) {   // 无 PSI 节点: 回退到负载双确认(busy 高 且 load 高 才算卡顿, 避免单信号误判)
             if (mx.cpuBusyW >= Config::AutoMode::power_boost_jank_busy &&
                 mx.load1    >= Config::AutoMode::power_boost_jank_load) return true;
@@ -1464,11 +1557,17 @@ public:
         } else { // boost 模式: 只能开/关
             ok = utils.FileWriteBlocking(kPwrSchedBoost, string_t(wantOn ? "1" : "0"));
         }
-        // cgroup/sysctl 模式: sched_boost 作 boost 信号(若存在且我们记过原值), 对齐 powerd set_uclamp
-        if (ok && (pwrBoostMode_ == 1 || pwrBoostMode_ == 2) && !pwrBoostSbOrig_.empty())
+        // sched_boost 只在 sysctl 模式(2)下作 boost 信号 —— 该模式不碰 sched_util_clamp_min,
+        // sched_boost 是它唯一的 boost 手段, 去掉会导致 ok=true 但实际什么都没写。
+        // cgroup 模式(1)【不再】附带写 sched_boost: 高通内核的 sched_boost 是全局大核偏置
+        // (把任务整体推向大核), 与 cpu.uclamp.min 下限叠加会把功耗放大一大截 —— 这正是
+        // "低负载也窜功耗"的主要放大器。uclamp 下限已足够补响应性, 不需要再叠一层。
+        // (mode 3 无 uclamp 接口, 仍只能用 sched_boost, 见上面 else 分支。)
+        if (ok && pwrBoostMode_ == 2 && !pwrBoostSbOrig_.empty())
             utils.FileWriteBlocking(kPwrSchedBoost, string_t(wantOn ? "1" : "0"));
         if (ok) {
             pwrBoostState_ = level;
+            if (!wantOn) pwrBoostNoteLeave();     // 离开 boost: 起冷却计时
             if (wantOn) logger.Info("功率 boost: 开 (卡顿补救, %dW, min=%d, uclamp=%s)", lastPwrW_,
                         Config::AutoMode::power_boost_value,
                         pwrBoostMode_ == 1 ? "cgroup" : (pwrBoostMode_ == 2 ? "sysctl" : "boost"));
@@ -1853,7 +1952,7 @@ public:
         std::lock_guard<std::recursive_mutex> lk(applyMtx);
         // 配置热重载可在 GAMING 期间重进这里: 下方 FreqWriter 会重写基础 governor,
         // 先把游戏态调速器条件还原并复位状态, 下一 FSM tick(仍在 GAMING)会自动重新切换。
-        applyGamingGov(false);
+        applyGamingGov(false, "primeAutoFsm");
         // 还原后 gamingGovActive_=false 但 fengchiActive(循环局部)仍 true → 状态机死区(进入沿要
         // !fengchiActive, 补切要 gamingGovActive_, 还原要 !fengchiActive, 全不满足 → 永远停在 walt)。
         // 置标志通知 FSM 循环重置 fengchiActive, 让进入沿重新接管(重走 3s 延时 → 重新切风驰)。
@@ -1920,7 +2019,7 @@ public:
                 // 这里只把去重缓存复位为全 1, 下次进 auto 不因陈旧缓存漏掉一次上线。
                 // 必须持 applyMtx: fileWatch 线程经 onModeChanged→onlineAll 在锁内写同一数组(避免 data race)。
                 { std::lock_guard<std::recursive_mutex> lk(applyMtx);
-                  applyGamingGov(false);   // 退出 auto: 游戏态调速器若在切换态, 条件还原(外部改过则不覆盖)
+                  applyGamingGov(false, "退出auto");   // 退出 auto: 游戏态调速器若在切换态, 条件还原(外部改过则不覆盖)
                   gamingGovEngaged_ = false;   // 退出 auto: 清原生风驰标记 (active_=false 时 applyGamingGov(false) 为 no-op, 需显式清)
                   applyTopAppUclampMin(0);   // 退出 auto: 还原 top-app uclamp 下限
                   applyPowerBoost(-1);        // 退出 auto: 还原 UCLAMP 各节点到原值
@@ -2260,7 +2359,9 @@ public:
                     // 采样融入 auto: 由 computePwrLevel 统一算档。
                     // 档位: 0=卡顿(开 boost + 抬大核上限补救) 1=中性(不动, 省电) 2=高功耗(压大核上限+限 GPU) 3=临界(深压+关大核+限 GPU)。
                     // boost 段同步切 UCLAMP(cgroup v2/sysctl/sched_boost 三级回退)。
-                    const int pwrLevel = computePwrLevel(mx);
+                    // 套时间门控: 最短驻留/单次上限/冷却, 防 PSI 在阈值附近抖动导致 boost 反复开关
+                    // (每次开关都要写 uclamp/sched_boost, 高通内核上 sched_boost 还会触发跨簇迁移)。
+                    const int pwrLevel = pwrBoostGate(computePwrLevel(mx));
                     // 卡顿档(L0): 适度抬高 FSM 大核上限(给 boost 下限留空间, 否则下限被上限夹住还是卡)。
                     // 只抬不压: hwmax × cap_pct 与 FSM caps 取更宽者(不削弱 FSM 已有的省电 caps, 仅在卡顿时放宽)。
                     if (pwrLevel == 0) {
@@ -2335,7 +2436,7 @@ public:
                                 // 原生在位: 不调 applyGamingGov(避免覆盖原生设置);
                                 // gamingGovActive_ 保持 false → 退出时 applyGamingGov(false) 为 no-op。
                                 gamingGovEngaged_ = true;  // 标记风驰在位, 供 cpuset 周期检查判定
-                                // cpuset 仍可能被 OEM 收窄, 进入沿矫正一次
+                                // 但 cpuset 仍可能被 OEM 收窄, 进入沿矫正一次
                                 correctGameTopAppCpus();
                             } else {
                                 logger.Info("原生风驰启动失败, 强制切换风驰调速器");
@@ -2357,23 +2458,7 @@ public:
                                 string_t cur = readSmallFile(path);
                                 if (cur.empty()) continue;
                                 // ROM 可能把 scx 改成 hm/hmbird(同属偏好列表), 只要还是风驰就算在位
-                                bool isGaming = false;
-                                const string_t& prefs = Config::AutoMode::gaming_gov;
-                                // string_t 是 qlib 持有型字符串, 没有 find/substr:
-                                // 手动按逗号切分偏好列表, 逐段与 cur 定长比对(避免切片临时对象)。
-                                const char*  pref = prefs.c_str();
-                                const size_t prefLen = prefs.size();
-                                size_t pos = 0;
-                                while (pos < prefLen) {
-                                    size_t comma = pos;
-                                    while (comma < prefLen && pref[comma] != ',') comma++;
-                                    const size_t len = comma - pos;
-                                    if (len == cur.size() && memcmp(cur.c_str(), pref + pos, len) == 0) {
-                                        isGaming = true; break;
-                                    }
-                                    pos = comma + 1;
-                                }
-                                if (!isGaming) {
+                                if (!govInPrefList(cur)) {
                                     gamingGovActive_ = false;  // 不在偏好列表 → 已被 ROM 改回
                                     break;
                                 }
@@ -2382,7 +2467,7 @@ public:
                         applyGamingGov(true);
                     } else if (!fengchiActive) {
                         // 非风驰态: 还原(若我们切过则条件还原, 没切过则 no-op)
-                        applyGamingGov(false);
+                        applyGamingGov(false, "离开风驰态(FSM)");
                     }
                     // fengchiActive && !fengchiGovPending && !gamingGovActive_: 原生风驰在位, 不碰调速器
                     // ── P2-⑥ uclamp: game_heavy 风驰游戏给 top-app 设性能下限(同时抬调频+把高需求任务
@@ -2462,7 +2547,7 @@ public:
             }
         }   // autoModeTask 主循环结束
         // 线程退出(守护停止/重启): 游戏态调速器若在切换态, 条件还原, 不把 hm/scx 留给死守护
-        { std::lock_guard<std::recursive_mutex> lk(applyMtx); applyGamingGov(false); applyTopAppUclampMin(0); applyPowerBoost(-1); applyFpsgo(false); applyCameraHold(false); pwrParkBig_ = false; }
+        { std::lock_guard<std::recursive_mutex> lk(applyMtx); applyGamingGov(false, "auto线程退出"); applyTopAppUclampMin(0); applyPowerBoost(-1); applyFpsgo(false); applyCameraHold(false); pwrParkBig_ = false; }
     }
 
     static constexpr int kFsmTickMs = 2000;   // FSM 亮屏 tick 固定 2s(对齐 ASB)
@@ -2846,11 +2931,12 @@ public:
                 // config 重载后 applyWithProfile 用画像 governor(sugov_ext) 覆盖了 scx,
                 // 必须重切游戏态调速器, 否则游戏在前台但跑在 sugov_ext 下
                 applyGamingGov(strcmp(Config::AppProfile::Models[m].modelName.c_str(),
-                                      "game_heavy") == 0);
+                                      "game_heavy") == 0, "配置重载(保活中重应用画像)");
                 return;
             }
         }
         heldPkg.clear();
+        heldMissStreak_ = 0;   // 换持有对象: 清历史未命中计数, 不让旧包的计数影响新包
         forceReevalForeground();
     }
 
@@ -3141,38 +3227,46 @@ public:
             }
             bool changed = enforceState();
             if (propagateGameGovernor()) changed = true;   // 游戏档留空簇跟随 ROM 风驰
-            correctGameTopAppCpus();   // 游戏态周期性矫正 cpuset (与调速器检测同频, 适配天玑/骁龙)
+            // 游戏态周期性矫正 cpuset (与调速器检测同频, 适配天玑/骁龙)。
+            // 矫正命中也算 changed: cpuset 正被外部反复收窄时应保持 2s 紧盯, 不退避到 5s。
+            if (correctGameTopAppCpus()) changed = true;
             if (changed) { interval = 2000; stable = 0; }
             else if (++stable >= 5) interval = 5000;
             if (waitStop(interval)) break;
         }
     }
 
-    void correctGameTopAppCpus() {
+    // 返回是否真的下发了一次矫正(供调用方判断"状态仍在被外部改写", 不要退避巡检间隔)
+    bool correctGameTopAppCpus() {
         // 读 Models/Cpuset 全局 string，与配置重载互斥
         std::lock_guard<std::recursive_mutex> lk(applyMtx);
         // 游戏态判定: 手动模式看画像匹配, 自动模式看调速器是否在位 (覆盖手动+智能双模)
         int cur = Config::AppProfile::currentMatch.load();
         bool inGame = (cur >= 0 && cur < Config::AppProfile::modelCount
                        && Config::AppProfile::Models[cur].isGame);
-        if (!inGame && !gamingGovActive_ && !gamingGovEngaged_) return;
+        if (!inGame && !gamingGovActive_ && !gamingGovEngaged_) return false;
 
         // 目标全核范围: 优先用配置的 top_app(游戏档应为 0-7), 否则用当前全部在线 CPU。
         char desired[64] = { 0 };
         if (Config::Cpuset::enable && !Config::Cpuset::top_app.empty())
             snprintf(desired, sizeof(desired), "%s", Config::Cpuset::top_app.c_str());
         else if (!readNodeTrim("/sys/devices/system/cpu/online", desired, sizeof(desired)))
-            return;
-        if (!desired[0]) return;
+            return false;
+        if (!desired[0]) return false;
 
+        // 【必须校验读取成功】否则 now 恒为空串 → strcmp 永不相等 → 每轮巡检都误判"被收窄",
+        // 无休止重写+刷日志且永不收敛(节点不存在/cgroup v2 机型/SELinux 拦读时就会这样)。
         char now[64] = { 0 };
-        readNodeTrim("/dev/cpuset/top-app/cpus", now, sizeof(now));
+        if (!readNodeTrim("/dev/cpuset/top-app/cpus", now, sizeof(now)) || !now[0]) {
+            logger.Debug("游戏档: top-app cpuset 节点读不到, 跳过矫正");
+            return false;
+        }
         // 已是全核范围 → 不矫正 (适配天玑/骁龙, 不在代码里写死 0-7)
-        if (strcmp(now, desired) == 0) return;
+        if (strcmp(now, desired) == 0) return false;
 
         constexpr long long kFixMinMs = 1000;    // 节流：最多每秒矫正一次，防 ping-pong
         long long t = nowMs();
-        if (t - lastGameCpusetFixMs < kFixMinMs) return;
+        if (t - lastGameCpusetFixMs < kFixMinMs) return false;
         lastGameCpusetFixMs = t;
 
         // cpuset 子集 ⊆ 父集：先放开 root，再写 top-app/foreground
@@ -3180,6 +3274,7 @@ public:
         utils.FileWrite("/dev/cpuset/top-app/cpus", desired);
         utils.FileWrite("/dev/cpuset/foreground/cpus", desired);
         logger.Info("游戏档: top-app cpuset 被收窄(%s) → 矫正回 %s", now, desired);
+        return true;
     }
 
     std::string getForegroundPkg(bool fresh) {
@@ -3313,6 +3408,7 @@ public:
         }
         if (!heldPkg.empty()) {
             if (utils.isPackageRunning(heldPkg.c_str())) {
+                heldMissStreak_ = 0;  // 进程在 → 清空连续未命中计数
                 if (!fresh) return;   // 空闲复查: 进程在就维持, 不取前台
                 std::string cur = getForegroundPkg(true);
                 if (cur.empty() || cur == "null" || cur == heldPkg) return;   // 还在游戏/取不到 → 维持
@@ -3324,15 +3420,25 @@ public:
                 heldPkg.clear();      // 切到"另一个"保活类 App → 移交(走下方重建)
                 lastTopApp.clear();
             } else {
-                // /proc 瞬断去抖: 等 50ms 再查一次, 避免竞态误判游戏退出
+                // /proc 瞬断去抖: 原先只等 50ms 再查一次就定生死, 但应用切换/系统卡顿期的扫描失败
+                // 可持续数秒, 而一次误判的代价是完整掉档(清 currentMatch + 落基础档 + 还原调速器)再重建。
+                // 【不能在此原地长睡补偿】: 本函数全程持 applyMtx, 长睡会阻塞 cpuEnforceTask/配置重载。
+                // 故保留原 50ms 短重查(锁持有时长不变), 改用【跨轮连续未命中】兜底:
+                // 只有连续 kHeldMissMax 轮巡检都查不到进程才真解除, 单次瞬断不再掉档。
                 usleep(50000);
-                if (utils.isPackageRunning(heldPkg.c_str())) return;
+                if (utils.isPackageRunning(heldPkg.c_str())) { heldMissStreak_ = 0; return; }
+                if (++heldMissStreak_ < kHeldMissMax) {
+                    logger.Debug("保活: %s 进程查不到(%d/%d), 暂不解除(疑似 /proc 瞬断)",
+                                 labelForLog(heldPkg).c_str(), heldMissStreak_, kHeldMissMax);
+                    return;
+                }
+                heldMissStreak_ = 0;
                 logger.Info("保活: %s 已退出 → 解除", labelForLog(heldPkg).c_str());  // 退出打印一次
                 heldPkg.clear();
                 Config::AppProfile::currentMatch.store(-1);
                 lastTopApp.clear();
                 applyWithProfile();   // 立即落基础, 防去重跳过致高频残留
-                applyGamingGov(false);   // 游戏退出: 风驰调速器条件还原(下方取不到新前台时也不悬空)
+                applyGamingGov(false, "保活解除/游戏进程退出");   // 游戏退出: 风驰调速器条件还原(下方取不到新前台时也不悬空)
             }
         }
 
@@ -3358,7 +3464,7 @@ public:
                 blacklistReleased = true;
                 Config::AppProfile::currentMatch.store(-1);
                 logger.Info("前台: %s → 释放接管(黑名单, 交还系统默认)", labelForLog(pkg).c_str());
-                applyGamingGov(false);   // 交还系统前先条件还原风驰调速器(releaseControl 会写默认 governor)
+                applyGamingGov(false, "黑名单前台/释放接管");   // 交还系统前先条件还原风驰调速器(releaseControl 会写默认 governor)
                 releaseControl();
             }
             return;
@@ -3369,7 +3475,10 @@ public:
         // 两种检测模式都建立(匹配到游戏/保活画像即持有); auto 下 matched 已为 -1, 不会建立。
         if (matched >= 0) {
             const auto& mdl = Config::AppProfile::Models[matched];
-            if (mdl.isGame || mdl.keepAlive) heldPkg = pkg;
+            if (mdl.isGame || mdl.keepAlive) {
+                if (heldPkg != pkg) heldMissStreak_ = 0;   // 换保活目标: 清掉上一个包的未命中计数
+                heldPkg = pkg;
+            }
         }
 
         // 无匹配/黑名单 → 跟随全局:优先用 perapp "*" 行(全局默认),没有再回落基础档。
@@ -3402,7 +3511,8 @@ public:
         // 其它前台条件还原。放在 applyWithProfile 之后: 先落画像 governor 再覆盖/保存,
         // 还原时才能回到画像本来的调速器。auto 模式不走本函数(上方早退), 由 FSM 分支驱动。 ──
         applyGamingGov(matched >= 0 &&
-            strcmp(Config::AppProfile::Models[matched].modelName.c_str(), "game_heavy") == 0);
+            strcmp(Config::AppProfile::Models[matched].modelName.c_str(), "game_heavy") == 0,
+            "前台重评估(当前前台非 game_heavy)");
     }
 
     void appProfileTask() {
