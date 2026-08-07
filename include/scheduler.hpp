@@ -1348,11 +1348,12 @@ public:
     }
 
     // ── 功率驱动 boost/压制(移植 powerd: UCLAMP 三级回退控制 boost, 功率作压制边界) ──
-    // UCLAMP 接口优先级(powerd 式, 逐级回退):
-    //   1) cgroup v2 cpu.uclamp.min(/sys/fs/cgroup, 全局下限, 最精细)
-    //   2) 全局 /proc/sys/kernel/sched_util_clamp_min(控 boost 开关, 最常见)
-    //   3) 回退 /proc/sys/kernel/sched_boost(老接口, 只能开/关 boost)
-    // 注: sched_util_clamp_max 语义是"允许下限"不能直接 cap, 故 cap 一律走 cpufreq(见 FSM 压制段 + 关核)。
+    // UCLAMP 接口优先级(powerd 式, 逐级回退)。语义详见 docs/kernel-boost-research.md 第一节:
+    //   1) cgroup v2 cpu.uclamp.min(/sys/fs/cgroup, 全局下限, 最精细)。单位【百分比 0-100】非 0-1024。
+    //   2) /proc/sys/kernel/sched_util_clamp_min: "系统允许的 UCLAMP_MIN 上限"(默认 1024), 非 boost 源;
+    //      写小值反而钳死全系统下限, 故 sysctl 模式不碰它, boost 交给 sched_boost。
+    //   3) 回退 /proc/sys/kernel/sched_boost(老接口, 只能开/关 boost)。
+    // 注: sched_util_clamp_max 语义是"允许的 UCLAMP_MAX 上限"(非"允许下限"), 且 max 聚合下挡不住频率, 故 cap 一律走 cpufreq(见 FSM 压制段 + 关核)。
     //   卡顿 → 抬高(开 boost, 内核给任务频率底线补响应); 高功耗 → 压 0(关 boost)。
     // 边沿驱动(仅档位变化才写)。auto 启用接管此节点, 退出还原各节点原值。
     // 内核全无接口则 boost 段跳过(首次探测失败永久禁用); 压制段走 caps/关核/GPU 不受影响。
@@ -1427,7 +1428,8 @@ public:
         return false;
     }
     // 应用功率 boost 档位。level: -1=旁路(还原) 0=卡顿(开boost) 1=中性(省电) 2=高 3=临界。
-    // 仅 level 变化才写。cgroup/sysctl 模式: 卡顿档写 power_boost_value(0-1024), 其余写 0(关 boost);
+    // 仅 level 变化才写。cgroup 模式: 卡顿档 power_boost_value 换算百分比写 cpu.uclamp.min, 其余写 0;
+    // sysctl 模式: 不碰 sched_util_clamp_min(非 boost 源), boost 仅靠 sched_boost;
     // boost 模式: 只能写 1/0。cgroup/sysctl 模式若有 sched_boost 节点, 同步作补充 boost 信号(对齐 powerd)。
     void applyPowerBoost(int level) {
         if (level < 0) { pwrBoostRestore(); return; }             // 旁路: 还原
@@ -1446,14 +1448,23 @@ public:
         }
         char buf[16];
         bool ok = false;
-        if (pwrBoostMode_ == 1 || pwrBoostMode_ == 2) {
-            int v = wantOn ? Config::AutoMode::power_boost_value : 0; // 0-1024
+        if (pwrBoostMode_ == 1) {
+            // cgroup v2 cpu.uclamp.min 单位是【百分比 0-100】(非 0-1024): 直接写 128 会被内核
+            // -ERANGE 拒绝, boost 静默失效 → 换算成百分比。详见 docs/kernel-boost-research.md 第二节。
+            int v = wantOn ? (Config::AutoMode::power_boost_value * 100 / 1024) : 0;
+            if (v < 0) v = 0;
+            if (v > 100) v = 100;
             snprintf(buf, sizeof(buf), "%d", v);
             ok = utils.FileWriteBlocking(mainNode, string_t(buf));
+        } else if (pwrBoostMode_ == 2) {
+            // sysctl: sched_util_clamp_min 是"系统允许的 UCLAMP_MIN 上限"(默认 1024), 不是全局 boost 源。
+            // 写 128 会把上限钳到 128(反而限制), 写 0 会钳死所有任务(含 OEM 给 top-app 的下限)的
+            // uclamp_min 请求, 有害。故 sysctl 模式 boost 完全交给 sched_boost, 不碰此节点。
+            ok = !pwrBoostSbOrig_.empty();
         } else { // boost 模式: 只能开/关
             ok = utils.FileWriteBlocking(kPwrSchedBoost, string_t(wantOn ? "1" : "0"));
         }
-        // cgroup/sysctl 模式: sched_boost 作补充 boost 信号(若存在且我们记过原值), 对齐 powerd set_uclamp
+        // cgroup/sysctl 模式: sched_boost 作 boost 信号(若存在且我们记过原值), 对齐 powerd set_uclamp
         if (ok && (pwrBoostMode_ == 1 || pwrBoostMode_ == 2) && !pwrBoostSbOrig_.empty())
             utils.FileWriteBlocking(kPwrSchedBoost, string_t(wantOn ? "1" : "0"));
         if (ok) {
