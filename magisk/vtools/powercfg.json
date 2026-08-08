@@ -1,8 +1,8 @@
 {
     "name": "Kin 调度",
     "author": "Ktwo",
-    "version": "Ⅴ⁰⁵",
-    "versionCode": 260623,
+    "version": "260807",
+    "versionCode": 260810,
     "features": {
         "strict": true,
         "pedestal": false
