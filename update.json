@@ -1,6 +1,6 @@
 {
-  "version": "V60+V61+oiface",
-  "versionCode": 1785893519,
+  "version": "260807",
+  "versionCode": 260809,
   "zipUrl": "https://github.com/kktwo2923-creator/CTS-Daemon/releases/download/nightly-main/Kin-module.zip",
-  "changelog": "ASB V60 Camera hold + V61 Quiet Night + 风驰 oiface 保活"
+  "changelog": "v260807: App v2.0.3 动画效果+卡片交错入场, Kin守护与模块版本同步"
 }

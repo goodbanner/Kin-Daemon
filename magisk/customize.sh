@@ -1,8 +1,6 @@
 #!/system/bin/sh
 SKIPMOUNT=false
-# system.prop 仅限 ColorOS: 关闭 Magisk/KernelSU 的 system.prop 自动应用机制,
-# 属性改由 post-fs-data.sh 按机型判定逐条 resetprop(非 ColorOS 不应用)。
-PROPFILE=false
+PROPFILE=true
 POSTFSDATA=true
 LATESTARTSERVICE=true
 
@@ -197,14 +195,6 @@ deploy_cts_daemon() {
 
     chmod 0755 "$MODPATH/Kinetic" 2>/dev/null
 
-    # binary.version: 单独记录 Kinetic 二进制版本号(versionCode),供 App 检测二进制更新通道用。
-    # 注意: 它与 module.prop 同步生成,但与模块版本解耦 —— App 通过它判断是否需要推送二进制热更新。
-    local BIN_VER
-    BIN_VER=$(grep -m1 '^versionCode=' "$MODPATH/module.prop" 2>/dev/null | cut -d= -f2 | tr -dc '0-9')
-    [ -z "$BIN_VER" ] && BIN_VER=0
-    echo "$BIN_VER" > "$MODPATH/binary.version" 2>/dev/null
-    chmod 0644 "$MODPATH/binary.version" 2>/dev/null
-
     sh "$MODPATH/vtools/init_vtools.sh" 2>/dev/null
     [ -s /data/powercfg.sh ] && ui_print "  ✓ Scene 接管插件已生成(可选,不影响 Kin 自启)"
 
@@ -292,7 +282,7 @@ ui_print " "
 ui_print "━━━━━━━━━━━━━━━━━━━━━━━━"
 ui_print "  清理旧版子模块残留"
 ui_print "━━━━━━━━━━━━━━━━━━━━━━━━"
-LEGACY_MODS="Thread_Config_replace Config_Mount Scene_Config_replace Kin_legacy OPGCE BSwitcher qinghe8e"
+LEGACY_MODS="Thread_Config_replace Config_Mount Scene_Config_replace Kin_legacy BSwitcher qinghe8e"
 CLEANED=0
 for mid in $LEGACY_MODS; do
     [ "$mid" = "Kin" ] && continue
@@ -355,11 +345,6 @@ if [ -f "$MODPATH/Kinetic" ]; then
         if cp -f "$MODPATH/Kinetic" "$LIVE/Kinetic" 2>/dev/null; then
             chmod 0755 "$LIVE/Kinetic" 2>/dev/null
             HOT_OK=1
-        fi
-        # binary.version 一并同步到 live 目录, 让 App 立即识别新二进制版本号
-        if [ -f "$MODPATH/binary.version" ]; then
-            cp -f "$MODPATH/binary.version" "$LIVE/binary.version" 2>/dev/null
-            chmod 0644 "$LIVE/binary.version" 2>/dev/null
         fi
     done
 fi
