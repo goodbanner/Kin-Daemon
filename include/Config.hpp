@@ -59,18 +59,6 @@ namespace Config {
     // 触控加速(Kin 自研, 不依赖内核 input_boost): 触摸时把各簇 scaling_min 顶到 cpuinfo_max 的
     // level_pct%, 停手 duration_ms 后回落到基础 min。所有模式可用, 默认关。
     namespace TouchBoost { inline bool enable = false; inline int duration_ms = 1200; inline int level_pct = 55; }
-    // 线程分配(持续绑核守护): 周期性把前台游戏的渲染类线程 sched_setaffinity 绑到大核簇,
-    // 只动亲和不碰频率/governor, 与 FSM/FAS 调频完全正交。默认关。
-    // big_only=true 只绑最高频大核簇; false=大核簇+次高频中核簇。game_pkgs=手动游戏库(逗号分隔, 可空)。
-    // rt_enable=实时调度(SCHED_FIFO/RR)总开关(独立于 enable): 开则按 thread_priority_rules.conf 设线程调度类。
-    // 前台变化由 App 无障碍推送 topapp.txt 即时驱动(精准识别), 新线程由 interval_s 轮询覆盖。
-    namespace ThreadAlloc { inline bool enable = false; inline int interval_s = 3; inline bool big_only = true; inline string_t game_pkgs; inline bool rt_enable = false; inline string_t blacklist_pkgs;
-        // 权重配置(对齐 Metric): 把绑到大核的关键线程移入 cpuctl 子组抬高 cpu.shares(算力权重),
-        // 高负载下更抢得到 CPU。weight_enable 默认关(opt-in); weight_shares 该子组的 cpu.shares 值
-        // (top-app 常为 1024/20480 量级, 取相对值即可, 越大权重越高)。
-        inline bool weight_enable = false; inline int weight_shares = 4096;
-    }
-
     // 自动模式(mode=auto): 守护按 温度/电量/屏幕/时段 + 自学习 在 powersave/balance/performance
     // 之间动态选基础档。切换粒度为整个 mode(频率低), 不重写频率上限, 不与 governor 自主调频冲突。
     // App 画像仍优先: auto 只决定"无专属画像时"的基础档。所有阈值可在 config.json 的

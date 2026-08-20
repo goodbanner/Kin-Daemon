@@ -6,8 +6,6 @@
 #include "AutoFsm.hpp"
 #include "AutoFas.hpp"
 #include "SysTweaks.hpp"
-#include "ThreadRules.hpp"
-#include "ThreadPriorityRules.hpp"
 #include <sys/inotify.h>
 #include <sys/resource.h>
 #include <poll.h>
@@ -23,7 +21,6 @@
 #include <condition_variable>
 #include <unordered_map>
 #include <map>
-#include <unordered_set>
 
 class Schedule {
 private:
@@ -31,10 +28,6 @@ private:
     static constexpr const char* jsonPath = "/sdcard/Android/Kin/config.json";
     // App 开关覆盖层(JsonConfig::settingsPath 同值; 此处用于变更监听/联合哈希)
     static constexpr const char* settingsJsonPath = "/sdcard/Android/Kin/settings.json";
-    // 线程分配规则文件(AppOpt 兼容, 沿用 AppOpt 文件名 applist.prop; App 侧 ThreadAllocRuleStore 推到此处)。
-    static constexpr const char* threadRulesPath = "/sdcard/Android/Kin/applist.prop";
-    // 实时调度优先级规则文件(AppOpt priority.prop 兼容: 包名{线程}=SCHED_FIFO 优先级)。
-    static constexpr const char* threadPrioRulesPath = "/sdcard/Android/Kin/thread_priority_rules.conf";
     static constexpr const char* cpusetEventPath = "/dev/cpuset/top-app";
     static constexpr const char* onlinePath = "/sys/devices/system/cpu/cpu%d/online";
     static constexpr const char* SchedParamPath = "/sys/devices/system/cpu/cpufreq/policy%d/%s/%s";
@@ -91,37 +84,6 @@ private:
     std::string heldPkg;             // 正在保活的游戏/保活画像包名(进程存活则维持), 空=未保活
     bool        blacklistReleased = false;  // [真黑名单·方案A] 当前是否已对黑名单前台"释放接管"(交还系统)
 
-    // ── 线程分配(AppOpt 式规则引擎)状态; 仅 threadAllocTask 线程访问, 无需加锁 ──
-    ThreadRules threadRules_;                 // 已解析的 "pkg{thread}=核" 规则集
-    time_t      threadRulesMtime_ = -1;       // 规则文件上次加载时的 mtime
-    off_t       threadRulesSize_  = -1;       // 上次加载时的文件大小; 与 mtime 合成变更判据(FUSE mtime 仅秒级)
-    cpu_set_t   threadPresentMask_;           // 本机在线核集合(过滤越界核), 首次用到时构建
-    bool        threadPresentInit_ = false;
-    std::unordered_set<int> threadBoundPids_; // 上轮已按规则/快路径绑过核的进程 pid(用于离场还原)
-
-    // ── 实时调度(SCHED_FIFO/RR)状态; 仅 threadAllocTask 线程访问 ──
-    ThreadPriorityRules threadPrioRules_;     // 已解析的 "pkg{thread}=策略 优先级" 规则集
-    time_t      threadPrioMtime_ = -1;
-    off_t       threadPrioSize_  = -1;
-    bool        rtBudgetSet_ = false;         // 内核 RT 预算是否已按安全值下调(只写一次)
-    bool        rrSliceSet_  = false;         // sched_rr_timeslice_ms 是否已设 3(对齐 Metric, 只写一次)
-    // ── 权重配置(cpu.shares 子组, 对齐 Metric) ──
-    bool        weightEnableTick_ = false;    // 本 tick 权重开关快照(供 applyRulesToProc 读)
-    int         weightSharesTick_ = 4096;     // 本 tick 权重值快照
-    int         weightGroupState_ = 0;        // 0=未建/未知, 1=已建可用, -1=不可用(无 cpuctl)
-    int         lastWeightShares_ = -1;       // 已写入子组的 cpu.shares(去重)
-    bool        weightBigInit_ = false;
-    cpu_set_t   weightBigMask_;               // 大核掩码(判定"关键线程"是否绑到大核)
-    std::unordered_set<int> weightTickTids_;  // 本 tick 移入权重组的 tid(applyRulesToProc 填)
-    std::unordered_set<int> weightBoundTids_; // 上一轮在权重组里的 tid(用于离场还原)
-    std::unordered_set<int> rtBoundTids_;     // 上轮被我们提到实时调度类的 tid(逐 tid 还原, 不误伤系统 RT 线程)
-
-    // ── 事件驱动(proc connector)状态 ──
-    std::mutex   eventMtx_;
-    std::condition_variable eventCv_;
-    std::atomic<bool> eventWake_{false};      // 有 fork/exec 事件 → 叫醒 threadAllocTask 立即重应用
-    static constexpr int kEventCoalesceMs = 200;  // 收到事件后攒批窗口, 合并同批 fork, 防扫描风暴
-
     // App 无障碍服务(AppSwitchService)推送的前台包名 + 接收时刻; 新鲜则优先于 dumpsys, 省 popen。
     // 服务未启用/被杀 → 推送变陈旧 → 自动回退 dumpsys, 不影响"不开 App 也能用"。
     std::mutex  pushMtx_;
@@ -130,10 +92,9 @@ private:
     static constexpr long long kPushTtlMs = 30000;  // 推送有效期(ms): 3×心跳(10s), 心跳偶发跳拍不误废
     // auto/FSM 快路: getTopAppFast 返回的顶层可能是黑名单(输入法/launcher/systemui 与真 App 同在 top-app)。
     // 黑名单时回退到上一个"非黑名单"前台, 避免拿键盘当前台误报 类=-1。
-    // autoModeTask 与 threadAllocTask 都会在 auto 快路读写它 → 用 fgMtx_ 守护, 防 std::string 数据竞争。
+    // autoModeTask 会在 auto 快路读写它 → 用 fgMtx_ 守护, 防 std::string 数据竞争。
     std::mutex  fgMtx_;
     std::string lastGoodFgPkg_;
-    std::string policyFgPkg_;                     // fgMtx_ 保护; 粘滞生效时=游戏包(threadAlloc 消费)
     std::atomic<long long> lastFocusProbeMs_{0};  // mFocusedApp 兜底探测限频游标(≥5s, fas-rs 同款兜底)
     static constexpr const char* topAppPath = "/sdcard/Android/Kin/topapp.txt";
 
@@ -274,8 +235,6 @@ public:
         threads.emplace_back(thread(&Schedule::autoModeTask, this));
         // BG_TRIM 后台内存回收线程(默认关, Function.BgTrim.enable 开启)
         threads.emplace_back(thread(&Schedule::bgTrimTask, this));
-        // 线程分配(持续绑核守护)线程(默认关, Function.ThreadAlloc.enable 开启): 只动亲和, 不碰频率
-        threads.emplace_back(thread(&Schedule::threadAllocTask, this));
         // 功耗记录线程(始终运行, 与情景模式无关): 供 App 首页"当前记录"卡片 + 曲线
         threads.emplace_back(thread(&Schedule::powerRecorderTask, this));
     }
@@ -345,37 +304,6 @@ public:
         }
     }
 
-    // ── 线程分配(持续绑核守护): 周期把前台游戏的渲染类线程绑到大核簇 ──
-    // 只动 sched_setaffinity, 绝不碰频率/governor/GPU/online, 与 FSM/FAS 调频正交。
-    // 默认关(Function.ThreadAlloc.enable); 关闭/离开游戏/守护退出时把绑过的进程还原为全核。
-
-    // 逗号分隔列表精确匹配: csv 按逗号切、trim 前后空白后与 pkg 全等比较
-    bool pkgInList(const std::string& pkg, const std::string& csv) {
-        if (pkg.empty() || csv.empty()) return false;
-        size_t start = 0;
-        while (start <= csv.size()) {
-            size_t comma = csv.find(',', start);
-            size_t end = (comma == std::string::npos) ? csv.size() : comma;
-            size_t b = start, e = end;
-            while (b < e && (csv[b] == ' ' || csv[b] == '\t')) b++;
-            while (e > b && (csv[e-1] == ' ' || csv[e-1] == '\t' ||
-                             csv[e-1] == '\r' || csv[e-1] == '\n')) e--;
-            if (e > b && csv.compare(b, e - b, pkg) == 0) return true;
-            if (comma == std::string::npos) break;
-            start = comma + 1;
-        }
-        return false;
-    }
-
-    // ThreadAlloc 应用黑名单: 进程名(可含 :子进程后缀)取主包名后与逗号分隔列表精确匹配。
-    // 命中 = 该应用不执行线程分配(规则引擎/游戏快路径/实时调度三条路径统一跳过)。
-    bool procInPkgList(const char* name, const std::string& csv) {
-        if (!name || !*name || csv.empty()) return false;
-        const char* colon = strchr(name, ':');
-        std::string base = colon ? std::string(name, (size_t)(colon - name)) : std::string(name);
-        return pkgInList(base, csv);
-    }
-
     // 找包主进程 pid: 扫 /proc/<pid>/cmdline 与包名全等(同 Utils::isPackageRunning 的判法,
     // 排除 pkg:sub 子进程)。不走 popen/pidof → 无 shell、无命令注入面。找不到返回 -1。
     int findGamePid(const std::string& pkg) {
@@ -406,545 +334,6 @@ public:
         return found;
     }
 
-    // 构造大核亲和 mask: 大核簇 = CpuPolicy 里最大的非 -1 policy 号对应簇, bigOnly=false 再并入
-    // 次大 policy 号的簇。核号取自 policy<P>/related_cpus。任何读失败 → 退化为全核(等于不限制, 安全)。
-    void buildBigMask(cpu_set_t& mask, bool bigOnly) {
-        CPU_ZERO(&mask);
-        int best = -1, second = -1;   // 最大 / 次大的 policy 号
-        for (int i = 0; i < kClusterCount; i++) {
-            int pol = Config::Policy::CpuPolicy[i];
-            if (pol < 0) continue;
-            if (pol > best)        { second = best; best = pol; }
-            else if (pol > second) { second = pol; }
-        }
-        bool any = false;
-        auto addPolicyCpus = [&](int pol) {
-            if (pol < 0) return;
-            char p[128], buf[128];
-            FastSnprintf(p, sizeof(p),
-                         "/sys/devices/system/cpu/cpufreq/policy%d/related_cpus", pol);
-            if (!readNodeTrim(p, buf, sizeof(buf))) return;
-            char* save = nullptr;
-            for (char* tok = strtok_r(buf, " \t", &save); tok; tok = strtok_r(nullptr, " \t", &save)) {
-                int c = atoi(tok);
-                if (c >= 0 && c < kCoreCount) { CPU_SET(c, &mask); any = true; }
-            }
-        };
-        addPolicyCpus(best);
-        if (!bigOnly) addPolicyCpus(second);
-        // 拓扑/节点读不到 → mask 为空会导致 setaffinity EINVAL, 退化为全核 = 不限制
-        if (!any)
-            for (int c = 0; c < kCoreCount; c++) CPU_SET(c, &mask);
-    }
-
-    // 遍历 /proc/<pid>/task, 按线程名(comm, 不区分大小写子串)挑渲染类线程 setaffinity 到 mask。
-    // 一个都没命中 → 退回只绑主线程 pid 本身。返回成功绑定的线程数; 全程容错, 失败静默。
-    int bindRenderThreads(int pid, const cpu_set_t& mask) {
-        // 渲染类线程名关键字(全小写; comm 截断 15 字符, 子串匹配可覆盖 UnityGfxDeviceW 等)
-        static constexpr const char* kRenderKeys[] = {
-            "renderthread", "unitymain", "unitygfx", "glthread",
-            "mali", "vulkan", "swappy", "rhithread",
-        };
-        char taskDir[64];
-        FastSnprintf(taskDir, sizeof(taskDir), "/proc/%d/task", pid);
-        DIR* d = opendir(taskDir);
-        if (!d) return 0;   // 进程已退出等 → 静默
-        int bound = 0;
-        struct dirent* e;
-        while ((e = readdir(d)) != nullptr) {
-            if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
-            int tid = atoi(e->d_name);
-            if (tid <= 0) continue;
-            char commPath[96], comm[64];
-            FastSnprintf(commPath, sizeof(commPath), "/proc/%d/task/%d/comm", pid, tid);
-            if (!readNodeTrim(commPath, comm, sizeof(comm))) continue;
-            for (char* c = comm; *c; ++c)
-                if (*c >= 'A' && *c <= 'Z') *c += 'a' - 'A';   // 就地转小写
-            bool hit = false;
-            for (const char* key : kRenderKeys)
-                if (strstr(comm, key)) { hit = true; break; }
-            if (!hit) continue;
-            if (sched_setaffinity(tid, sizeof(cpu_set_t), &mask) == 0) bound++;
-            // 失败(线程刚退出/无权限)静默跳过
-        }
-        closedir(d);
-        // 没找到任何渲染线程(如小游戏/自绘引擎) → 退回绑主线程, 聊胜于无
-        if (bound == 0 && sched_setaffinity(pid, sizeof(cpu_set_t), &mask) == 0) bound = 1;
-        return bound;
-    }
-
-    // 把进程【所有】线程亲和还原为全核, 交还调度器自由迁移。进程已退出(/proc 目录没了)则静默。
-    // 刻意全量还原(而非只还我们绑过的那几个线程): 绑核后新建/子线程会继承父线程的受限亲和,
-    // 只还已知 tid 会漏掉这些继承者; 全核=不受限=系统默认, 全量还原能确保离场后无残留绑定。
-    // 代价是可能顺带放开该进程里别的工具/App 自己设的亲和 —— 但只作用于被本功能规则命中的进程, 可接受。
-    // ── 权重配置(cpu.shares, 对齐 Metric): 关键线程移入 /dev/cpuctl/top-app/kin-weight 子组抬权重 ──
-    static constexpr const char* kWeightGroupDir  = "/dev/cpuctl/top-app/kin-weight";
-    static constexpr const char* kWeightTasksPath = "/dev/cpuctl/top-app/kin-weight/tasks";
-    static constexpr const char* kWeightSharesPath= "/dev/cpuctl/top-app/kin-weight/cpu.shares";
-    static constexpr const char* kTopAppTasksPath = "/dev/cpuctl/top-app/tasks";
-
-    // 建子组 + 写 cpu.shares(变化才写)。无 cpuctl(部分 ROM)则标记不可用, 之后跳过。返回是否可用。
-    bool ensureWeightGroup(int shares) {
-        if (weightGroupState_ == -1) return false;
-        // 无 top-app cgroup → 该机型不走 cpuctl, 权重功能不可用
-        struct stat st;
-        if (stat("/dev/cpuctl/top-app", &st) != 0) { weightGroupState_ = -1; return false; }
-        if (weightGroupState_ == 0) {
-            mkdir(kWeightGroupDir, 0755);   // 已存在返回 EEXIST, 忽略
-            if (stat(kWeightGroupDir, &st) != 0) { weightGroupState_ = -1; return false; }
-            weightGroupState_ = 1;
-            lastWeightShares_ = -1;         // 强制写一次 shares
-        }
-        if (shares != lastWeightShares_) {
-            char v[24]; FastSnprintf(v, sizeof(v), "%d", shares);
-            if (utils.FileWriteBlocking(kWeightSharesPath, string_t(v))) {
-                lastWeightShares_ = shares;
-                logger.Info("权重配置: kin-weight 子组 cpu.shares=%d", shares);
-            }
-        }
-        return true;
-    }
-
-    // 把 tid 写入权重子组 tasks(移入即生效, 该线程按子组 shares 参与算力分配)。best-effort。
-    void moveTidToWeight(int tid) {
-        if (tid <= 0) return;
-        char v[16]; int n = FastSnprintf(v, sizeof(v), "%d", tid);
-        int fd = open(kWeightTasksPath, O_WRONLY | O_CLOEXEC);
-        if (fd < 0) return;
-        ssize_t w = write(fd, v, (size_t)n); (void)w;
-        close(fd);
-    }
-    // 把 tid 还原回 top-app 组(离开权重管辖)。best-effort。
-    void restoreWeightTid(int tid) {
-        if (tid <= 0) return;
-        char v[16]; int n = FastSnprintf(v, sizeof(v), "%d", tid);
-        int fd = open(kTopAppTasksPath, O_WRONLY | O_CLOEXEC);
-        if (fd < 0) return;
-        ssize_t w = write(fd, v, (size_t)n); (void)w;
-        close(fd);
-    }
-    // 该目标核集合是否算"绑到大核的关键线程"(含大核, 且非全核放开)。
-    bool wantIsBigKey(const cpu_set_t& want) {
-        if (!weightBigInit_) { buildBigMask(weightBigMask_, /*bigOnly=*/false); weightBigInit_ = true; }
-        bool hasBig = false;
-        for (int c = 0; c < kCoreCount; c++)
-            if (CPU_ISSET(c, &weightBigMask_) && CPU_ISSET(c, &want)) { hasBig = true; break; }
-        if (!hasBig) return false;
-        return ThreadRules::cpuCount(&want) < kCoreCount;   // 全核放开的不算"钉在大核"
-    }
-
-    void restoreAffinity(int pid) {
-        if (pid <= 0) return;
-        cpu_set_t all;
-        CPU_ZERO(&all);
-        for (int c = 0; c < kCoreCount; c++) CPU_SET(c, &all);
-        char taskDir[64];
-        FastSnprintf(taskDir, sizeof(taskDir), "/proc/%d/task", pid);
-        DIR* d = opendir(taskDir);
-        if (!d) return;
-        struct dirent* e;
-        while ((e = readdir(d)) != nullptr) {
-            if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
-            int tid = atoi(e->d_name);
-            if (tid > 0) sched_setaffinity(tid, sizeof(cpu_set_t), &all);   // 失败静默
-        }
-        closedir(d);
-    }
-
-    // 构建本机在线核集合(读 /sys/.../present, 失败退化为 [0,kCoreCount))。规则里越界核会被过滤掉。
-    void ensureThreadPresentMask() {
-        if (threadPresentInit_) return;
-        CPU_ZERO(&threadPresentMask_);
-        char buf[128];
-        bool ok = false;
-        if (readNodeTrim("/sys/devices/system/cpu/present", buf, sizeof(buf))) {
-            char* save = nullptr;
-            for (char* seg = strtok_r(buf, ",", &save); seg; seg = strtok_r(nullptr, ",", &save)) {
-                int a = -1, b = -1;
-                if (sscanf(seg, "%d-%d", &a, &b) == 2) { /* 区间 */ }
-                else if (sscanf(seg, "%d", &a) == 1) { b = a; }
-                else continue;
-                if (a < 0) continue;
-                if (b < a) b = a;
-                for (int c = a; c <= b && c < CPU_SETSIZE; c++) { CPU_SET(c, &threadPresentMask_); ok = true; }
-            }
-        }
-        if (!ok) for (int c = 0; c < kCoreCount; c++) CPU_SET(c, &threadPresentMask_);
-        threadPresentInit_ = true;
-    }
-
-    // 规则文件(threadRulesPath)变化时热重载。返回当前是否有可用规则。
-    // 文件不存在 → 清空规则集(引擎按"无规则"处理, 只跑游戏快路径)。
-    // 变更判据用 (mtime, size) 双条件: /sdcard 是 FUSE, mtime 只有秒级粒度, 同一秒内的二次保存
-    // (改完又立刻改)靠 size 兜底捕获。open/read 失败时【不推进游标】, 保留旧规则下拍重试(#3)。
-    bool reloadThreadRulesIfChanged() {
-        struct stat st;
-        if (stat(threadRulesPath, &st) != 0) {
-            if (!threadRules_.empty() || threadRulesMtime_ != -1) {
-                threadRules_.clear();
-                threadRulesMtime_ = -1;
-                threadRulesSize_ = -1;
-                logger.Debug("线程分配: 规则文件不存在, 已清空规则");
-            }
-            return false;
-        }
-        if (st.st_mtime == threadRulesMtime_ && st.st_size == threadRulesSize_)
-            return !threadRules_.empty();
-        int fd = open(threadRulesPath, O_RDONLY | O_CLOEXEC);
-        if (fd < 0) return !threadRules_.empty();   // App 正持有/fd 耗尽: 不推进 mtime, 保留旧规则, 下拍重试
-        std::string text;
-        char buf[8192];
-        ssize_t r;
-        bool ioOk = true;
-        while ((r = read(fd, buf, sizeof(buf))) != 0) {
-            if (r < 0) { ioOk = false; break; }
-            text.append(buf, (size_t)r);
-        }
-        close(fd);
-        if (!ioOk) return !threadRules_.empty();    // 读中途失败: 不用半截内容覆盖, 下拍重试
-        ensureThreadPresentMask();
-        size_t n = threadRules_.load(text, &threadPresentMask_);
-        threadRulesMtime_ = st.st_mtime;
-        threadRulesSize_ = st.st_size;
-        logger.Info("线程分配: 规则热重载, 共 %zu 条", n);
-        return n > 0;
-    }
-
-    // 对已命中规则的进程逐线程绑核: 每条线程按规则解析目标核 → 与当前亲和不同才 setaffinity(幂等)。
-    // 未命中任何具体线程规则又无进程默认的线程 → 不动(保持系统原样)。返回本次实际改动的线程数。
-    int applyRulesToProc(int pid, const std::vector<const ThreadRules::Rule*>& procRules) {
-        char taskDir[64];
-        FastSnprintf(taskDir, sizeof(taskDir), "/proc/%d/task", pid);
-        DIR* d = opendir(taskDir);
-        if (!d) return 0;
-        int bound = 0;
-        struct dirent* e;
-        while ((e = readdir(d)) != nullptr) {
-            if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
-            int tid = atoi(e->d_name);
-            if (tid <= 0) continue;
-            char commPath[96], comm[64];
-            FastSnprintf(commPath, sizeof(commPath), "/proc/%d/task/%d/comm", pid, tid);
-            if (!readNodeTrim(commPath, comm, sizeof(comm))) continue;
-            cpu_set_t want;
-            if (!ThreadRules::resolveThread(procRules, comm, &want)) continue;  // 无规则命中 → 不动
-            if (ThreadRules::cpuCount(&want) == 0) continue;
-            // 权重配置: 该线程被规则钉到大核(关键线程) 且 权重开 → 移入 kin-weight 子组抬 cpu.shares
-            if (weightEnableTick_ && weightGroupState_ == 1 && wantIsBigKey(want)) {
-                if (weightBoundTids_.find(tid) == weightBoundTids_.end()) moveTidToWeight(tid);
-                weightTickTids_.insert(tid);
-            }
-            cpu_set_t cur;
-            if (sched_getaffinity(tid, sizeof(cur), &cur) == 0 && ThreadRules::cpuEqual(&cur, &want))
-                continue;   // 已是目标, 幂等跳过
-            if (sched_setaffinity(tid, sizeof(cpu_set_t), &want) == 0) bound++;
-            // 失败(线程刚退出/无权限)静默跳过
-        }
-        closedir(d);
-        return bound;
-    }
-
-    // 扫 /proc 一遍: cmdline basename 命中规则的进程 → 逐线程绑核, pid 收进 newBound。
-    // 不限前台(系统进程/普通应用/游戏均可被规则覆盖), 与 AppOpt 语义一致。仅在有规则时调用。
-    void scanAndApplyRules(std::unordered_set<int>& newBound, const std::string& blacklist) {
-        DIR* d = opendir("/proc");
-        if (!d) return;
-        std::vector<const ThreadRules::Rule*> procRules;
-        struct dirent* e;
-        while ((e = readdir(d)) != nullptr) {
-            if (e->d_name[0] < '1' || e->d_name[0] > '9') continue;
-            bool num = true;
-            for (const char* p = e->d_name; *p; ++p)
-                if (*p < '0' || *p > '9') { num = false; break; }
-            if (!num) continue;
-            int pid = atoi(e->d_name);
-            if (pid <= 0) continue;
-            char cmdPath[64];
-            FastSnprintf(cmdPath, sizeof(cmdPath), "/proc/%d/cmdline", pid);
-            int cfd = open(cmdPath, O_RDONLY | O_CLOEXEC);
-            if (cfd < 0) continue;
-            char cmd[256] = { 0 };
-            ssize_t cn = read(cfd, cmd, sizeof(cmd) - 1);
-            close(cfd);
-            if (cn <= 0) continue;
-            cmd[cn] = '\0';
-            // 进程名取最后一个 '/' 之后(与 AppOpt 一致); App 进程名即包名(可含 :子进程后缀)
-            const char* name = strrchr(cmd, '/');
-            name = name ? name + 1 : cmd;
-            if (!*name) continue;
-            if (procInPkgList(name, blacklist)) continue;   // 黑名单应用: 有规则也不执行
-            if (!threadRules_.collectForProcess(name, procRules)) continue;
-            applyRulesToProc(pid, procRules);
-            newBound.insert(pid);
-        }
-        closedir(d);
-    }
-
-    // ── 实时调度(SCHED_FIFO/RR): 给关键线程更高的调度类, 让它抢占普通线程, 更不掉帧 ──
-
-    // 规则文件(threadPrioRulesPath)变化时热重载。返回是否有可用规则。判据/容错同 reloadThreadRulesIfChanged。
-    bool reloadThreadPrioRulesIfChanged() {
-        struct stat st;
-        if (stat(threadPrioRulesPath, &st) != 0) {
-            if (!threadPrioRules_.empty() || threadPrioMtime_ != -1) {
-                threadPrioRules_.clear();
-                threadPrioMtime_ = -1;
-                threadPrioSize_ = -1;
-            }
-            return false;
-        }
-        if (st.st_mtime == threadPrioMtime_ && st.st_size == threadPrioSize_)
-            return !threadPrioRules_.empty();
-        int fd = open(threadPrioRulesPath, O_RDONLY | O_CLOEXEC);
-        if (fd < 0) return !threadPrioRules_.empty();
-        std::string text;
-        char buf[8192];
-        ssize_t r;
-        bool ioOk = true;
-        while ((r = read(fd, buf, sizeof(buf))) != 0) {
-            if (r < 0) { ioOk = false; break; }
-            text.append(buf, (size_t)r);
-        }
-        close(fd);
-        if (!ioOk) return !threadPrioRules_.empty();
-        size_t n = threadPrioRules_.load(text);
-        threadPrioMtime_ = st.st_mtime;
-        threadPrioSize_ = st.st_size;
-        logger.Info("实时调度: 规则热重载, 共 %zu 条", n);
-        return n > 0;
-    }
-
-    // 安全网: 保证内核 RT 预算不是"无限"(-1)/0/超周期 —— 否则用户的实时线程可能把某核甚至整机饿死。
-    // 危险值时收窄到周期的 95%(给普通线程留 5% 兜底)并【回读确认】; 确认安全前【不施加实时】。
-    // 返回是否安全; 一旦确认安全(rtBudgetSet_)后续直接放行, 不再复查/写盘。
-    bool ensureRtBudgetSafe() {
-        if (rtBudgetSet_) return true;
-        char buf[32];
-        // 对齐 Metric: 施加实时前把 RR 时间片收到 3ms(sched_rr_timeslice_ms), 减少 RR 线程独占时长、
-        // 降低卡顿。幂等写一次(失败静默, 不影响后续)。Metric 另设 rt_runtime=-1(去限流), 但那会让
-        // 失控实时线程饿死系统 —— 我们保留下面的 RT 预算安全网(收窄到周期 95%), 只对齐时间片粒度。
-        if (!rrSliceSet_) {
-            rrSliceSet_ = true;
-            utils.FileWriteBlocking("/proc/sys/kernel/sched_rr_timeslice_ms", string_t("3"));
-        }
-        long period = 1000000, runtime = -1;
-        if (readNodeTrim("/proc/sys/kernel/sched_rt_period_us", buf, sizeof(buf))) period = atol(buf);
-        if (period <= 0) period = 1000000;
-        if (readNodeTrim("/proc/sys/kernel/sched_rt_runtime_us", buf, sizeof(buf))) runtime = atol(buf);
-        // 已是合理上限(0<runtime<period, 至少留了点普通线程时间) → 直接放行
-        if (runtime > 0 && runtime < period) { rtBudgetSet_ = true; return true; }
-        // 危险值: 收窄到 95% 后回读确认
-        long safe = period - period / 20;
-        char v[32];
-        FastSnprintf(v, sizeof(v), "%ld", safe);
-        utils.FileWriteBlocking("/proc/sys/kernel/sched_rt_runtime_us", string_t(v));
-        long now = -1;
-        if (readNodeTrim("/proc/sys/kernel/sched_rt_runtime_us", buf, sizeof(buf))) now = atol(buf);
-        if (now > 0 && now < period) {
-            rtBudgetSet_ = true;
-            logger.Info("实时调度: 已收窄 RT 预算 sched_rt_runtime_us=%ld/%ld(防实时线程饿死系统)", now, period);
-            return true;
-        }
-        // 收窄失败(节点只读/写被 ROM 挡): 本轮不施加实时, 下轮再试, 决不在无上限下放实时
-        logger.Warn("实时调度: 无法给 RT 预算设上限(当前=%ld/%ld), 暂不施加实时调度以防饿死系统", runtime, period);
-        return false;
-    }
-
-    // 把某 tid 还原为普通分时调度(SCHED_OTHER, 优先级 0)。失败(线程已退出/无权限)静默。
-    void restoreRtTid(int tid) {
-        if (tid <= 0) return;
-        struct sched_param p;
-        p.sched_priority = 0;
-        sched_setscheduler(tid, SCHED_OTHER, &p);
-    }
-
-    // 对命中优先级规则的进程逐线程设调度类: FIFO/RR 带 SCHED_RESET_ON_FORK(子线程不继承实时), 幂等。
-    // 被提到实时(FIFO/RR)的 tid 收进 newRt(用于逐 tid 精确还原, 不误伤系统自己的 RT 线程)。
-    void applyPrioToProc(int pid, const std::vector<const ThreadPriorityRules::Rule*>& procRules,
-                         std::unordered_set<int>& newRt) {
-        char taskDir[64];
-        FastSnprintf(taskDir, sizeof(taskDir), "/proc/%d/task", pid);
-        DIR* d = opendir(taskDir);
-        if (!d) return;
-        struct dirent* e;
-        while ((e = readdir(d)) != nullptr) {
-            if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
-            int tid = atoi(e->d_name);
-            if (tid <= 0) continue;
-            char commPath[96], comm[64];
-            FastSnprintf(commPath, sizeof(commPath), "/proc/%d/task/%d/comm", pid, tid);
-            if (!readNodeTrim(commPath, comm, sizeof(comm))) continue;
-            ThreadPriorityRules::PrioVal want;
-            if (!ThreadPriorityRules::resolveThread(procRules, comm, &want)) continue;   // 无规则 → 不动
-            bool isRt = (want.policy == SCHED_FIFO || want.policy == SCHED_RR);
-            int target = isRt ? (want.policy | SCHED_RESET_ON_FORK) : want.policy;
-            int cur = sched_getscheduler(tid);
-            struct sched_param cp;
-            if (cur == target && sched_getparam(tid, &cp) == 0 && cp.sched_priority == want.prio) {
-                if (isRt) newRt.insert(tid);   // 已是目标: 幂等跳过, 但仍登记为我们管辖的 RT 线程
-                continue;
-            }
-            struct sched_param param;
-            param.sched_priority = want.prio;
-            if (sched_setscheduler(tid, target, &param) == 0 && isRt) newRt.insert(tid);
-            // 失败(权限/线程退出)静默
-        }
-        closedir(d);
-    }
-
-    // 扫 /proc 一遍: cmdline 命中优先级规则的进程 → 逐线程设调度类。仅在有优先级规则时调用。
-    void scanAndApplyPriority(std::unordered_set<int>& newRt, const std::string& blacklist) {
-        DIR* d = opendir("/proc");
-        if (!d) return;
-        std::vector<const ThreadPriorityRules::Rule*> procRules;
-        struct dirent* e;
-        while ((e = readdir(d)) != nullptr) {
-            if (e->d_name[0] < '1' || e->d_name[0] > '9') continue;
-            bool num = true;
-            for (const char* p = e->d_name; *p; ++p)
-                if (*p < '0' || *p > '9') { num = false; break; }
-            if (!num) continue;
-            int pid = atoi(e->d_name);
-            if (pid <= 0) continue;
-            char cmdPath[64];
-            FastSnprintf(cmdPath, sizeof(cmdPath), "/proc/%d/cmdline", pid);
-            int cfd = open(cmdPath, O_RDONLY | O_CLOEXEC);
-            if (cfd < 0) continue;
-            char cmd[256] = { 0 };
-            ssize_t cn = read(cfd, cmd, sizeof(cmd) - 1);
-            close(cfd);
-            if (cn <= 0) continue;
-            cmd[cn] = '\0';
-            const char* name = strrchr(cmd, '/');
-            name = name ? name + 1 : cmd;
-            if (!*name) continue;
-            if (procInPkgList(name, blacklist)) continue;   // 黑名单应用: 不执行实时调度
-            if (!threadPrioRules_.collectForProcess(name, procRules)) continue;
-            applyPrioToProc(pid, procRules, newRt);
-        }
-        closedir(d);
-    }
-
-    // 线程分配主循环: ① AppOpt 式规则引擎(扫 /proc 对命中规则的所有进程逐线程绑核) +
-    // ② 游戏库快路径(前台游戏且未被规则覆盖 → 渲染类线程绑大核, 保留零配置体验) +
-    // ③ 实时调度(SCHED_FIFO/RR)——独立开关 rt_enable。
-    // 绝不碰频率/governor/GPU/online; 关闭/离场/退出时把绑过的进程还原为全核、把提过的线程还原为普通调度。
-    void threadAllocTask() {
-        if (waitStop(9000)) return;   // 等系统起来
-        while (!shouldExit_.load()) {
-            // 拷贝配置: 配置热重载(applyAllConfig 持 applyMtx)会整体重写, 锁内拷到局部再用, 防撕裂
-            bool en; bool rtEn; int iv; bool bigOnly; std::string pkgs; std::string blk;
-            bool weightEn; int weightShares;
-            {
-                std::lock_guard<std::recursive_mutex> lk(applyMtx);
-                en      = Config::ThreadAlloc::enable;
-                rtEn    = Config::ThreadAlloc::rt_enable;
-                iv      = Config::ThreadAlloc::interval_s;
-                bigOnly = Config::ThreadAlloc::big_only;
-                pkgs    = Config::ThreadAlloc::game_pkgs.c_str();
-                blk     = Config::ThreadAlloc::blacklist_pkgs.c_str();
-                weightEn     = Config::ThreadAlloc::weight_enable;
-                weightShares = Config::ThreadAlloc::weight_shares;
-            }
-            if (iv < 2) iv = 2;
-            if (weightShares < 2) weightShares = 2;
-            // 权重仅在绑核开时有意义(靠绑核判定关键线程); 建/写子组失败则本 tick 视为关闭
-            weightEnableTick_ = weightEn && en && ensureWeightGroup(weightShares);
-            weightSharesTick_ = weightShares;
-            weightTickTids_.clear();
-
-            // 绑核与实时调度都关: 还原一切, 长睡零副作用
-            if (!en && !rtEn) {
-                if (!threadBoundPids_.empty()) {
-                    for (int p : threadBoundPids_) restoreAffinity(p);
-                    threadBoundPids_.clear();
-                }
-                if (!rtBoundTids_.empty()) {
-                    for (int t : rtBoundTids_) restoreRtTid(t);
-                    rtBoundTids_.clear();
-                }
-                if (!weightBoundTids_.empty()) {   // 权重组里的线程还原回 top-app
-                    for (int t : weightBoundTids_) restoreWeightTid(t);
-                    weightBoundTids_.clear();
-                }
-                if (waitStop(5000)) break;
-                continue;
-            }
-
-            // ==== 绑核(gated by en) ====
-            std::unordered_set<int> newBound;
-            if (en) {
-                bool hasRules = reloadThreadRulesIfChanged();
-                // ① 规则引擎: 扫 /proc, 对命中 "pkg{thread}=核" 规则的所有进程逐线程绑核
-                if (hasRules) scanAndApplyRules(newBound, blk);
-                // ② 游戏库快路径: 前台是游戏 且 未被显式规则覆盖 → 渲染类线程绑大核(黑名单除外)。
-                // 用策略前台: 游戏粘滞生效时(小窗焦点横跳)绑核目标钉在游戏, 不跟焦点抖。
-                std::string fg = policyForegroundPkg();
-                if (!fg.empty() && procInPkgList(fg.c_str(), blk)) fg.clear();   // 线程分配黑名单: 直接视为无目标
-                // Config::AppProfile 全局与配置热重载(onJsonChanged 持 applyMtx 整体重写 Models/黑名单)并发 →
-                // 在 applyMtx 内取"是否游戏"判定快照, 防 data race/UAF; fgCategory 的 popen 慢 I/O 留锁外。
-                bool proceed = false, isGameModel = false;
-                if (!fg.empty() && fg != "null") {
-                    std::lock_guard<std::recursive_mutex> lk(applyMtx);
-                    if (!Config::AppProfile::isBlacklisted(fg.c_str())
-                        && !(hasRules && threadRules_.matchesProcess(fg.c_str()))) {
-                        proceed = true;
-                        int gm = Config::AppProfile::findMatchingModel(fg.c_str());
-                        isGameModel = (gm >= 0 && Config::AppProfile::Models[gm].isGame);
-                    }
-                }
-                if (proceed) {
-                    bool target = isGameModel;
-                    if (!target && fgCategory(fg) == 0) target = true;   // 首见 popen 一次后命中缓存
-                    if (!target && pkgInList(fg, pkgs)) target = true;
-                    if (target) {
-                        int pid = findGamePid(fg);
-                        if (pid > 0) {
-                            cpu_set_t mask;
-                            buildBigMask(mask, bigOnly);
-                            int bound = bindRenderThreads(pid, mask);
-                            if (threadBoundPids_.find(pid) == threadBoundPids_.end() && bound > 0)
-                                logger.Info("线程分配: 已把 %s 的 %d 个渲染线程绑到大核", fg.c_str(), bound);
-                            newBound.insert(pid);
-                        }
-                    }
-                }
-            }
-            // 离场还原: 上轮绑过、本轮不再命中(离开/退出/规则删除/关绑核)的进程 → 还原全核
-            for (int p : threadBoundPids_)
-                if (newBound.find(p) == newBound.end()) restoreAffinity(p);
-            threadBoundPids_.swap(newBound);
-
-            // 权重组还原: 上轮在组里、本轮不再是关键线程(或关权重)的 tid → 移回 top-app
-            for (int t : weightBoundTids_)
-                if (weightTickTids_.find(t) == weightTickTids_.end()) restoreWeightTid(t);
-            weightBoundTids_.swap(weightTickTids_);
-
-            // ==== 实时调度(gated by rtEn, 独立于绑核) ====
-            std::unordered_set<int> newRt;
-            if (rtEn) {
-                bool hasPrio = reloadThreadPrioRulesIfChanged();
-                // 只有 RT 预算确认有上限时才施加实时(否则本轮跳过, 下轮再试), 决不在无上限下放实时
-                if (hasPrio && ensureRtBudgetSafe())
-                    scanAndApplyPriority(newRt, blk);   // ③ 逐线程设 SCHED_FIFO/RR(黑名单跳过)
-            }
-            // 逐 tid 还原: 上轮提过、本轮不再命中(离开/退出/规则删除/关实时)的线程 → 还原普通调度
-            for (int t : rtBoundTids_)
-                if (newRt.find(t) == newRt.end()) restoreRtTid(t);
-            rtBoundTids_.swap(newRt);
-
-            // 周期全量扫描(iv) 或 被 fork/exec 事件唤醒立即重应用(事件驱动开启时)
-            if (waitStopOrEvent(iv * 1000)) break;
-        }
-        // 退出前收尾: 还原所有绑过的进程与提过的线程, 不把限制留给死守护
-        for (int p : threadBoundPids_) restoreAffinity(p);
-        threadBoundPids_.clear();
-        for (int t : rtBoundTids_) restoreRtTid(t);
-        rtBoundTids_.clear();
-        for (int t : weightBoundTids_) restoreWeightTid(t);   // 权重组线程移回 top-app
-        weightBoundTids_.clear();
-    }
-
     // 同 Function::stopGuards 风格：置位 → 唤醒(cv + eventfd) → join，成员销毁前线程已全部退出
     ~Schedule() {
         {
@@ -953,7 +342,6 @@ public:
         }
         stopCv_.notify_all();
         fsmCv_.notify_all();   // 一并唤醒 FSM 等待, 保证 autoModeTask 能退出
-        eventCv_.notify_all(); // 唤醒 threadAllocTask 的事件等待, 保证能退出
         if (stopEventFd_ >= 0) {
             eventfd_write(stopEventFd_, 1);
         }
@@ -987,22 +375,6 @@ public:
     void wakeFsm() {
         { std::lock_guard<std::mutex> lk(fsmMtx_); fsmWake_.store(true); }
         fsmCv_.notify_all();
-    }
-
-    // 线程分配专用睡眠: 到点(周期全量扫描) / 收到 fork/exec 事件 / 退出 任一发生即返回。返回 true = 应退出。
-    // 被事件唤醒时再攒批 kEventCoalesceMs(让同批新线程落地后一次处理), 消费标记后返回 false(立即重应用)。
-    bool waitStopOrEvent(int ms) {
-        {
-            std::unique_lock<std::mutex> lk(eventMtx_);
-            bool fired = eventCv_.wait_for(lk, std::chrono::milliseconds(ms),
-                                           [this] { return shouldExit_.load() || eventWake_.load(); });
-            if (shouldExit_.load()) return true;
-            if (!fired) return false;              // 到点 → 正常周期全量扫描
-            eventWake_.store(false);
-        }
-        if (waitStop(kEventCoalesceMs)) return true;   // 攒批期间退出则 true
-        { std::lock_guard<std::mutex> lk(eventMtx_); eventWake_.store(false); }  // 吞掉窗口内新事件
-        return false;
     }
 
 
@@ -1898,7 +1270,6 @@ public:
                 lastLoggedFgPkg_ = "\x01"; lastLoggedFgCat_ = -2; lastLogMs_ = 0;
                 stickyGame.clear();   // 退 auto: 粘滞归零(对称 fasWasGaming)
                 fengchiGovResetPending_ = false;   // 退 auto: 清热重载标志(对称 fengchiActive)
-                { std::lock_guard<std::mutex> lk(fgMtx_); policyFgPkg_.clear(); }
                 if (fasWasGaming) { autoFas_.onExitGaming(); fasWasGaming = false; }
                 // 退出 auto(切手动档等): antiClampTick 不再被调用, 若攻击侧仍抬着厂商节点则在此收手还原,
                 // 否则厂商热钳被永久顶在满频。幂等——未抬起则 no-op。
@@ -1942,7 +1313,7 @@ public:
                     !Config::AppProfile::isBlacklisted(fgPkg.c_str())) {
                     // 画像匹配 + modelName 字符串读取收进 applyMtx: 配置热重载(onJsonChanged 持锁)会
                     // 整表重写 Models[].modelName(std::string 重赋值), 锁外读 c_str() 有撕裂/UAF 风险。
-                    // fgCategory 的 popen 慢 I/O 留锁外(与 threadAllocTask 的同款快照模式一致)。
+                    // fgCategory 的 popen 慢 I/O 留锁外。
                     {
                         std::lock_guard<std::recursive_mutex> lk(applyMtx);
                         int gm = Config::AppProfile::findMatchingModel(fgPkg.c_str(), false);
@@ -1957,6 +1328,33 @@ public:
                     // 与白名单取【或】, 独立于实验开关 fas_auto_game; 视频(category=2)等不命中, 不会误入。
                     // fgCategory 仅首次见该包 popen 一次, 之后命中缓存 → 不增每 tick 开销。
                     if (!gameHint && fgCategory(fgPkg) == 0) gameHint = true;
+                }
+                // ── 多窗口游戏扫描: 小窗/分屏时前台包名只有顶层一个, 但游戏可能在后台可见窗口里。
+                // 遍历所有 visible=true 的 standard Task, 只要有一个命中游戏画像就保持游戏态。
+                // 仅在尚未从 fgPkg 判出游戏时才触发(避免重复 getForegroundCached 开销)。
+                // fgHeavy: 多窗口扫出的 heavy 直接驱动风驰调速器, 与粘滞语义一致。
+                if (!gameHint && mx.screenOn != 0) {
+                    Utils::ForegroundSnapshot snap = utils.getForegroundCached(2000);
+                    if (snap.valid) {
+                        std::lock_guard<std::recursive_mutex> lk(applyMtx);
+                        for (const auto& visiblePkg : snap.standardVisible) {
+                            if (visiblePkg.empty() || visiblePkg == "null") continue;
+                            if (Config::AppProfile::isBlacklisted(visiblePkg.c_str())) continue;
+                            if (visiblePkg == fgPkg) continue;   // fgPkg 已检测过
+                            int gm = Config::AppProfile::findMatchingModel(visiblePkg.c_str(), false);
+                            if (gm >= 0 && Config::AppProfile::Models[gm].isGame) {
+                                gameHint = true;
+                                gameByProfile = true;
+                                bool h = (strcmp(Config::AppProfile::Models[gm].modelName.c_str(),
+                                                 "game_heavy") == 0);
+                                if (h) fgHeavy = true;
+                                // fgPkg 更新为游戏包, 供粘滞/FAS/日志使用
+                                if (!h || fgPkg.empty() || fgPkg == "null")
+                                    fgPkg = visiblePkg;
+                                break;
+                            }
+                        }
+                    }
                 }
                 // 实验性帧时辅助进入(默认关): 限帧游戏 GPU<90 永不触 GPU 门, 这里给一条【非白名单】入口。
                 // 必须同时满足: 开关开 + 亮屏 + GPU≥地板 持续 FRAME_ENTRY_DWELL tick + 检测到游戏渲染层。
@@ -2044,11 +1442,6 @@ public:
                             }
                         }
                     }
-                }
-                // 发布策略前台(threadAllocTask 的绑核/游戏库快路径消费): 粘滞生效=游戏包, 否则清空
-                {
-                    std::lock_guard<std::mutex> lk(fgMtx_);
-                    policyFgPkg_ = stickyHolding ? fgPkg : std::string();
                 }
                 // 首次进入 FSM: 预置一次(放开下限+governor, 不挂基础档), 之后 FSM 只写上限 scaling_max。
                 // 注意: prime 不再额外调 autoFsm_.update() —— 否则同一份 mx 被喂两次, 把一次真实 tick
@@ -3180,16 +2573,6 @@ public:
             if (!s.topPkg.empty()) return s.topPkg;   // 全是黑名单 → 退回最顶层
         }
         return fresh ? utils.getTopApp() : utils.getTopAppCached(2500);
-    }
-
-    // 策略前台(粘滞后): threadAllocTask 等下游消费 —— 粘滞生效时绑核/游戏库快路径跟随游戏,
-    // 不被小窗焦点带跑。非 auto 或无粘滞时与 getForegroundPkg 一致。
-    std::string policyForegroundPkg() {
-        if (autoActive_.load()) {
-            std::lock_guard<std::mutex> lk(fgMtx_);
-            if (!policyFgPkg_.empty()) return policyFgPkg_;
-        }
-        return getForegroundPkg(false);
     }
 
     // App 推送 topapp.txt 变更: 记录包名+时刻, 立即重评前台(走 getForegroundPkg 会用到推送值)

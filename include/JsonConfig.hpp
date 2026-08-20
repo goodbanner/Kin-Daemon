@@ -276,10 +276,6 @@ public:
         Scheduler::Sched_util_clamp_max = "";
         GpuFreq::enable = true;
         AppProfile::enable = false;
-        // ThreadAlloc 整段复位
-        ThreadAlloc::enable = false; ThreadAlloc::interval_s = 3; ThreadAlloc::big_only = true;
-        ThreadAlloc::game_pkgs = ""; ThreadAlloc::rt_enable = false; ThreadAlloc::blacklist_pkgs = "";
-        ThreadAlloc::weight_enable = false; ThreadAlloc::weight_shares = 4096;
         // AutoMode 标量(学习/温控/FAS/风驰/抢频/分类开关)
         AutoMode::enable = true; AutoMode::thermal_path = "";
         AutoMode::warm_temp = 50; AutoMode::cool_temp = 55; AutoMode::hot_temp = 70;
@@ -536,18 +532,6 @@ private:
                 readInt (tb, "duration_ms", TouchBoost::duration_ms);
                 readInt (tb, "level_pct", TouchBoost::level_pct);
             } catch (...) {}
-            try {
-                auto& ta = F["ThreadAlloc"];
-                readBool(ta, "enable",     ThreadAlloc::enable);
-                readInt (ta, "interval_s", ThreadAlloc::interval_s);
-                readBool(ta, "big_only",   ThreadAlloc::big_only);
-                readStr (ta, "game_pkgs",  ThreadAlloc::game_pkgs);
-                readBool(ta, "rt_enable",  ThreadAlloc::rt_enable);
-                readStr (ta, "blacklist_pkgs", ThreadAlloc::blacklist_pkgs);
-                readBool(ta, "weight_enable", ThreadAlloc::weight_enable);
-                readInt (ta, "weight_shares", ThreadAlloc::weight_shares);
-            } catch (...) {}
-
             try {
                 auto& s = F["Scheduler"];
                 readBool(s, "enable",                       Scheduler::enable);

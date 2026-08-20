@@ -117,11 +117,20 @@ public:
         if (alpha >  100000) alpha =  100000;
         if (alpha < -100000) alpha = -100000;
         const float t = LEVEL[state_];
+
+        // ── V62 新思路: cpu_max 缩放按状态级别 t 加权 ──
+        // 原来 scale() 对所有状态一视同仁地用 hwmax/ref 比例缩放, 导致 LIGHT_IDLE 的上限
+        // 在 SM8850(hwmax=3628800)上从 1190400 被抬到 ~2122505 —— 手机什么都没做却被允许跑到
+        // 2.1GHz。V62 修正: 缩放权重乘以状态级别 t, 空闲保持参考值, 游戏才享受硬件全量。
+        // SUSTAINED 例外: 它是热降频状态, 级别 0.62 高于 MODERATE(0.45), 但此时恰恰要压频,
+        // 不能因为"级别高"就获得更大的缩放——权重上限钳到 MODERATE(0.45f)。
+        // cpu_min floor 不做 hwmax/ref 缩放: 空闲地板不随峰值线性增长
+        // (SM8850 最低频 ~364MHz ≈ SM8650 ~300MHz, 而峰值相差 1.78x)。改为仅 clamp 到本机真实最低频。
         Caps o;
-        o.maxL = scale(0, lerp(blend(BAL_F_MAXL, BAT_F_MAXL, alpha), blend(BAL_C_MAXL, BAT_C_MAXL, alpha), t));
-        o.minL = scale(0, lerp(blend(BAL_F_MINL, BAT_F_MINL, alpha), blend(BAL_C_MINL, BAT_C_MINL, alpha), t));
-        o.maxB = scale(1, lerp(blend(BAL_F_MAXB, BAT_F_MAXB, alpha), blend(BAL_C_MAXB, BAT_C_MAXB, alpha), t));
-        o.minB = scale(1, lerp(blend(BAL_F_MINB, BAT_F_MINB, alpha), blend(BAL_C_MINB, BAT_C_MINB, alpha), t));
+        o.maxL = scaleWeighted(0, lerp(blend(BAL_F_MAXL, BAT_F_MAXL, alpha), blend(BAL_C_MAXL, BAT_C_MAXL, alpha), t), t);
+        o.minL = clampFloor(0, lerp(blend(BAL_F_MINL, BAT_F_MINL, alpha), blend(BAL_C_MINL, BAT_C_MINL, alpha), t));
+        o.maxB = scaleWeighted(1, lerp(blend(BAL_F_MAXB, BAT_F_MAXB, alpha), blend(BAL_C_MAXB, BAT_C_MAXB, alpha), t), t);
+        o.minB = clampFloor(1, lerp(blend(BAL_F_MINB, BAT_F_MINB, alpha), blend(BAL_C_MINB, BAT_C_MINB, alpha), t));
         if (o.minL > o.maxL) o.minL = o.maxL;
         if (o.minB > o.maxB) o.minB = o.maxB;
         o.state = state_;
@@ -268,6 +277,42 @@ private:
         if (scaled > hw)    scaled = hw;
         if (scaled < floor) scaled = floor;
         return (int)scaled;
+    }
+
+    // V62: cpu_max 缩放按状态级别 t 加权 —— 空闲保持参考值, 只有高性能状态才享受硬件全量。
+    // SUSTAINED 权重上限钳到 MODERATE(0.45f): 热降频状态不因级别较高而获得更大缩放空间。
+    int scaleWeighted(int slot, int kHz, float t) const {
+        if (kHz <= 0) {
+            int floorK = (slot == 0) ? hwminL_ : hwminB_;
+            return floorK > 0 ? floorK : 300000;
+        }
+        int hw  = (slot == 0) ? hwmaxL_ : hwmaxB_;
+        int ref = (slot == 0) ? REF_HWMAX_LITTLE : REF_HWMAX_BIG;
+        if (hw <= 0 || ref <= 0) return kHz;
+        std::int64_t scaled = static_cast<std::int64_t>(kHz) * hw / ref;
+        int floor = (slot == 0) ? hwminL_ : hwminB_;
+        if (floor <= 0) floor = 300000;
+        if (scaled > hw) scaled = hw;
+        if (scaled < floor) scaled = floor;
+        // 加权混合: raw + (scaled - raw) × w
+        // w = t, SUSTAINED 时上限 0.45f(MODERATE 级别), 防热降频状态反而抬高上限
+        float w = t;
+        if (state_ == SUSTAINED && w > 0.45f) w = 0.45f;
+        int result = kHz + (int)((scaled - kHz) * w);
+        if (result > hw)    result = hw;
+        if (result < floor) result = floor;
+        return result;
+    }
+
+    // V62: cpu_min floor 不做 hwmax/ref 缩放 —— 空闲地板不随峰值线性增长。
+    // 仅 clamp 到本机真实最低频即可(设备最低频接近, 而峰值差距可达 1.78x)。
+    int clampFloor(int slot, int kHz) const {
+        int floor = (slot == 0) ? hwminL_ : hwminB_;
+        if (floor <= 0) floor = 300000;
+        int hw = (slot == 0) ? hwmaxL_ : hwmaxB_;
+        if (kHz < floor) return floor;
+        if (hw > 0 && kHz > hw) return hw;
+        return kHz;
     }
 
     void enter(State s, long now) {
