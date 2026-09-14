@@ -19,9 +19,6 @@
 #include <stddef.h>
 #include <chrono>
 #include <cstdio>
-#include <sys/inotify.h>
-#include <sys/mount.h>
-#include <sys/prctl.h>
 #include <string_view>
 #include <unordered_map>
 #include <functional>
@@ -30,6 +27,11 @@
 #include <memory>
 #include "LibUtils.hpp"
 #include "Json/string.hpp"
+#include "WindowFocus.hpp"
+#include "NodeValue.hpp"
+#include "ForegroundCache.hpp"
+#include "PresenceCache.hpp"
+#include "WriteStatus.hpp"
 
 #define DEBUG_DURATION 0
 #define MAX_PKG_LEN 128
@@ -80,6 +82,25 @@ public:
         }
     }
 
+    // sysfs/proc 专用：节点必须预先存在，绝不 chmod 或 O_CREAT。
+    // 用于 SysTweaks，避免把缺失能力误当成可创建文件。
+    bool FileWriteExisting(const char* filePath, const char* content) noexcept {
+        if (!filePath || !content || access(filePath, F_OK) != 0) return false;
+        int fd = open(filePath, O_WRONLY | O_CLOEXEC);
+        if (fd < 0) return false;
+        const size_t len = Faststrlen(content);
+        size_t off = 0;
+        while (off < len) {
+            ssize_t n = write(fd, content + off, len - off);
+            if (n > 0) { off += (size_t)n; continue; }
+            if (n < 0 && errno == EINTR) continue;
+            close(fd);
+            return false;
+        }
+        close(fd);
+        return true;
+    }
+
 
     void FileWrite(const string& filePath, const string& content) noexcept {
         int fd = open(filePath.c_str(), O_WRONLY | O_NONBLOCK);
@@ -113,6 +134,38 @@ public:
     void sleep_ms(const int ms) {
         usleep(1000 * ms);
     }
+
+    // 读当前节点并仅在值变化时写入。sysfs 节点通常不带换行，读取时仅去掉行尾空白。
+    // 返回 false 表示节点不存在、读取失败或写入失败；同值跳过返回 true。
+    bool FileWriteIfChangedBlocking(const char* filePath, const string_t& content) noexcept {
+        if (!filePath || content.empty()) {
+            writeStatus_.record(kin::WriteStatus::Failed);
+            return false;
+        }
+        const auto comparison = kin::compareNodeValue(
+            filePath, std::string_view(content.data(), content.size()));
+        if (comparison == kin::NodeComparison::Equal) {
+            writeStatus_.record(kin::WriteStatus::Unchanged);
+            return true;
+        }
+        // 不以截断或读取失败推断节点值；保留失败语义，交调用方重试/报告。
+        if (comparison != kin::NodeComparison::Different) {
+            writeStatus_.record(kin::WriteStatus::Failed);
+            return false;
+        }
+        const bool written = FileWriteBlocking(filePath, content);
+        writeStatus_.record(written ? kin::WriteStatus::Written : kin::WriteStatus::Failed);
+        return written;
+    }
+
+    bool FileWriteIfChangedBlocking(const char* filePath, const char* content) noexcept {
+        return content && FileWriteIfChangedBlocking(filePath, string_t(content));
+    }
+
+    void beginWriteBatch() noexcept { writeStatus_.startBatch(); }
+    void endWriteBatch() noexcept { writeStatus_.endBatch(); }
+    kin::WriteStatus lastWriteStatus() const noexcept { return writeStatus_.get(); }
+    kin::WriteStatus writeBatchStatus() const noexcept { return writeStatus_.batch(); }
 
     // scaling_governor 等节点不能用 O_NONBLOCK（内核返回 EAGAIN 导致静默失败），失败时解锁权限重试
     bool FileWriteBlocking(const char* filePath, const string_t& content) noexcept {
@@ -192,21 +245,25 @@ public:
     //   mFocusedApp=ActivityRecord{... u0 com.tencent.tmgp.dfm/.MainActivity t123}
     // 解析: 取行内第一个含 '/' 的 token, 斜杠前即包名。调用方需限频(一次 ~100-300ms)。
     string getFocusedAppWindow() {
-        char buf[1024] = {0};
-        if (!popenRead("dumpsys window 2>/dev/null | grep -m1 mFocusedApp", buf, sizeof(buf)))
-            return "";
-        char* slash = strchr(buf, '/');
-        if (!slash) return "";
-        char* start = slash;
-        while (start > buf && *(start - 1) != ' ' && *(start - 1) != '{') start--;
-        if (slash <= start) return "";
-        string pkg(start, (size_t)(slash - start));
-        // 包名合法性: 含 '.' 且无奇异字符(解析错位时宁可返回空)
-        if (pkg.find('.') == string::npos || pkg.find('=') != string::npos) return "";
-        return pkg;
+        auto* pipe = popen("dumpsys window 2>/dev/null", "r");
+        if (!pipe) return "";
+        kin::WindowFocus focus;
+        char line[2048];
+        while (fgets(line, sizeof(line), pipe)) focus.consume(line);
+        pclose(pipe);
+        return focus.package();
     }
 
     string getTopAppFast() {
+        // cpuset 读取仍需访问 /proc/<pid>/cmdline；短 TTL 防止 FSM/事件线程
+        // 在同一前台切换期间重复扫描。缓存空结果也避免错误路径形成扫描风暴。
+        {
+            std::lock_guard<std::mutex> lk(topAppFastMtx_);
+            if (topAppFastCached_ &&
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - topAppFastAt_).count() < 300)
+                return topAppFastValue_;
+        }
         // 候选 cpuset 路径(不同 Android 版本/cgroup 布局)。
         // cgroup.procs(进程 PID)优先于 tasks(线程 TID): top-app 下每个 App 有几十~上百线程,
         // 按 tasks 枚举会对同一进程的每个 TID 都 open /proc/<tid>/cmdline —— 每 tick 最大 syscall 源。
@@ -244,7 +301,19 @@ public:
                 if (strchr(cmd, '.') && !strchr(cmd, '/'))
                     best = cmd;
             }
-            if (!best.empty()) return best;
+            if (!best.empty()) {
+                std::lock_guard<std::mutex> lk(topAppFastMtx_);
+                topAppFastValue_ = best;
+                topAppFastAt_ = std::chrono::steady_clock::now();
+                topAppFastCached_ = true;
+                return best;
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lk(topAppFastMtx_);
+            topAppFastValue_.clear();
+            topAppFastAt_ = std::chrono::steady_clock::now();
+            topAppFastCached_ = true;
         }
         return "";
     }
@@ -289,41 +358,52 @@ public:
     // 用于"游戏档保活到退出"——前台离开但进程未死时维持画像。
     bool isPackageRunning(const char* pkg) {
         if (!pkg || !*pkg) return false;
-        DIR* d = opendir("/proc");
-        if (!d) return false;
-        bool found = false;
-        struct dirent* e;
-        while ((e = readdir(d)) != nullptr) {
-            if (e->d_name[0] < '1' || e->d_name[0] > '9') continue;
-            bool num = true;
-            for (const char* p = e->d_name; *p; ++p)
-                if (*p < '0' || *p > '9') { num = false; break; }
-            if (!num) continue;
-            char cmdPath[64];
-            snprintf(cmdPath, sizeof(cmdPath), "/proc/%s/cmdline", e->d_name);
-            int cfd = open(cmdPath, O_RDONLY);
-            if (cfd < 0) continue;
-            char cmd[256] = { 0 };
-            ssize_t cn = read(cfd, cmd, sizeof(cmd) - 1);
-            close(cfd);
-            if (cn <= 0) continue;
-            cmd[cn] = '\0';
-            char* colon = strchr(cmd, ':');
-            if (colon) *colon = '\0';
-            if (strcmp(cmd, pkg) == 0) { found = true; break; }
-        }
-        closedir(d);
-        return found;
+        const std::string key(pkg);
+        return packagePresenceCache_.alive(key, 2000, [](const std::string& name) {
+            DIR* d = opendir("/proc");
+            if (!d) return false;
+            bool found = false;
+            struct dirent* e;
+            while ((e = readdir(d)) != nullptr) {
+                if (e->d_name[0] < '1' || e->d_name[0] > '9') continue;
+                bool numeric = true;
+                for (const char* p = e->d_name; *p; ++p)
+                    if (*p < '0' || *p > '9') { numeric = false; break; }
+                if (!numeric) continue;
+                char cmdPath[64];
+                snprintf(cmdPath, sizeof(cmdPath), "/proc/%s/cmdline", e->d_name);
+                int cfd = open(cmdPath, O_RDONLY);
+                if (cfd < 0) continue;
+                char cmd[256] = { 0 };
+                ssize_t cn = read(cfd, cmd, sizeof(cmd) - 1);
+                close(cfd);
+                if (cn <= 0) continue;
+                cmd[cn] = '\0';
+                char* colon = strchr(cmd, ':');
+                if (colon) *colon = '\0';
+                if (name == cmd) { found = true; break; }
+            }
+            closedir(d);
+            return found;
+        });
+
     }
 
     // topPkg = Z 序最顶的可见标准 Task（过滤输入法/通知栏等非 standard Task）
     // visible = 所有 visible=true 的 Task 包名（供 isPackageVisible 判小窗场景）
-    struct ForegroundSnapshot {
-        std::string topPkg;
-        std::vector<std::string> visible;
-        std::vector<std::string> standardVisible;  // Z 序: 所有 type=standard 且 visible=true 的包名
-        bool valid = false;
-    };
+    using ForegroundSnapshot = kin::ForegroundSnapshot;
+
+private:
+    kin::WriteStatusTracker writeStatus_;
+
+    kin::ForegroundCache<> foregroundCache_;
+    mutable std::mutex topAppFastMtx_;
+    kin::PresenceCache<> packagePresenceCache_;
+    std::string topAppFastValue_;
+    std::chrono::steady_clock::time_point topAppFastAt_{};
+    bool topAppFastCached_ = false;
+
+public:
 
     ForegroundSnapshot parseForegroundOnce() {
         ForegroundSnapshot s;
@@ -355,24 +435,9 @@ public:
     }
 
     ForegroundSnapshot getForegroundCached(int ttlMs) {
-        using clock = std::chrono::steady_clock;
-        static std::mutex m;
-        static ForegroundSnapshot last;
-        static clock::time_point lastTime{};
-        auto now = clock::now();
-        {
-            std::lock_guard<std::mutex> lk(m);
-            auto since = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastTime).count();
-            if (lastTime.time_since_epoch().count() != 0 && since < ttlMs && last.valid)
-                return last;
-        }
-        ForegroundSnapshot s = parseForegroundOnce();
-        if (s.valid) {
-            std::lock_guard<std::mutex> lk(m);
-            last = s;
-            lastTime = now;
-        }
-        return s;
+        // 即使 fresh/ttl=0 或查询失败，也至少间隔 2s；并发只允许一次 Activity 探测。
+        // 新鲜无障碍推送在 Schedule 中直接返回，不受本缓存限制。
+        return foregroundCache_.get(ttlMs, [this] { return parseForegroundOnce(); });
     }
 
     // ColorOS 小窗报 mode=fullscreen 而非 freeform，故用 visible=true 判游戏是否仍在渲染
@@ -432,20 +497,26 @@ public:
     string getTopAppCached(int minIntervalMs = 1500) {
         using clock = std::chrono::steady_clock;
         static std::mutex   m;
+        static std::atomic_flag probing = ATOMIC_FLAG_INIT;
         static std::string  lastResult = "null";
         static clock::time_point lastTime{};
-        auto now = clock::now();
+        const auto now = clock::now();
         {
             std::lock_guard<std::mutex> lk(m);
-            auto since = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastTime).count();
+            const auto since = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastTime).count();
             if (since < minIntervalMs && !lastResult.empty()) return lastResult;
+            // Do not queue behind a slow dumpsys or start a duplicate probe from a
+            // concurrent scheduler/event thread. The previous result is safer than
+            // multiplying shell processes; an empty result remains an explicit miss.
+            if (probing.test_and_set(std::memory_order_acquire)) return lastResult;
         }
-        std::string r = getTopApp();
+        const std::string r = getTopApp();
         {
             std::lock_guard<std::mutex> lk(m);
             lastResult = r;
-            lastTime   = now;
+            lastTime   = clock::now();
         }
+        probing.clear(std::memory_order_release);
         return r;
     }
 

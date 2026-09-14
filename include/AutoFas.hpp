@@ -135,7 +135,13 @@ public:
                 char line[256]; memcpy(line, p, len); line[len] = '\0';
                 if (strstr(line, pkg) &&
                     (strstr(line, "BLAST") || strstr(line, "SurfaceView") || strstr(line, "TX -"))) {
-                    layerSeen_ = true; break;
+                    layerSeen_ = true;
+                    // Reuse the matching layer for the imminent FAS latency probe;
+                    // otherwise the same tick would launch a second --list command.
+                    if (dumpLayer_[0] == '\0') {
+                        memcpy(dumpLayer_, line, len + 1);
+                    }
+                    break;
                 }
             }
             if (!eol) break; p = eol + 1;

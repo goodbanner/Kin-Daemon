@@ -21,6 +21,9 @@
 #include "Config.hpp"
 #include "Logger.hpp"
 #include "Soc.hpp"
+#include "PolicyStatus.hpp"
+#include "BatteryPolicy.hpp"
+#include "ThermalStatus.hpp"
 #include <atomic>
 #include <mutex>
 #include <cerrno>
@@ -73,7 +76,25 @@ public:
     // 调度每 tick 注入当前前台包名(供 App 发热学习 / 凉爽游戏提前介入)。空/null=无。
     void setForegroundApp(const char* pkg) {
         curAppHash_ = (pkg && pkg[0] && strcmp(pkg, "null") != 0) ? fnv1a(pkg) : 0;
+        curAppName_.clear();
+        if (!pkg || !*pkg || strcmp(pkg, "null") == 0) return;
+        // Android 包名只允许安全 token 字符；异常字符被替换为 '_'，避免污染 key=value 文件。
+        for (const char* p = pkg; *p && curAppName_.size() < 160; ++p) {
+            const unsigned char c = (unsigned char)*p;
+            curAppName_.push_back((c == '.' || c == '_' || c == '-' ||
+                                   (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                                   (c >= '0' && c <= '9')) ? (char)c : '_');
+        }
     }
+
+    bool lowBatteryActive(bool enabled, bool charging) const {
+        return enabled && !charging && batteryPolicy_.engaged();
+    }
+    void setForegroundCategory(int category) { curAppCategory_ = category; }
+    void setForegroundSource(const char* source) {
+        curFgSource_ = (source && *source) ? source : "unknown";
+    }
+    void setLastWriteStatus(kin::WriteStatus status) { utilsLastWriteStatus_ = status; }
 
     // 功耗记录: 由独立线程每 ~30s 调用一次(与情景模式无关, 始终记录)。
     // 只记原始电池量(ts,电量,电流mA绝对值,电压mV,温度deci℃,充电), App 据 cellCount 自算功率/会话/曲线。
@@ -247,10 +268,11 @@ public:
             alpha = maxi(alpha, ASB_NIGHT_FORCE_ALPHA); nightOv = true;
         }
         // 自动省电: 低电迟滞闩持续更新(防开关切换时状态错乱), 仅在 auto_battery_enable 时上抬 alpha。
-        updateLowbatLatch(m.battPct, m.charging);
-        if (Config::AutoMode::auto_battery_enable && lowbatEngaged_) {
-            const bool crit = (m.battPct >= 0 && m.battPct <= AutoMode::crit_batt && !m.charging);
-            alpha = maxi(alpha, crit ? ASB_LOWBAT_CRIT_ALPHA : ASB_LOWBAT_FORCE_ALPHA); lowbatOv = true;
+        batteryPolicy_.update(m.battPct, m.charging, AutoMode::low_batt);
+        const int batteryFloor = batteryPolicy_.alphaFloor(
+            m.battPct, m.charging, AutoMode::auto_battery_enable, AutoMode::crit_batt);
+        if (batteryFloor > 0) {
+            alpha = maxi(alpha, batteryFloor); lowbatOv = true;
         }
         // 热否决/软抬走【皮肤锚定决策温】: 结温恒高但外壳凉时不再误抬 alpha(无皮肤 td=结温=现状)
         const int tdA = thermalDecisionC(m);
@@ -397,7 +419,8 @@ public:
     }
 
     // FSM 模式下的实时状态(含 FSM 状态名与本 tick 频率上限)
-    void writeFsmStatus(const Metrics& m, int alpha, const char* fsmState, int maxL, int maxB) {
+    void writeFsmStatus(const Metrics& m, int alpha, const char* fsmState, int maxL, int maxB,
+                        const kin::PolicyDecision& decision, bool fasEngaged, bool romManaged) {
         // 状态文件仅供 App 显示(App ~1Hz 轮询)。FAS/游戏档 tick 可达 ~4Hz, 每次都 open+write+close
         // /sdcard(FUSE/sdcardfs)开销大且白白唤醒 → 限到 ~1Hz 写, 与读端节奏对齐。
         {
@@ -421,13 +444,70 @@ public:
             alphaRaw_[bucket],
             Config::AutoMode::last_conf.load(), maxL, maxB,
             m.tempC, m.battPct, m.gpuPct, m.load1,
-            m.cpuBusy, m.currentMa, m.powerW, m.charging ? 1 : 0, m.screenOn, lowbatEngaged_ ? 1 : 0,
+            m.cpuBusy, m.currentMa, m.powerW, m.charging ? 1 : 0, m.screenOn, batteryPolicy_.engaged() ? 1 : 0,
             nightSleepMin_, nightWakeMin_, nightSamples_,
             m.headroom, m.headroomValid, m.softClamp, m.hardClamp, m.vendorClamp, clamp1hCount_,
             acActive_, acTotal_,
             explDir_, baseCostMa_[bucket],
             (dtSamples_[bucket] >= 3 ? consistencyX1000(bucket) : 1000));
-        if (n > 0) writeFile(kStatusPath, buf, (size_t)n);
+        if (n > 0 && (size_t)n < sizeof(buf)) {
+            // 这些字段使用固定枚举值，避免把未经校验的外部文本带入状态协议。
+            std::string status(buf, (size_t)n);
+            status += "schema_version=2\n";
+            status += "seq=" + std::to_string(++fsmStatusSeq_) + "\n";
+            status += "timestamp=" + std::to_string((long long)time(nullptr)) + "\n";
+            status += "owner=kin_daemon\nreason=smart_policy\nevent=steady\n";
+            status += "foreground_package=" + curAppName_ + "\n";
+            status += "foreground_category=" + std::to_string(curAppCategory_) + "\n";
+            status += "foreground_source=" + curFgSource_ + "\n";
+            status += kin::policyStatusFields(decision, fasEngaged, romManaged,
+                                               utilsLastWriteStatus_);
+            status += "battery_state=";
+            status += batteryPolicy_.state(m.battPct, m.charging,
+                Config::AutoMode::auto_battery_enable, Config::AutoMode::crit_batt);
+            status += "\nthermal_state=";
+            status += kin::thermalStatus(thermalDecisionC(m), m.skinC, m.headroom,
+                                         m.headroomValid, m.hardClamp);
+            status += "\n";
+            writeFile(kStatusPath, status.c_str(), status.size());
+        }
+    }
+
+    // 启动时输出只读能力摘要，供 App 区分设备不支持与运行时失败。
+    // 仅探测固定节点，不执行任何写入；单项缺失不会影响调度启动。
+    void writeCapabilities() {
+        mkdir(kAiDir, 0755);
+        std::string out;
+        out += "schema_version=1\n";
+        out += "timestamp=" + std::to_string((long long)time(nullptr)) + "\n";
+        out += "cpu_policy_count=" + std::to_string(Config::kClusterCount) + "\n";
+        for (int i = 0; i < Config::kClusterCount; ++i) {
+            const int policy = Config::Policy::CpuPolicy[i];
+            if (policy < 0) continue;
+            char path[160];
+            snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpufreq/policy%d/cpuinfo_max_freq", policy);
+            bool ok = false;
+            const long max = readRawLong(path, ok);
+            out += "cpu_policy" + std::to_string(i) + "_exists=" + (ok ? "1\n" : "0\n");
+            out += "cpu_policy" + std::to_string(i) + "_max_khz=" + std::to_string(ok ? max : -1) + "\n";
+            snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpufreq/policy%d/cpuinfo_min_freq", policy);
+            const long min = readRawLong(path, ok);
+            out += "cpu_policy" + std::to_string(i) + "_min_khz=" + std::to_string(ok ? min : -1) + "\n";
+        }
+        const char* gpu = "/sys/class/kgsl/kgsl-3d0/max_gpuclk";
+        out += std::string("gpu_kgsl_exists=") + (access(gpu, R_OK) == 0 ? "1\n" : "0\n");
+        out += "gpu_kgsl_reason=" + std::string(access(gpu, R_OK) == 0 ? "available\n" : "node_missing\n");
+        const char* mali = "/sys/class/devfreq/48000000.mali/max_freq";
+        out += std::string("gpu_mali_exists=") + (access(mali, R_OK) == 0 ? "1\n" : "0\n");
+        out += "gpu_mali_reason=" + std::string(access(mali, R_OK) == 0 ? "available\n" : "node_missing\n");
+        out += "thermal_exists=" + std::string(access("/sys/class/thermal", R_OK) == 0 ? "1\n" : "0\n");
+        out += "uclamp_exists=" + std::string(access("/proc/sys/kernel", R_OK) == 0 ? "1\n" : "0\n");
+        bool fpsExists = false;
+        for (const char* const* p = Soc::kMeasuredFps; *p; ++p) {
+            if (access(*p, R_OK) == 0) { fpsExists = true; break; }
+        }
+        out += "fas_measured_fps_exists=" + std::string(fpsExists ? "1\n" : "0\n");
+        writeFile(kCapabilitiesPath, out.c_str(), out.size());
     }
 
     // 屏幕亮/灭状态(复用 slot 15 的缓存 fd 读背光节点): 1=亮 0=灭 -1=未知。
@@ -463,6 +543,7 @@ private:
     static constexpr const char* kStatePath  = "/sdcard/Android/Kin/.kin/auto_state.txt";
     static constexpr const char* kAiDir      = "/sdcard/Android/Kin/AI";
     static constexpr const char* kStatusPath = "/sdcard/Android/Kin/AI/auto_status.txt";   // App 读, 收进 AI/
+    static constexpr const char* kCapabilitiesPath = "/sdcard/Android/Kin/AI/capabilities.txt";
     static constexpr const char* kAppheatPath = "/sdcard/Android/Kin/.kin/auto_appheat.txt";
     static constexpr const char* kNightPath   = "/sdcard/Android/Kin/.kin/auto_night.txt";
     static constexpr const char* kPowerLogPath = "/sdcard/Android/Kin/AI/power_log.txt";
@@ -481,8 +562,6 @@ private:
     static constexpr int DRAIN_HIGH_MA         = 1200;  // 会话平均放电电流≥此值(mA)也算 drainy(喂功耗记录入学习)
     static constexpr int ASB_NIGHT_FORCE_ALPHA = 900;
     static constexpr int ASB_VETO_FORCE_ALPHA  = 700;
-    static constexpr int ASB_LOWBAT_FORCE_ALPHA= 800;
-    static constexpr int ASB_LOWBAT_CRIT_ALPHA = 900;
 
     // 热趋势(asb_smart_apply_thermal_trend): 升温斜率 m℃/min, 越陡越提前压频
     static constexpr int TREND_MIN_TEMP   = 45,  TREND_MIN_SLOPE = 3000;   // 常规
@@ -541,7 +620,8 @@ private:
     unsigned rngState_ = 0; // 轻量 xorshift32 PRNG 状态(首次用 time() 播种); 仅用于探索抽样
     long lastCtrlCheck_ = 0;// 上次检查控制文件的时刻(限频, 减少 FUSE 轮询)
 
-    bool lowbatEngaged_ = false;   // 低电迟滞闩
+    kin::BatteryPolicy batteryPolicy_;   // 低电迟滞与 alpha 安全地板
+    kin::WriteStatus utilsLastWriteStatus_ = kin::WriteStatus::Unknown;
 
     // 亮屏会话累计
     bool inSession_      = false;
@@ -932,16 +1012,6 @@ private:
                      drainRate, obsX100_[bucket], confOf(bucket));
     }
 
-    // 低电迟滞闩(ASB asb_smart_apply_low_battery_override)
-    void updateLowbatLatch(int battPct, bool charging) {
-        if (battPct < 0) return;
-        if (!lowbatEngaged_) {
-            if (battPct <= Config::AutoMode::low_batt && !charging) lowbatEngaged_ = true;
-        } else {
-            if (battPct >= 40 || charging) lowbatEngaged_ = false;   // RESTORE_PCT=40
-        }
-    }
-
     // ── 充电感知(移植 ASB asb_smart_apply_charge_aware) ──
     // 充电时: 电池烫→省电护温; 息屏→满速充压性能; 亮屏且凉→朝均衡放(去掉省电带来的延迟)。
     int applyChargeAware(int alpha, const Metrics& m, bool nightOv, bool lowbatOv, bool vetoFlag) {
@@ -1254,6 +1324,10 @@ private:
     // 节点消失/读失败即关闭该 slot 下次重开(热插拔/路径变动安全)。slot 固定分配, 见各读取函数。
     bool fdInit_ = false;
     long lastFsmStatusMs_ = 0;   // writeFsmStatus ~1Hz 写节流的上次写入时刻(CLOCK_MONOTONIC ms)
+    unsigned long fsmStatusSeq_ = 0;
+    std::string curAppName_;
+    std::string curFgSource_ = "unknown";
+    int curAppCategory_ = -1;
     static constexpr int kFdSlots = 21;   // slot 0-15 见各读取函数; slot 16 FAS measured_fps; slot 17 headroom; slot 18 皮肤/外壳温; slot 19 加权负载 /proc/stat; slot 20 PSI
     int  cachedFd_[kFdSlots];
     const char* gpuPath_ = nullptr;
@@ -1413,19 +1487,40 @@ private:
         return ok ? strtol(b, nullptr, 10) : 0;
     }
     static void writeFile(const char* path, const char* data, size_t len) {
-        int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        if (!path || !data || len == 0) return;
+        // 状态文件使用同目录临时文件+完整写入+fsync+rename，避免 App 读到半份快照。
+        // 唯一临时名和进程内互斥避免状态/能力文件并发写入互相清理临时文件。
+        static std::mutex writeMtx;
+        static std::atomic<unsigned long> writeSeq{0};
+        std::lock_guard<std::mutex> lock(writeMtx);
+        char tmpBuf[320];
+        snprintf(tmpBuf, sizeof(tmpBuf), "%s.tmp.%ld.%lu", path, (long)getpid(), ++writeSeq);
+        const std::string tmp(tmpBuf);
+        int fd = open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
         if (fd < 0 && errno == ENOENT) {
-            // 父目录不存在(如运行数据子目录 AI/ 尚未建)→ 建目录后重试一次
             char dir[256];
             snprintf(dir, sizeof(dir), "%s", path);
             char* slash = strrchr(dir, '/');
             if (slash) { *slash = '\0'; mkdir(dir, 0755); }
-            fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+            fd = open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
         }
         if (fd < 0) return;
-        ssize_t w = write(fd, data, len);
-        (void)w;
+        size_t off = 0;
+        while (off < len) {
+            ssize_t w = write(fd, data + off, len - off);
+            if (w > 0) { off += (size_t)w; continue; }
+            if (w < 0 && errno == EINTR) continue;
+            close(fd);
+            unlink(tmp.c_str());
+            return;
+        }
+        if (fsync(fd) != 0) {
+            close(fd);
+            unlink(tmp.c_str());
+            return;
+        }
         close(fd);
+        if (rename(tmp.c_str(), path) != 0) unlink(tmp.c_str());
     }
     static int normTemp(long raw) {
         long c;

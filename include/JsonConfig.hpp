@@ -2,6 +2,7 @@
 
 #include "Json/json.h"
 #include "Config.hpp"
+#include "ConfigValidation.hpp"
 #include "Logger.hpp"
 #include <stdexcept>
 #include <cstring>
@@ -29,13 +30,25 @@ public:
     int         baseModelIdx = -1;
 
     void LoadConfig() {
-        ifstream file(modePath);
+        const char* paths[] = {
+            modePath,
+            "/storage/emulated/0/Android/Kin/mode.txt"
+        };
+        ifstream file;
+        const char* usedPath = modePath;
+        for (const char* path : paths) {
+            file.open(path);
+            if (file.is_open()) { usedPath = path; break; }
+            file.clear();
+        }
         if (!file.is_open()) {
-            // mode.txt 不存在时默认 balance，避免首次部署报错
-            fprintf(stderr, "无法打开配置文件: %s，使用默认 balance\n", modePath);
+            // mode.txt 不存在时默认 balance，但保留明确诊断；service.sh 负责创建。
+            fprintf(stderr, "无法打开配置文件: %s 或 %s，使用默认 balance\n",
+                    paths[0], paths[1]);
             mode = "balance";
             return;
         }
+        fprintf(stderr, "Kin mode.txt: %s\n", usedPath);
         std::string temp;
         getline(file, temp);
         size_t end = temp.find_last_not_of(" \t\r\n");
@@ -350,8 +363,22 @@ public:
         resetState();
         publishGpuSnapshot();   // 重载期间/失败时与清空后的 string 保持一致
 
-        ifstream ifs(configPath, std::ios::binary);
-        if (!ifs) { logger.Error("无法打开配置文件: %s", configPath); return false; }
+        const char* configPaths[] = {
+            configPath,
+            "/storage/emulated/0/Android/Kin/config.json"
+        };
+        ifstream ifs;
+        const char* usedConfigPath = configPath;
+        for (const char* path : configPaths) {
+            ifs.open(path, std::ios::binary);
+            if (ifs.is_open()) { usedConfigPath = path; break; }
+            ifs.clear();
+        }
+        if (!ifs.is_open()) {
+            logger.Error("无法打开配置文件: %s 或 %s", configPaths[0], configPaths[1]);
+            return false;
+        }
+        logger.Debug("Kin config.json: %s", usedConfigPath);
         std::string text((std::istreambuf_iterator<char>(ifs)),
                           std::istreambuf_iterator<char>());
         int rc = json::parse(&json, text.data(), text.data() + text.size());
@@ -386,8 +413,17 @@ public:
         // 同结构 Function 子集, 用同一套 readXxx 解析: 键存在即覆盖出厂值, 缺键保持 config/默认。
         // 文件不存在/为空/解析失败 → 忽略覆盖层(仅 config 生效), 不影响守护启动。
         {
-            ifstream sf(settingsPath, std::ios::binary);
-            if (sf) {
+            const char* settingsPaths[] = {
+                settingsPath,
+                "/storage/emulated/0/Android/Kin/settings.json"
+            };
+            ifstream sf;
+            for (const char* path : settingsPaths) {
+                sf.open(path, std::ios::binary);
+                if (sf.is_open()) break;
+                sf.clear();
+            }
+            if (sf.is_open()) {
                 std::string st((std::istreambuf_iterator<char>(sf)),
                                std::istreambuf_iterator<char>());
                 if (!st.empty()) {
@@ -709,9 +745,11 @@ private:
                             readInt(c, "maxB", e.maxPctB);
                             readInt(c, "gpu",  e.gpuPct);
                             // 护栏: 频率% 钳到 [10,100], GPU% 钳到 [0,100]。
-                            if (e.maxPctL < 10) e.maxPctL = 10; if (e.maxPctL > 100) e.maxPctL = 100;
-                            if (e.maxPctB < 10) e.maxPctB = 10; if (e.maxPctB > 100) e.maxPctB = 100;
-                            if (e.gpuPct  < 0)  e.gpuPct  = 0;  if (e.gpuPct  > 100) e.gpuPct  = 100;
+                            kin::PolicyEntry checkedEntry{e.maxPctL, e.maxPctB, e.gpuPct};
+                            kin::validatePolicyEntry(checkedEntry, false);
+                            e.maxPctL = checkedEntry.maxL;
+                            e.maxPctB = checkedEntry.maxB;
+                            e.gpuPct = checkedEntry.gpu;
                             // cores: 8 字符在线掩码 "11111100"(cpu0..7, 1=在线 0=停泊)。缺失/非法字符
                             // 按在线(=1)处理, 故不写或写错绝不会误关核。硬护栏在 scheduler 落实(不关 cpu0/整簇)。
                             string_t mask;
@@ -742,9 +780,11 @@ private:
                             readInt(c, "maxB", e.maxB);
                             readInt(c, "gpu",  e.gpu);
                             // 护栏: 越界一律回到「未设置」而不是半钳 —— 用户写错不影响内置行为。
-                            if (e.maxL < 10 || e.maxL > 100) e.maxL = -1;
-                            if (e.maxB < 10 || e.maxB > 100) e.maxB = -1;
-                            if (e.gpu  < 0  || e.gpu  > 100) e.gpu  = 0;
+                            kin::PolicyEntry checkedEntry{e.maxL, e.maxB, e.gpu};
+                            kin::validatePolicyEntry(checkedEntry, true);
+                            e.maxL = checkedEntry.maxL;
+                            e.maxB = checkedEntry.maxB;
+                            e.gpu = checkedEntry.gpu;
                             if (e.maxL > 0 || e.maxB > 0 || e.gpu > 0) nOverride++;
                         } catch (...) {}   // 该状态未配置 → 保持未设置
                     }
@@ -752,12 +792,55 @@ private:
                         logger.Info("AutoMode: fsm_policy 覆盖 %d/6 个状态的频率/GPU 上限", nOverride);
                 } catch (...) {}           // 无 fsm_policy 节点 → 无覆盖
                 // 进/出温度安全护栏: enter 必须严格大于 exit, 否则进出抖动; 异常时回退默认 57/49。
-                if (AutoMode::fsm_sustained_enter <= AutoMode::fsm_sustained_exit) {
-                    logger.Warn("AutoMode: fsm_sustained_enter(%d) ≤ exit(%d) 非法, 回退 54/48",
-                                AutoMode::fsm_sustained_enter, AutoMode::fsm_sustained_exit);
-                    AutoMode::fsm_sustained_enter = 54;
-                    AutoMode::fsm_sustained_exit  = 48;
-                }
+                kin::AutoModeConfigValues checked{
+                    AutoMode::low_batt, AutoMode::crit_batt,
+                    AutoMode::fsm_sustained_enter, AutoMode::fsm_sustained_exit,
+                    AutoMode::anticlamp_soft_pct, AutoMode::anticlamp_hard_pct,
+                    AutoMode::anticlamp_attack_temp, AutoMode::explore_pct,
+                    AutoMode::explore_offset, AutoMode::reward_step,
+                    AutoMode::camera_hold_max_pct, AutoMode::game_uclamp_min,
+                    AutoMode::power_boost_value, AutoMode::power_boost_jank_psi,
+                    AutoMode::power_boost_jank_busy, AutoMode::power_boost_cap_pct,
+                    AutoMode::power_throttle_big_pct, AutoMode::power_throttle_critical_pct,
+                    AutoMode::fas_target_fps, AutoMode::power_throttle_w,
+                    AutoMode::power_throttle_critical_w, AutoMode::power_boost_jank_load,
+                    AutoMode::night_start, AutoMode::night_end, AutoMode::tick_sec,
+                    AutoMode::learn_rate, AutoMode::drain_high, AutoMode::warm_temp,
+                    AutoMode::cool_temp, AutoMode::hot_temp, AutoMode::vhot_temp,
+                    AutoMode::veto_temp};
+                kin::validateAutoModeConfig(checked);
+                AutoMode::low_batt = checked.lowBatt;
+                AutoMode::crit_batt = checked.critBatt;
+                AutoMode::fsm_sustained_enter = checked.thermalEnter;
+                AutoMode::fsm_sustained_exit = checked.thermalExit;
+                AutoMode::anticlamp_soft_pct = checked.antiSoft;
+                AutoMode::anticlamp_hard_pct = checked.antiHard;
+                AutoMode::anticlamp_attack_temp = checked.attackTemp;
+                AutoMode::explore_pct = checked.explorePct;
+                AutoMode::explore_offset = checked.exploreOffset;
+                AutoMode::reward_step = checked.rewardStep;
+                AutoMode::camera_hold_max_pct = checked.cameraPct;
+                AutoMode::game_uclamp_min = checked.gameUclamp;
+                AutoMode::power_boost_value = checked.boostValue;
+                AutoMode::power_boost_jank_psi = checked.boostPsi;
+                AutoMode::power_boost_jank_busy = checked.boostBusy;
+                AutoMode::power_boost_cap_pct = checked.boostCapPct;
+                AutoMode::power_throttle_big_pct = checked.throttleBigPct;
+                AutoMode::power_throttle_critical_pct = checked.throttleCriticalPct;
+                AutoMode::fas_target_fps = checked.fasTargetFps;
+                AutoMode::power_throttle_w = checked.throttleW;
+                AutoMode::power_throttle_critical_w = checked.throttleCriticalW;
+                AutoMode::power_boost_jank_load = checked.boostJankLoad;
+                AutoMode::night_start = checked.nightStart;
+                AutoMode::night_end = checked.nightEnd;
+                AutoMode::tick_sec = checked.tickSec;
+                AutoMode::learn_rate = checked.learnRate;
+                AutoMode::drain_high = checked.drainHigh;
+                AutoMode::warm_temp = checked.warmTemp;
+                AutoMode::cool_temp = checked.coolTemp;
+                AutoMode::hot_temp = checked.hotTemp;
+                AutoMode::vhot_temp = checked.veryHotTemp;
+                AutoMode::veto_temp = checked.vetoTemp;
             } catch (...) { logger.Debug("无 AutoMode 节点, 用默认阈值"); }
         } catch (const qlib::exception& e) {
             logger.Warn("Function 节点异常: %s", e.what());

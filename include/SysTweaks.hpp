@@ -126,7 +126,14 @@ private:
     Utils&  utils_;
 
     void wsys(const char* path, const char* val) {
-        if (val && *val) utils_.FileWrite(path, val);
+        if (!val || !*val) return;
+        // 普通 sysctl/sysfs 参数统一采用读后比较：同值不写，外部模块改过后
+        // 下一次应用仍会重新核对真实节点值。FileWriteIfChangedBlocking 不创建
+        // 缺失节点，保留 FileWriteExisting 的能力边界。
+        if (!utils_.FileWriteIfChangedBlocking(path, string_t(val))) {
+            // 缺失节点和只读节点都按单项能力不可用处理，不影响其它调优项。
+            logger_.Debug("系统调优节点不可用: %s", path ? path : "(null)");
+        }
     }
     void sh(const std::string& cmd) {
         char b[8];

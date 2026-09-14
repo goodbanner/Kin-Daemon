@@ -2,13 +2,6 @@
 
 MODDIR="${0%/*}"
 
-set_shell_temp() {
-    [ -e /proc/shell-temp ] || return 0
-    for zone in 0 1 2 3 4 5 6 7; do
-        echo "$zone 36000" > /proc/shell-temp 2>/dev/null
-    done
-}
-
 rm -f /dev/.opgv07_mask_* 2>/dev/null
 
 lock_val() {
@@ -78,9 +71,7 @@ lock_targets_empty
 lock_targets_zero
 disable_cpu_input_boost
 stop horae 2>/dev/null
-set_shell_temp
 
-MODDIR="${0%/*}"
 ANYFS_UPPER="/dev/anyfs/upper"
 SLC_XML="sys_slc_dispatch_config_list.xml"
 SLC_TARGET="/my_product/etc/extension/$SLC_XML"

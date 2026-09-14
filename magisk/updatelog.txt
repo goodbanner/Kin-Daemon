@@ -1,14 +1,30 @@
 
 ────────────────────────────
-   𝗢𝗻𝗲𝗣𝗹𝘂𝘀  V  𝗣𝗿𝗼   ·   更新
+   OnePlus V Pro · 更新
 ────────────────────────────
 
-• kin 不再因未激活而停摆:守护始终正常运行,
-  付费状态由 App 告知,不再弹"请输入卡密激活"
-• 日志更清爽:默认只记基础(开机/模式/错误),
-  不再被应用切换刷屏(需要看就设 loglevel=DEBUG)
-• 升级不丢数据:安装自动把旧目录 4 个数据文件
-  (画像/状态/功耗)迁移到 Android/Kin/AI/
-• 修复 App 无法编译的问题
+• 策略合并优化：统一热、低电、功率、FAS、应用和相机限制，
+  固定优先级为 thermal > battery > power > app > camera > FAS
+
+• sysfs 写入优化：普通 CPU、GPU、cpuset 和调度参数改为
+  读后比较，仅在值变化时写入，减少重复写入并防止外部覆盖失控
+
+• 性能优化：增加前台、Activity、cpuset、游戏 PID 和进程存活缓存，
+  限制高频 /proc、dumpsys 和 SurfaceFlinger 查询
+
+• 状态诊断完善：新增前台来源、热状态、低电状态、策略原因、
+  写入范围和写入结果，便于定位模块是否真正生效
+
+• 恢复逻辑增强：governor、UCLAMP 等节点恢复失败时保留状态，
+  后续继续重试；检测到外部修改时不强行覆盖
+
+• 配置路径兼容：mode.txt、config.json 和 settings.json 支持
+  /sdcard/Android/Kin 与 /storage/emulated/0/Android/Kin 双路径
+
+• 安装脚本兼容：统一使用 LF 行尾，兼容精简 BusyBox，
+  修复 non-interactive shell 下 chattr、seq、sed 和 log 问题
+
+• 修复 mode.txt：安装和开机阶段主动创建 mode.txt，
+  共享存储未及时挂载时自动回退真实存储路径
 
 ────────────────────────────

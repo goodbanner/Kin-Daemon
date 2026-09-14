@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <thread>
 #include <chrono>
+#include <cerrno>
 #include <unistd.h>
 #include <sys/eventfd.h>
 #include <poll.h>
@@ -53,13 +54,20 @@ int main(void) {
     g_wakefd = eventfd(0, EFD_CLOEXEC);
 
     // ===== 运行中周期刷新付费状态(App 激活/续费/退款在窗口内生效; 不停机) =====
-    std::thread([&licLog]() {
+    std::thread authThread([&licLog]() {
         bool last = g_paid.load(std::memory_order_relaxed);
         while (g_run.load(std::memory_order_relaxed)) {
-            struct pollfd pfd { g_wakefd, POLLIN, 0 };
-            // 一次性等待 kRecheckSeconds: 期间收到停机(eventfd 可读)立即返回; 超时则到点刷新。
-            // g_wakefd<0(eventfd 创建失败)时 fd 为负, poll 忽略该 fd → 退化为纯定时睡眠, 兜底安全。
-            int pr = poll(&pfd, 1, kRecheckSeconds * 1000);
+            int pr;
+            if (g_wakefd >= 0) {
+                struct pollfd pfd { g_wakefd, POLLIN, 0 };
+                pr = poll(&pfd, 1, kRecheckSeconds * 1000);
+            } else {
+                pr = 0;
+                for (int i = 0; i < kRecheckSeconds && g_run.load(std::memory_order_relaxed); ++i)
+                    sleep(1);
+                if (g_run.load(std::memory_order_relaxed)) pr = 0;
+                else break;
+            }
             if (!g_run.load(std::memory_order_relaxed)) break;
             if (pr < 0) continue;          // 被信号打断(EINTR)等 → 重新等待
             if (pr > 0) break;             // 收到停机通知 → 退出刷新线程
@@ -70,7 +78,7 @@ int main(void) {
                 licLog.Info("授权状态更新: %s (%s)", r.paid ? "已付费" : "未付费", r.reason.c_str());
             }
         }
-    }).detach();
+    });
 
     // ===== Scene 式指标推流(native daemon + 本地 Socket) =====
     // 守护常驻、已是 root、本就在读这些 sysfs, 由它统一采集再经抽象 unix socket 推给 App,
@@ -83,8 +91,18 @@ int main(void) {
     Schedule sched;
 
     while (g_run.load(std::memory_order_relaxed)) {
-        pause();     // 纯等信号，主线程零周期唤醒
+        if (g_wakefd >= 0) {
+            struct pollfd pfd { g_wakefd, POLLIN, 0 };
+            int pr = poll(&pfd, 1, -1);
+            if (pr < 0 && errno == EINTR) continue;
+        } else {
+            sleep(1);
+        }
     }
 
+    metrics.stop();
+    if (g_wakefd >= 0) (void)eventfd_write(g_wakefd, 1);
+    if (authThread.joinable()) authThread.join();
+    if (g_wakefd >= 0) { close(g_wakefd); g_wakefd = -1; }
     return 0;
 }

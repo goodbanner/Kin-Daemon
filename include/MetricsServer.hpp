@@ -23,6 +23,8 @@
 #include <thread>
 #include <string>
 #include <mutex>
+#include <cerrno>
+#include <vector>
 #include <cstring>
 #include <cstdio>
 #include <cstdint>
@@ -34,6 +36,7 @@
 #include <poll.h>
 #include <cctype>
 #include <endian.h>
+#include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/mman.h>
@@ -65,8 +68,16 @@ public:
 
     RingShm() { init(); }
 
+    ~RingShm() {
+        if (base_) { munmap(base_, SIZE); base_ = nullptr; }
+        if (fd_ >= 0) { close(fd_); fd_ = -1; }
+    }
+
+    RingShm(const RingShm&) = delete;
+    RingShm& operator=(const RingShm&) = delete;
+
     bool valid() const { return base_ != nullptr && fd_ >= 0; }
-    int  fd()    const { return fd_; }
+    int fd() const { return fd_; }
 
     // 单生产者调用: 写 payload+size, 再 release 写槽 seq, 最后 release 更新头部 latestSeq。
     ku64 publish(const char* data, size_t n) {
@@ -105,16 +116,59 @@ private:
 class MetricsServer {
 public:
     explicit MetricsServer(std::atomic<bool>& running) : run_(running) {}
+    ~MetricsServer() { stop(); }
+
+    MetricsServer(const MetricsServer&) = delete;
+    MetricsServer& operator=(const MetricsServer&) = delete;
 
     void start() {
-        std::thread([this]() { this->publisherLoop(); }).detach();
-        std::thread([this]() { this->acceptLoop(); }).detach();
+        bool expected = false;
+        if (!started_.compare_exchange_strong(expected, true)) return;
+        stopping_.store(false, std::memory_order_relaxed);
+        stopFd_ = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+        publisherThread_ = std::thread([this]() { publisherLoop(); });
+        acceptThread_ = std::thread([this]() { acceptLoop(); });
+    }
+
+    void stop() {
+        if (!started_.exchange(false)) return;
+        stopping_.store(true, std::memory_order_relaxed);
+        if (stopFd_ >= 0) (void)eventfd_write(stopFd_, 1);
+        int srv;
+        {
+            std::lock_guard<std::mutex> lk(serverMx_);
+            srv = serverFd_.exchange(-1);
+        }
+        if (srv >= 0) { shutdown(srv, SHUT_RDWR); close(srv); }
+        {
+            std::lock_guard<std::mutex> lk(clientMx_);
+            for (int fd : clientFds_) shutdown(fd, SHUT_RDWR);
+        }
+        if (acceptThread_.joinable()) acceptThread_.join();
+        if (publisherThread_.joinable()) publisherThread_.join();
+        std::vector<std::thread> clients;
+        {
+            std::lock_guard<std::mutex> lk(clientMx_);
+            clients.swap(clientThreads_);
+        }
+        for (auto& t : clients) if (t.joinable()) t.join();
+        if (stopFd_ >= 0) { close(stopFd_); stopFd_ = -1; }
     }
 
 private:
     static constexpr const char* kSockName = "kin_metrics";
 
     std::atomic<bool>& run_;
+    std::atomic<bool> started_{false};
+    std::atomic<bool> stopping_{false};
+    std::atomic<int> serverFd_{-1};
+    std::mutex serverMx_;
+    int stopFd_ = -1;
+    std::thread publisherThread_;
+    std::thread acceptThread_;
+    std::mutex clientMx_;
+    std::vector<int> clientFds_;
+    std::vector<std::thread> clientThreads_;
     Logger log_;
     Utils utils_;
     RingShm ring_;
@@ -138,7 +192,7 @@ private:
         (void)utils_.getTopAppCached(1);   // 预热前台探测的函数内 static(单线程)
         if (ring_.valid()) log_.Info("MetricsServer: 共享内存环形缓冲已就绪(memfd)");
         long counter = 0;
-        while (run_.load(std::memory_order_relaxed)) {
+        while (run_.load(std::memory_order_relaxed) && !stopping_.load(std::memory_order_relaxed)) {
             std::string line = buildSnapshot(counter);
             ku64 seq = ring_.valid() ? ring_.publish(line.data(), line.size())
                                          : static_cast<ku64>(counter + 1);
@@ -156,20 +210,52 @@ private:
     void acceptLoop() {
         int srv = socket(AF_UNIX, SOCK_STREAM, 0);
         if (srv < 0) { log_.Info("MetricsServer: socket() 失败, 推流不启用"); return; }
-        sockaddr_un addr{};
-        socklen_t len = fillAddr(addr);
-        if (bind(srv, reinterpret_cast<sockaddr*>(&addr), len) < 0) {
-            log_.Info("MetricsServer: bind(@%s) 失败, 推流不启用", kSockName);
-            close(srv); return;
+        // 用同一把锁串行化监听 socket 初始化与 stop()，避免 stop() 在 bind/listen 前关闭 fd。
+        {
+            std::lock_guard<std::mutex> lk(serverMx_);
+            if (stopping_.load(std::memory_order_acquire) || !run_.load(std::memory_order_acquire)) {
+                close(srv);
+                return;
+            }
+            sockaddr_un addr{};
+            socklen_t len = fillAddr(addr);
+            if (bind(srv, reinterpret_cast<sockaddr*>(&addr), len) < 0) {
+                log_.Info("MetricsServer: bind(@%s) 失败, 推流不启用", kSockName);
+                close(srv);
+                return;
+            }
+            if (listen(srv, 4) < 0) {
+                log_.Info("MetricsServer: listen 失败");
+                close(srv);
+                return;
+            }
+            serverFd_.store(srv, std::memory_order_release);
         }
-        if (listen(srv, 4) < 0) { log_.Info("MetricsServer: listen 失败"); close(srv); return; }
         log_.Info("MetricsServer: 已在 @%s 上监听, 等待 App 连接", kSockName);
-        while (run_.load(std::memory_order_relaxed)) {
+        while (run_.load(std::memory_order_relaxed) && !stopping_.load(std::memory_order_relaxed)) {
             int cli = accept(srv, nullptr, nullptr);
-            if (cli < 0) { if (!run_.load(std::memory_order_relaxed)) break; continue; }
-            std::thread([this, cli]() { this->serveClient(cli); }).detach();
+            if (cli < 0) {
+                if (stopping_.load(std::memory_order_relaxed) || !run_.load(std::memory_order_relaxed)) break;
+                if (errno == EINTR) continue;
+                continue;
+            }
+            std::lock_guard<std::mutex> lk(clientMx_);
+            clientFds_.push_back(cli);
+            clientThreads_.emplace_back([this, cli]() { serveClient(cli); });
         }
-        close(srv);
+        int expected = srv;
+        if (serverFd_.compare_exchange_strong(expected, -1)) close(srv);
+    }
+
+    static bool writeAll(int fd, const void* data, size_t size) {
+        const char* p = static_cast<const char*>(data);
+        while (size > 0) {
+            ssize_t n = ::send(fd, p, size, MSG_NOSIGNAL);
+            if (n > 0) { p += n; size -= static_cast<size_t>(n); continue; }
+            if (n < 0 && errno == EINTR) continue;
+            return false;
+        }
+        return true;
     }
 
     // 短超时读客户端能力握手: 新版 App 连上先发 "K1\n"。读到 'K' 开头即认为支持共享内存。
@@ -199,7 +285,9 @@ private:
         cm->cmsg_type  = SCM_RIGHTS;
         cm->cmsg_len   = CMSG_LEN(sizeof(int));
         memcpy(CMSG_DATA(cm), &fd, sizeof(int));
-        return sendmsg(cli, &msg, 0) >= 0;
+        ssize_t n;
+        do { n = sendmsg(cli, &msg, MSG_NOSIGNAL); } while (n < 0 && errno == EINTR);
+        return n == static_cast<ssize_t>(hello.size());
     }
 
     void serveClient(int cli) {
@@ -211,22 +299,28 @@ private:
         }
         // 文本模式不发任何握手行, 直接推 key=value —— 与旧版 App(v11)完全一致。
         ku64 lastSeq = 0;
-        while (run_.load(std::memory_order_relaxed)) {
+        while (run_.load(std::memory_order_relaxed) && !stopping_.load(std::memory_order_relaxed)) {
             std::string line; ku64 seq;
             { std::lock_guard<std::mutex> lk(snapMx_); line = snapLine_; seq = snapSeq_; }
             if (seq != 0 && seq != lastSeq) {
                 lastSeq = seq;
                 if (shm) {
                     ku64 le = htole64(seq);
-                    if (::write(cli, &le, sizeof(le)) < 0) break;   // 8 字节门铃
+                    if (!writeAll(cli, &le, sizeof(le))) break;   // 8 字节门铃
                 } else {
                     std::string nl = line;
                     nl.push_back('\n');
-                    if (::write(cli, nl.data(), nl.size()) < 0) break;
+                    if (!writeAll(cli, nl.data(), nl.size())) break;
                 }
             }
             for (int i = 0; i < 2 && run_.load(std::memory_order_relaxed); ++i)
                 usleep(100 * 1000);   // ~200ms 轮询新帧(生产者 1s 一帧)
+        }
+        {
+            std::lock_guard<std::mutex> lk(clientMx_);
+            for (int& fd : clientFds_) {
+                if (fd == cli) { fd = -1; break; }
+            }
         }
         close(cli);
     }

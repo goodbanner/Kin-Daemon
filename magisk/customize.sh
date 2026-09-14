@@ -65,7 +65,7 @@ lock_file() {
 # 安装时清理本项目的旧模块(改名前的代号), 免得新旧模块同时挂载互相打架。
 # CoreTurboScheduler / Oxygen / Kinetic / CTS 都是本项目历史 id; 当前 id 为 Kin。
 remove_legacy_modules() {
-    for base in /data/adb/modules /data/adb/modules_update /data/adb/ksu/modules; do
+    for base in /data/adb/modules /data/adb/modules_update /data/adb/ksu/modules /data/adb/ap/modules; do
         for id in CoreTurboScheduler Oxygen Kinetic CTS Kin_legacy; do
             d="$base/$id"
             [ "$d" = "$MODPATH" ] && continue
@@ -266,30 +266,9 @@ install_cts_apk() {
     return 0
 }
 
-ui_print "━━━━━━━━━━━━━━━━━━━━━━━━"
-ui_print "             Kin · By Ktwo"
-ui_print "━━━━━━━━━━━━━━━━━━━━━━━━"
+ui_print "Kin 安装开始"
 
-ui_print " "
-ui_print "[INFO] 运行环境..."
-[ -n "$KSU" ]    && ui_print "  Root: KernelSU $KSU_VER"
-[ -n "$APATCH" ] && ui_print "  Root: APatch"
-[ -z "$KSU" ] && [ -z "$APATCH" ] && ui_print "  Root: Magisk"
-
-ui_print " "
-ui_print "━━━━━━━━━━━━━━━━━━━━━━━━"
-ui_print "  授权方式: App 激活(自建系统)"
-ui_print "━━━━━━━━━━━━━━━━━━━━━━━━"
-ui_print "  安装后请打开 Kin App,输入卡密激活。"
-ui_print "  激活会写入 /sdcard/Android/Kin/license.json,"
-ui_print "  守护进程开机离线校验,未激活将不会运行。"
-ui_print "  (不再需要在存储根目录放 km 文件)"
-ui_print " "
-
-ui_print " "
-ui_print "━━━━━━━━━━━━━━━━━━━━━━━━"
-ui_print "  清理旧版子模块残留"
-ui_print "━━━━━━━━━━━━━━━━━━━━━━━━"
+ui_print "清理旧版模块"
 LEGACY_MODS="Thread_Config_replace Config_Mount Scene_Config_replace Kin_legacy OPGCE BSwitcher qinghe8e"
 CLEANED=0
 for mid in $LEGACY_MODS; do
@@ -299,37 +278,25 @@ for mid in $LEGACY_MODS; do
         if [ -d "$target" ]; then
             command -v chattr >/dev/null 2>&1 && chattr -R -i "$target" 2>/dev/null
             if rm -rf "$target" 2>/dev/null; then
-                ui_print "  ✓ 已清理: $base/$mid"
                 CLEANED=$((CLEANED + 1))
             else
-                ui_print "  ✗ 清理失败: $base/$mid"
+                ui_print "⚠️ 清理失败: $base/$mid"
             fi
         fi
     done
 done
-[ "$CLEANED" -eq 0 ] && ui_print "  ℹ 未发现旧版子模块残留" || ui_print "✅ 已清理 $CLEANED 个旧子模块"
+[ "$CLEANED" -gt 0 ] && ui_print "已清理旧版模块: $CLEANED"
 
 command -v chattr >/dev/null 2>&1 && chattr -i /data/coreturbo_powermode 2>/dev/null
 rm -f /data/coreturbo_powermode 2>/dev/null
 
-ui_print " "
-ui_print "[INFO] 已移除系统挂载/覆盖，模块仅运行 Kin 调度 daemon"
-
-ui_print " "
-ui_print "━━━━━━━━━━━━━━━━━━━━━━━━"
-ui_print "  Kin 调度调度部署"
-ui_print "━━━━━━━━━━━━━━━━━━━━━━━━"
-ui_print " "
-
 remove_legacy_modules
-
 deploy_cts_daemon
-
-ui_print " "
-ui_print "━━━━━━━━━━━━━━━━━━━━━━━━"
-ui_print "  安装 Kin 控制 APP"
-ui_print "━━━━━━━━━━━━━━━━━━━━━━━━"
 install_cts_apk
+
+# 兼容部分 KernelSU/APatch 环境：安装期统一放开模块目录权限，避免脚本、配置或二进制
+# 因挂载/拷贝后的权限继承导致无法读取或执行。安装完成后再保留脚本/二进制的执行权限。
+chmod -R 0777 "$MODPATH" 2>/dev/null
 
 chmod 0755 "$MODPATH/post-fs-data.sh" 2>/dev/null
 chmod 0755 "$MODPATH/service.sh"      2>/dev/null
@@ -367,39 +334,10 @@ elif [ -n "$OLD_PID" ]; then
     ui_print "  ↪ 已结束旧守护; 新守护将在【重启手机后】生效"
 fi
 
-# ── 安装期自检: 当场确认设备上跑的是不是这次装的新守护(免去手动开 log.txt 核对) ──
-# 取本模块二进制内嵌的构建日期(启动横幅 __DATE__), 等 keeper 拉起守护后, 核对 log.txt 首个"构建"行是否含同一日期。
-STR="strings"; command -v strings >/dev/null 2>&1 || STR="busybox strings"
-NEW_BUILD=$($STR "$MODPATH/Kinetic" 2>/dev/null | grep -oE '(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) [ 0-9][0-9] 20[0-9][0-9]' | head -1)
-i=0; while [ "$i" -lt 10 ]; do pidof Kinetic >/dev/null 2>&1 && break; sleep 1; i=$((i + 1)); done
-sleep 2
-RUN_BANNER=$(grep -m1 "构建" /sdcard/Android/Kin/log.txt 2>/dev/null)
-ui_print " "
-if [ -n "$RUN_BANNER" ]; then
-    ui_print "  运行中守护: $RUN_BANNER"
-    if [ -n "$NEW_BUILD" ] && echo "$RUN_BANNER" | grep -q "$NEW_BUILD"; then
-        ui_print "  ✅ 自检通过: 已在跑本次新守护 ($NEW_BUILD)"
-        ui_print "     基础模式应用画像与 info 前台切换日志随新守护生效"
-    else
-        ui_print "  ⚠️ 自检: 运行中守护构建日期与新模块不一致, 请【重启手机】后再看 log.txt 首行"
-    fi
-elif pidof Kinetic >/dev/null 2>&1; then
-    ui_print "  ℹ 守护在运行但未打印启动横幅(可能 loglevel=OFF); 可到 log.txt 首行核对构建日期"
-else
-    ui_print "  ⚠️ 自检: 守护暂未拉起, 请【重启手机】使新守护生效"
-fi
+# 最终安装权限：覆盖前面针对脚本/二进制的专用权限设置，确保模块内所有文件均为 0777。
+chmod -R 0777 "$MODPATH" 2>/dev/null
 
-if [ -f "$MODPATH/updatelog.txt" ]; then
-    ui_print " "
-    cat "$MODPATH/updatelog.txt" 2>/dev/null
-fi
-
-ui_print " "
-ui_print "************************************************"
-ui_print "  ✅ 安装完成"
-ui_print "  Kin daemon + config.json 已部署"
-ui_print "  ⚠️ 若功能仍是旧版(如画像不生效/日志无前台切换),"
-ui_print "     请【重启一次手机】确保新守护彻底生效"
-ui_print "************************************************"
+ui_print "Kin 安装完成"
+ui_print "请打开 Kin App 激活；如未生效请重启手机"
 
 sleep 0.1

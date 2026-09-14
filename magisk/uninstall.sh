@@ -7,11 +7,13 @@ export PATH="${PATH}:/data/adb/magisk:/data/adb/ksu/bin:/data/adb/ap/bin"
 export TZ="Asia/Shanghai"
 
 if command -v busybox >/dev/null 2>&1 && [ "$(which -a busybox)" != "" ]; then
-    alias chattr="busybox chattr"
+    chattr() { busybox chattr "$@"; }
 fi
 
 log_msg() {
-    log -t "OnePlusVPro-uninstall" "$*"
+    if command -v log >/dev/null 2>&1; then
+        log -t "OnePlusVPro-uninstall" "$*"
+    fi
 }
 
 un_chattr_file() {

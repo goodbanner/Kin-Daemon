@@ -34,7 +34,7 @@
 - 🧠 **智能模式(auto)** —— 六状态负载 FSM + 省电倾向自学习 + 夜间作息学习 + 问卷纠正;
   每状态频率上限可自定义(fsm_policy),按应用分类封顶/关核省电(app_policy)
 - 🎮 **FAS 帧感知调频** —— 游戏内按实际帧率闭环调 scaling_max:帧稳降频省电,掉帧秒放开追帧
-- 🌀 **风驰调速器切换** —— 「风驰游戏」档进游戏自动切 hmbird/scx(无则回退 walt/sugov_ext),离开还原;与 FAS 按应用互斥
+- 🌀 **风驰调度交接** —— 「风驰游戏」档解除 Kin 的频率上限并放权 governor，由 ROM/风驰(hmbird/scx 等)接管；Kin 不强制写兜底 governor，与 FAS 按应用互斥
 - 🧵 **线程分配** —— AppOpt 兼容 applist.prop 逐线程绑核 + 实时优先级(SCHED_FIFO/RR) + cpu.shares 权重 + 游戏库渲染线程快路径 + 应用黑名单
 - ⚙️ **governor 自主调频** —— 用 `up_rate_limit_us` / `down_rate_limit_us` / `hispeed_load` 精细控制升降频节奏
 - 📉 **真正能降频** —— 修复退出游戏后 SchedParam 不还原、场景频繁重写上限导致 CPU 粘高频的老问题
@@ -47,7 +47,7 @@
 
 | 开关 | 默认 | 作用（ASB 真值） |
 |---|---|---|
-| `SysTune.enable` | **开** | 每档 VM(`swappiness`/`dirty_*`/`vfs_cache_pressure`) + 网络(`tcp_rmem/wmem`/`fastopen`/`keepalive`) + WiFi(`power_save`/`tx_queue_len`)。省电档省、性能档激进；纯 sysctl，重启自动还原。 |
+| `SysTune.enable` | **开** | 每档 VM(`swappiness`/`dirty_*`/`vfs_cache_pressure`) + 网络(`tcp_rmem/wmem`/`fastopen`/`keepalive`/V57 TCP 与缓冲节点) + WiFi(`power_save`/`tx_queue_len`)。省电档省、性能档激进；仅写已存在节点，缺失能力跳过并记录，重启自动还原。 |
 | `BootTrim.enable` | 关 | 开机一次性禁用 4 个纯分析/遥测服务(midas/olc/crashbox/logkit) + 关 WiFi 后台扫描。⚠️ `pm disable` 跨重启持久。 |
 | `BgTrim.enable` | 关 | 周期性软回收后台内存(`am send-trim-memory`)：重度社交/流媒体常驻回收，息屏再回收相册/音乐工作集。**绝不杀进程、不动前台/系统应用**(同 ASB)。`interval_s` 默认 90。 |
 
@@ -66,7 +66,10 @@
 /sdcard/Android/Kin/
 ├── config.json      # 主配置
 ├── mode.txt         # 当前模式
-└── log.txt          # 运行日志
+├── log.txt          # 运行日志
+└── AI/
+    ├── auto_status.txt   # 智能策略实时快照
+    └── capabilities.txt  # 设备能力摘要
 ```
 
 ### 2. 切换模式（立即生效）
@@ -85,9 +88,9 @@ echo "auto"        > /sdcard/Android/Kin/mode.txt   # 自动（按温度/电量/
 `auto` 的**学习/决策算法移植自 [AutoSystemBoost](https://github.com/krilikd/AutoSystemBoost) 的
 Smart Mode**（真实源码 `asb_smart_defs.h` / `asb_smart.h`，MIT，© Dima Krylov），
 忠实复刻其 12 桶学习、置信门控、分级回退、夜间/热否决/低电覆盖与阈值常量；
-但**适配 Kin：输出离散映射到 `powersave / balance / performance` 三个整模式**（分钟级切换），
-不重写频率上限、不做场景识别，因此**不与"governor 自主调频"冲突，也不会重蹈频繁改
-`scaling_max_freq` 导致不降频的坑**。它只决定"无专属画像时"的基础档——游戏等 App 画像照常优先接管。
+但**适配 Kin：输出离散映射到 `powersave / balance / performance` 三个基础档**，并由 FSM/FAS 在需要时提供动态频率边界；
+边界以内仍交给 governor 调频，不做高频无意义重写，也不会重蹈频繁改
+`scaling_max_freq` 导致不降频的坑。它只决定"无专属画像时"的基础档——游戏等 App 画像照常优先接管。
 （MIT→GPL-3.0 兼容；移植署名见 `include/AutoMode.hpp` 顶部。）
 
 **决策输入**：CPU 温度、电量、充电态、屏幕亮灭、时段（12 桶 = 6 时段 × 工作日/周末）。

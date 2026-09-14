@@ -115,17 +115,20 @@ public:
     void cpusetFunction() {
         if (!Cpuset::enable) return;
 
-        utils.FileWrite("/dev/cpuset/top-app/cpus", Cpuset::top_app);
-        utils.FileWrite("/dev/cpuset/foreground/cpus", Cpuset::foreground);
-        utils.FileWrite("/dev/cpuset/background/cpus", Cpuset::background);
-        utils.FileWrite("/dev/cpuset/system-background/cpus", Cpuset::system_background);
-        utils.FileWrite("/dev/cpuset/restricted/cpus", Cpuset::restricted);
+        utils.FileWriteIfChangedBlocking("/dev/cpuset/top-app/cpus", Cpuset::top_app);
+        utils.FileWriteIfChangedBlocking("/dev/cpuset/foreground/cpus", Cpuset::foreground);
+        utils.FileWriteIfChangedBlocking("/dev/cpuset/background/cpus", Cpuset::background);
+        utils.FileWriteIfChangedBlocking("/dev/cpuset/system-background/cpus", Cpuset::system_background);
+        utils.FileWriteIfChangedBlocking("/dev/cpuset/restricted/cpus", Cpuset::restricted);
 
         logger.Debug("Cpuset OK");
     }
 
     bool writeSysfs(const char* path, const char* value, int valLen) {
         if (!path || !value || valLen <= 0) return false;
+        // GPU 节点有些只可写、不可读：只有明确读到相同值才跳过，读取失败仍照常写。
+        if (kin::compareNodeValue(path, std::string_view(value, static_cast<size_t>(valLen))) ==
+            kin::NodeComparison::Equal) return true;
 
         // 新 SoC（如 SM8850）GPU sysfs 默认 0444，open 失败时 chmod 后重试
         int fd = open(path, O_WRONLY | O_CLOEXEC);
@@ -841,17 +844,17 @@ public:
     void CfsSchedOpt() {
         if (!Scheduler::enable) return;
 
-        utils.FileWrite("/proc/sys/kernel/sched_schedstats", Scheduler::Sched_schedstats ? "1" : "0");
-        utils.FileWrite("/proc/sys/kernel/sched_latency_ns", Scheduler::Sched_latency_ns);
-        utils.FileWrite("/proc/sys/kernel/sched_migration_cost_ns", Scheduler::Sched_migration_cost_ns);
-        utils.FileWrite("/proc/sys/kernel/sched_min_granularity_ns", Scheduler::Sched_min_granularity_ns);
-        utils.FileWrite("/proc/sys/kernel/sched_wakeup_granularity_ns", Scheduler::Sched_wakeup_granularity_ns);
-        utils.FileWrite("/proc/sys/kernel/sched_nr_migrate", Scheduler::Sched_nr_migrate);
-        utils.FileWrite("/proc/sys/kernel/sched_util_clamp_min", Scheduler::Sched_util_clamp_min);
-        utils.FileWrite("/proc/sys/kernel/sched_util_clamp_max", Scheduler::Sched_util_clamp_max);
+        utils.FileWriteIfChangedBlocking("/proc/sys/kernel/sched_schedstats", Scheduler::Sched_schedstats ? "1" : "0");
+        utils.FileWriteIfChangedBlocking("/proc/sys/kernel/sched_latency_ns", Scheduler::Sched_latency_ns);
+        utils.FileWriteIfChangedBlocking("/proc/sys/kernel/sched_migration_cost_ns", Scheduler::Sched_migration_cost_ns);
+        utils.FileWriteIfChangedBlocking("/proc/sys/kernel/sched_min_granularity_ns", Scheduler::Sched_min_granularity_ns);
+        utils.FileWriteIfChangedBlocking("/proc/sys/kernel/sched_wakeup_granularity_ns", Scheduler::Sched_wakeup_granularity_ns);
+        utils.FileWriteIfChangedBlocking("/proc/sys/kernel/sched_nr_migrate", Scheduler::Sched_nr_migrate);
+        utils.FileWriteIfChangedBlocking("/proc/sys/kernel/sched_util_clamp_min", Scheduler::Sched_util_clamp_min);
+        utils.FileWriteIfChangedBlocking("/proc/sys/kernel/sched_util_clamp_max", Scheduler::Sched_util_clamp_max);
 
         if (checkEasSched()) {
-            utils.FileWrite("/proc/sys/kernel/sched_energy_aware", Scheduler::Sched_energy_aware ? "1" : "0");
+            utils.FileWriteIfChangedBlocking("/proc/sys/kernel/sched_energy_aware", Scheduler::Sched_energy_aware ? "1" : "0");
             logger.Info(Scheduler::Sched_energy_aware ? "已开启EAS调度器" : "已关闭EAS调度器");
         } else {
             logger.Warn("您的设备并不支持EAS调度器");
@@ -871,13 +874,13 @@ public:
 
     bool FeasFunc(bool Enable) {
         if (checkQcomFeas()) {
-            utils.FileWrite(qcomFeas, Enable ? "1" : "0");
+            utils.FileWriteIfChangedBlocking(qcomFeas, Enable ? "1" : "0");
             logger.Debug("QCOM Feas 已%s", Enable ? "开启" : "关闭");
             return true;
         }
 
         if (checkMtkFeas()) {
-            utils.FileWrite(mtkFeas, Enable ? "1" : "0");
+            utils.FileWriteIfChangedBlocking(mtkFeas, Enable ? "1" : "0");
             logger.Debug("MTK Feas 已%s", Enable ? "开启" : "关闭");
             return true;
         }
