@@ -481,8 +481,17 @@ private:
         char cmd[512];
         std::vector<char> outBuf(8192, 0);
         char* out = outBuf.data();
+        // 防 shell 注入: 图层名仅保留安全字符 (A-Za-z0-9._-), 其余替换为下划线
+        char safeLayer[256];
+        size_t j = 0;
+        for (const char* p = dumpLayer_; *p && j < sizeof(safeLayer) - 1; p++) {
+            char c = *p;
+            safeLayer[j++] = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                             (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-' ? c : '_';
+        }
+        safeLayer[j] = '\0';
         snprintf(cmd, sizeof(cmd),
-                 "dumpsys SurfaceFlinger --latency '%s' 2>/dev/null", dumpLayer_);
+                 "dumpsys SurfaceFlinger --latency '%s' 2>/dev/null", safeLayer);
         utils.popenRead(cmd, out, outBuf.size());
         double fps = fpsFromLatencyBlock(out);
         if (fps <= 0) { dumpLayer_[0] = '\0'; dumpFpsX10_ = 0; return -1; }

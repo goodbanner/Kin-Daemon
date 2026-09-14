@@ -318,7 +318,8 @@ public:
         AutoMode::power_enable = true; AutoMode::power_boost_value = 128;
         AutoMode::power_boost_jank_enable = true; AutoMode::power_boost_jank_psi = 20;
         AutoMode::power_boost_jank_busy = 85; AutoMode::power_boost_jank_load = 4.0f;
-        AutoMode::power_boost_cap_pct = 100;
+        AutoMode::power_boost_jank_busy_floor = 45;
+        AutoMode::power_boost_cap_pct = 85;
         AutoMode::power_throttle_w = 7.5f; AutoMode::power_throttle_critical_w = 9.5f;
         AutoMode::power_throttle_big_pct = 80; AutoMode::power_throttle_critical_pct = 60;
         AutoMode::power_throttle_gpu_mhz = 680; AutoMode::power_throttle_critical_gpu_mhz = 460;
@@ -333,6 +334,7 @@ public:
         AppProfile::blacklistCount  = 0;
         AppProfile::currentMatch.store(-1);
         baseModelIdx = -1;
+        { std::lock_guard<std::recursive_mutex> lk(AppProfile::profileMtx);
         for (int i = 0; i < AppProfile::MAX_BLACKLIST; i++)
             AppProfile::packageBlacklist[i] = "";
         for (int i = 0; i < AppProfile::MAX_MODELS; i++) {
@@ -350,6 +352,7 @@ public:
             m.GpuMinFreq = ""; m.GpuMaxFreq = "";
             for (int j = 0; j < kCoreCount; j++) m.Online[j] = -1;
         }
+        }  // profileMtx
     }
 
     // 发布 GPU 原子快照，供 gpuFreqGuard 跨线程无锁读取
@@ -617,6 +620,7 @@ private:
                 readInt (a, "power_boost_jank_psi",      AutoMode::power_boost_jank_psi);
                 readInt (a, "power_boost_jank_busy",     AutoMode::power_boost_jank_busy);
                 readFlt (a, "power_boost_jank_load",     AutoMode::power_boost_jank_load);
+                readInt (a, "power_boost_jank_busy_floor", AutoMode::power_boost_jank_busy_floor);
                 readInt (a, "power_boost_cap_pct",       AutoMode::power_boost_cap_pct);
                 readFlt (a, "power_throttle_w",          AutoMode::power_throttle_w);
                 readFlt (a, "power_throttle_critical_w", AutoMode::power_throttle_critical_w);
@@ -851,6 +855,7 @@ private:
         try {
             auto& bl = json["package_blacklist"];
             int n = 0;
+            { std::lock_guard<std::recursive_mutex> lk(AppProfile::profileMtx);
             for (int i = 0; i < AppProfile::MAX_BLACKLIST; i++) {
                 try {
                     string_t pkg = bl.array()[i].get<string_t>();
@@ -859,6 +864,7 @@ private:
                 } catch (...) { break; }
             }
             AppProfile::blacklistCount = n;
+            }  // profileMtx
             // 仅在条数变化时打印，避免重载刷屏
             static int lastBlacklistCount = -1;
             if (n > 0 && n != lastBlacklistCount) {

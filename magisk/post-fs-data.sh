@@ -2,6 +2,30 @@
 
 MODDIR="${0%/*}"
 
+# Apply vendor properties only on ColorOS/OxygenOS devices.
+apply_coloros_props() {
+    if [ -z "$(getprop ro.build.oplus_version 2>/dev/null)" ]; then
+        case "$(getprop ro.product.brand 2>/dev/null | tr 'A-Z' 'a-z')" in
+            oppo|oneplus|realme) ;;
+            *) return 0 ;;
+        esac
+    fi
+    [ -f "$MODDIR/system.prop.coloros" ] || return 0
+    local line key val CR
+    CR=$(printf '\r')
+    while IFS= read -r line; do
+        line="${line%$CR}"
+        case "$line" in
+            ''|\#*) continue ;;
+        esac
+        key="${line%%=*}"
+        val="${line#*=}"
+        [ -n "$key" ] || continue
+        resetprop "$key" "$val" 2>/dev/null
+    done < "$MODDIR/system.prop.coloros"
+}
+apply_coloros_props
+
 rm -f /dev/.opgv07_mask_* 2>/dev/null
 
 lock_val() {
