@@ -294,13 +294,17 @@ remove_legacy_modules
 deploy_cts_daemon
 install_cts_apk
 
-# 兼容部分 KernelSU/APatch 环境：安装期统一放开模块目录权限，避免脚本、配置或二进制
-# 因挂载/拷贝后的权限继承导致无法读取或执行。安装完成后再保留脚本/二进制的执行权限。
-chmod -R 0777 "$MODPATH" 2>/dev/null
-
-chmod 0755 "$MODPATH/post-fs-data.sh" 2>/dev/null
-chmod 0755 "$MODPATH/service.sh"      2>/dev/null
-chmod 0755 "$MODPATH/action.sh"       2>/dev/null
+# Root-owned executable code must not be writable by other users.
+set_module_permissions() {
+    find "$MODPATH" -type d -exec chmod 0755 {} \; || return 1
+    find "$MODPATH" -type f -exec chmod 0644 {} \; || return 1
+    find "$MODPATH" -type f -name '*.sh' -exec chmod 0755 {} \; || return 1
+    chmod 0755 "$MODPATH/Kinetic" || return 1
+    if [ -f "$MODPATH/META-INF/com/google/android/update-binary" ]; then
+        chmod 0755 "$MODPATH/META-INF/com/google/android/update-binary" || return 1
+    fi
+}
+set_module_permissions || abort "Cannot secure module permissions"
 
 echo "A" > "$MODPATH/.install_mode" 2>/dev/null
 
@@ -334,8 +338,8 @@ elif [ -n "$OLD_PID" ]; then
     ui_print "  ↪ 已结束旧守护; 新守护将在【重启手机后】生效"
 fi
 
-# 最终安装权限：覆盖前面针对脚本/二进制的专用权限设置，确保模块内所有文件均为 0777。
-chmod -R 0777 "$MODPATH" 2>/dev/null
+# Include files created during installation in the final permission pass.
+set_module_permissions || abort "Cannot secure module permissions"
 
 ui_print "Kin 安装完成"
 ui_print "请打开 Kin App 激活；如未生效请重启手机"

@@ -43,6 +43,8 @@
 #include <sys/syscall.h>
 #include "Utils.hpp"
 #include "Logger.hpp"
+#include "Soc.hpp"
+#include <memory>
 
 // 项目头(Utils.hpp 里 `using namespace LibUtils`)在全局注入了同名定宽整型, 直接写 ku64 会歧义;
 // 用带前缀别名规避, 明确指向 std 的定宽整型。
@@ -140,18 +142,20 @@ public:
             srv = serverFd_.exchange(-1);
         }
         if (srv >= 0) { shutdown(srv, SHUT_RDWR); close(srv); }
-        {
-            std::lock_guard<std::mutex> lk(clientMx_);
-            for (int fd : clientFds_) shutdown(fd, SHUT_RDWR);
-        }
         if (acceptThread_.joinable()) acceptThread_.join();
-        if (publisherThread_.joinable()) publisherThread_.join();
-        std::vector<std::thread> clients;
         {
             std::lock_guard<std::mutex> lk(clientMx_);
-            clients.swap(clientThreads_);
+            for (const auto& client : clients_)
+                if (client->fd >= 0) shutdown(client->fd, SHUT_RDWR);
         }
-        for (auto& t : clients) if (t.joinable()) t.join();
+        if (publisherThread_.joinable()) publisherThread_.join();
+        std::vector<std::unique_ptr<Client>> clients;
+        {
+            std::lock_guard<std::mutex> lk(clientMx_);
+            clients.swap(clients_);
+        }
+        for (auto& client : clients)
+            if (client->thread.joinable()) client->thread.join();
         if (stopFd_ >= 0) { close(stopFd_); stopFd_ = -1; }
     }
 
@@ -167,8 +171,29 @@ private:
     std::thread publisherThread_;
     std::thread acceptThread_;
     std::mutex clientMx_;
-    std::vector<int> clientFds_;
-    std::vector<std::thread> clientThreads_;
+    struct Client {
+        int fd = -1; // Protected by clientMx_, including close and shutdown.
+        std::atomic<bool> done{false};
+        std::thread thread;
+    };
+    std::vector<std::unique_ptr<Client>> clients_;
+    friend struct MetricsServerTest;
+
+    void reapClients() {
+        std::vector<std::unique_ptr<Client>> finished;
+        {
+            std::lock_guard<std::mutex> lk(clientMx_);
+            for (auto it = clients_.begin(); it != clients_.end();) {
+                if ((*it)->done.load(std::memory_order_acquire)) {
+                    finished.push_back(std::move(*it));
+                    it = clients_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+        for (auto& client : finished) client->thread.join();
+    }
     Logger log_;
     Utils utils_;
     RingShm ring_;
@@ -193,6 +218,7 @@ private:
         if (ring_.valid()) log_.Info("MetricsServer: 共享内存环形缓冲已就绪(memfd)");
         long counter = 0;
         while (run_.load(std::memory_order_relaxed) && !stopping_.load(std::memory_order_relaxed)) {
+            reapClients();
             std::string line = buildSnapshot(counter);
             ku64 seq = ring_.valid() ? ring_.publish(line.data(), line.size())
                                          : static_cast<ku64>(counter + 1);
@@ -240,8 +266,15 @@ private:
                 continue;
             }
             std::lock_guard<std::mutex> lk(clientMx_);
-            clientFds_.push_back(cli);
-            clientThreads_.emplace_back([this, cli]() { serveClient(cli); });
+            if (stopping_.load(std::memory_order_acquire)) {
+                close(cli);
+                break;
+            }
+            auto client = std::make_unique<Client>();
+            client->fd = cli;
+            Client* state = client.get();
+            clients_.push_back(std::move(client));
+            state->thread = std::thread([this, state]() { serveClient(*state); });
         }
         int expected = srv;
         if (serverFd_.compare_exchange_strong(expected, -1)) close(srv);
@@ -290,7 +323,8 @@ private:
         return n == static_cast<ssize_t>(hello.size());
     }
 
-    void serveClient(int cli) {
+    void serveClient(Client& client) {
+        const int cli = client.fd;
         bool wantShm = readClientHello(cli);
         bool shm = false;
         if (wantShm && ring_.valid()) {
@@ -318,11 +352,10 @@ private:
         }
         {
             std::lock_guard<std::mutex> lk(clientMx_);
-            for (int& fd : clientFds_) {
-                if (fd == cli) { fd = -1; break; }
-            }
+            close(cli);
+            client.fd = -1;
         }
-        close(cli);
+        client.done.store(true, std::memory_order_release);
     }
 
     // ── 轻量 sysfs 读取 ──

@@ -55,13 +55,23 @@ rm -rf /dev/opgce 2>/dev/null
 rm -f /dev/.opgv07_mask_* 2>/dev/null
 
 if [ -d /storage/emulated/0/Android/Kin ]; then
+    backup_ok=1
     if [ -f /storage/emulated/0/Android/Kin/config.json ]; then
-        cp /storage/emulated/0/Android/Kin/config.json \
-           /storage/emulated/0/Android/Kin/config.json.bak 2>/dev/null
-        log_msg "√ 已备份用户配置到 config.json.bak"
+        backup=/storage/emulated/0/Android/Kin-config.json.bak
+        if cp /storage/emulated/0/Android/Kin/config.json "$backup.tmp" 2>/dev/null \
+            && cmp -s /storage/emulated/0/Android/Kin/config.json "$backup.tmp" \
+            && mv -f "$backup.tmp" "$backup"; then
+            log_msg "已备份用户配置到 $backup"
+        else
+            rm -f "$backup.tmp" 2>/dev/null
+            backup_ok=0
+            log_msg "配置备份失败，保留 Kin 数据目录"
+        fi
     fi
-    rm -rf /storage/emulated/0/Android/Kin 2>/dev/null
-    log_msg "√ 已清理 Kin 目录"
+    if [ "$backup_ok" -eq 1 ]; then
+        rm -rf /storage/emulated/0/Android/Kin 2>/dev/null
+        log_msg "√ 已清理 Kin 目录"
+    fi
 fi
 
 [ -f /sdcard/Android/qinghe/logs.txt ] && : > /sdcard/Android/qinghe/logs.txt 2>/dev/null

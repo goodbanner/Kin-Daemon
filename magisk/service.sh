@@ -148,9 +148,7 @@ if [ -f "$MODDIR/.cts_enabled" ] && [ -f "$MODDIR/Kinetic" ]; then
         ( sh "$MODDIR/vtools/init_vtools.sh" >/dev/null 2>&1 ) &
     fi
 
-    # 单一常驻守护循环 —— 合并原来的三个 while/sleep 后台子进程(守护拉起 / cpuset 兜底 /
-    # mode.txt 合法性)。在 busybox shell 下每个后台循环就是一个常驻 busybox 进程;合并后
-    # 常驻 busybox 只剩这一个(守护进程 Kinetic 本身不是 busybox)。
+    # Supervise the process and validate mode.txt; hardware policy belongs to the daemon.
     (
         CTS_DIR="${KIN_DIR:-/sdcard/Android/Kin}"
         CTS_BIN="$MODDIR/Kinetic"
@@ -188,24 +186,6 @@ if [ -f "$MODDIR/.cts_enabled" ] && [ -f "$MODDIR/Kinetic" ]; then
         chmod 0755 "$CTS_BIN" 2>/dev/null
         chmod 0644 "$CTS_LIB/libc++_shared.so" 2>/dev/null
 
-        CHIP=$(cat "$MODDIR/.cts_enabled" 2>/dev/null)
-        case "$CHIP" in
-            8G3) SMALL="0-4" ;;
-            *)   SMALL="0-5" ;;
-        esac
-        FULL="0-7"
-        GROUPS="top-app foreground background system-background restricted"
-        set_cpuset() {
-            r="$1"
-            for g in $GROUPS; do
-                p="/dev/cpuset/$g/cpus"
-                [ -e "$p" ] || continue
-                cur=$(cat "$p" 2>/dev/null)
-                [ "$cur" = "$r" ] && continue
-                chmod 0666 "$p" 2>/dev/null
-                ( echo "$r" > "$p" ) 2>/dev/null
-            done
-        }
         is_base() { case "$1" in powersave|balance|performance|fast|auto) return 0 ;; *) return 1 ;; esac; }
 
         last_good="balance"
@@ -215,7 +195,7 @@ if [ -f "$MODDIR/.cts_enabled" ] && [ -f "$MODDIR/Kinetic" ]; then
             if [ $((tick % 5)) -eq 0 ] && ! pidof Kinetic >/dev/null 2>&1; then
                 LD_LIBRARY_PATH="$CTS_LIB:$LD_LIBRARY_PATH" nohup "$CTS_BIN" > "$CTS_DIR/log.txt" 2>&1 &
             fi
-            # mode.txt 合法性 + cpuset 兜底(每 2s)
+            # Validate mode.txt without overriding per-group CPU placement.
             m=$(cat "$MODE_FILE" 2>/dev/null | tr -d ' \t\r\n')
             if [ -n "$m" ]; then
                 if is_base "$m"; then
@@ -225,16 +205,12 @@ if [ -f "$MODDIR/.cts_enabled" ] && [ -f "$MODDIR/Kinetic" ]; then
                     log_msg "mode.txt 非法值 '$m' 已纠回 $last_good"
                     m="$last_good"
                 fi
-                case "$m" in
-                    video|powersave) set_cpuset "$SMALL" ;;
-                    *)               set_cpuset "$FULL" ;;
-                esac
             fi
             tick=$((tick + 1))
             sleep 2
         done
     ) &
-    log_msg "Kin 守护循环已启动(合并: 拉起 + mode 校验 + cpuset, 单进程)"
+    log_msg "Kin 守护循环已启动(拉起 + mode 校验, 单进程)"
 
 fi
 

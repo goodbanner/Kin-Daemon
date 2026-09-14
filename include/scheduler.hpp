@@ -8,6 +8,7 @@
 #include "SysTweaks.hpp"
 #include "PolicyResolver.hpp"
 #include "RestorePolicy.hpp"
+#include "OwnedNode.hpp"
 #include "PresenceCache.hpp"
 #include <sys/inotify.h>
 #include <sys/resource.h>
@@ -807,7 +808,7 @@ public:
     // 返回功率档位: 0=卡顿(开boost补救) 1=中性(省电) 2=高(关boost+压大核+限GPU) 3=临界(深压+关核+限GPU); -1=旁路。
     int  pwrBoostMode_  = 0;             // 0=未探测/无 1=cgroup 2=sysctl 3=boost
     int  pwrBoostState_ = -2;            // 当前已写的档位(-2=从未写过, -1..3=档位)
-    bool pwrBoostHeld_  = false;         // 我们是否正持有节点(auto 退出时据此还原)
+    kin::OwnedNode pwrBoostNode_;       // Only the selected boost node is owned.
     // ── boost 时间门控(防抖 + 防长期钉高) ──
     // 原实现只有"档位变化才写"的边沿去重, 没有任何时间约束: PSI some avg10 在阈值附近
     // 抖动时会 L0/L1 反复切, 每次都写 uclamp(+旧版还写 sched_boost), 抬频抖动且开销不小。
@@ -849,8 +850,6 @@ public:
         pwrBoostNoteLeave();
         return 1;
     }
-    string_t pwrBoostOrig_;              // 接管前主节点原值(cgroup/sysctl 的 uclamp.min)
-    string_t pwrBoostSbOrig_;            // sched_boost 原值(cgroup/sysctl 模式下作补充 boost 信号时记)
     static constexpr const char* kPwrCgUclampMin  = "/sys/fs/cgroup/cpu.uclamp.min";
     static constexpr const char* kPwrUclampSysctl = "/proc/sys/kernel/sched_util_clamp_min";
     static constexpr const char* kPwrSchedBoost   = "/proc/sys/kernel/sched_boost";
@@ -867,29 +866,22 @@ public:
     const char* pwrBoostMainNode() {
         switch (pwrBoostMode_) {
             case 1: return kPwrCgUclampMin;
-            case 2: return kPwrUclampSysctl;
+            case 2: return kPwrSchedBoost;
             case 3: return kPwrSchedBoost;
         }
         return nullptr;
     }
     // 还原各节点原值(auto 退出/关功率功能/旁路时调)。仅当我们持有过才还原。
     void pwrBoostRestore() {
-        if (!pwrBoostHeld_) return;
-        bool restored = true;
-        if (pwrBoostMode_ == 1 || pwrBoostMode_ == 2) {
-            string_t v = pwrBoostOrig_;
-            if (v.empty() && pwrBoostMode_ == 2) v = Scheduler::Sched_util_clamp_min;
-            if (!v.empty()) restored = utils.FileWriteIfChangedBlocking(pwrBoostMainNode(), v);
-            if (!pwrBoostSbOrig_.empty())
-                restored = utils.FileWriteIfChangedBlocking(kPwrSchedBoost, pwrBoostSbOrig_) && restored;
-        } else if (pwrBoostMode_ == 3) {
-            restored = utils.FileWriteIfChangedBlocking(
-                kPwrSchedBoost, pwrBoostOrig_.empty() ? string_t("0") : pwrBoostOrig_);
-        }
-        pwrBoostHeld_ = !restored;
-        if (restored) {
+        pwrBoostNoteLeave();
+        const char* node = pwrBoostMainNode();
+        if (!node) return;
+        if (pwrBoostNode_.restore(
+                [&] { return std::string(readSmallFile(node).c_str()); },
+                [&](const std::string& value) {
+                    return utils.FileWriteIfChangedBlocking(node, string_t(value.c_str()));
+                })) {
             pwrBoostState_ = -2;
-            pwrBoostSbOrig_.clear();
         }
     }
     // 由本 tick 采样算功率档位(采样融入 auto 决策)。
@@ -940,7 +932,7 @@ public:
     // 应用功率 boost 档位。level: -1=旁路(还原) 0=卡顿(开boost) 1=中性(省电) 2=高 3=临界。
     // 仅 level 变化才写。cgroup 模式: 卡顿档 power_boost_value 换算百分比写 cpu.uclamp.min, 其余写 0;
     // sysctl 模式: 不碰 sched_util_clamp_min(非 boost 源), boost 仅靠 sched_boost;
-    // boost 模式: 只能写 1/0。cgroup/sysctl 模式若有 sched_boost 节点, 同步作补充 boost 信号(对齐 powerd)。
+    // Modes 2/3 write only sched_boost; mode 1 writes only cgroup uclamp.
     void applyPowerBoost(int level) {
         if (level < 0) { pwrBoostRestore(); return; }             // 旁路: 还原
         if (pwrBoostProbe() == 0) return;                         // 无任何接口: boost 段跳过
@@ -948,16 +940,7 @@ public:
         const bool wantOn = (level == 0);                         // 仅卡顿档开 boost(补救响应性)
         const char* mainNode = pwrBoostMainNode();
         if (!mainNode) return;
-        if (!pwrBoostHeld_) {                                     // 首次接管: 记原值
-            pwrBoostOrig_ = readSmallFile(mainNode);
-            if (pwrBoostMode_ == 1 || pwrBoostMode_ == 2) {       // 这两模式可能用 sched_boost 作补充
-                struct stat st;
-                if (stat(kPwrSchedBoost, &st) == 0) pwrBoostSbOrig_ = readSmallFile(kPwrSchedBoost);
-            }
-            pwrBoostHeld_ = true;
-        }
         char buf[16];
-        bool ok = false;
         if (pwrBoostMode_ == 1) {
             // cgroup v2 cpu.uclamp.min 单位是【百分比 0-100】(非 0-1024): 直接写 128 会被内核
             // -ERANGE 拒绝, boost 静默失效 → 换算成百分比。详见 docs/kernel-boost-research.md 第二节。
@@ -965,16 +948,14 @@ public:
             if (v < 0) v = 0;
             if (v > 100) v = 100;
             snprintf(buf, sizeof(buf), "%d", v);
-            ok = utils.FileWriteIfChangedBlocking(mainNode, string_t(buf));
-        } else if (pwrBoostMode_ == 2) {
-            // The sysctl limits allowed UCLAMP_MIN; use sched_boost instead.
-            ok = !pwrBoostSbOrig_.empty();
-        } else { // boost 模式: 只能开/关
-            ok = utils.FileWriteIfChangedBlocking(kPwrSchedBoost, string_t(wantOn ? "1" : "0"));
+        } else {
+            snprintf(buf, sizeof(buf), "%d", wantOn ? 1 : 0);
         }
-        // Do not stack global sched_boost on top of cgroup uclamp.
-        if (ok && pwrBoostMode_ == 2 && !pwrBoostSbOrig_.empty())
-            ok = utils.FileWriteIfChangedBlocking(kPwrSchedBoost, string_t(wantOn ? "1" : "0"));
+        const bool ok = pwrBoostNode_.apply(buf,
+            [&] { return std::string(readSmallFile(mainNode).c_str()); },
+            [&](const std::string& value) {
+                return utils.FileWriteIfChangedBlocking(mainNode, string_t(value.c_str()));
+            });
         if (ok) {
             pwrBoostState_ = level;
             if (!wantOn) pwrBoostNoteLeave();     // 离开 boost: 起冷却计时
