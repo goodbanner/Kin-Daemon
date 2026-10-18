@@ -24,10 +24,13 @@
 #include "PolicyStatus.hpp"
 #include "BatteryPolicy.hpp"
 #include "ThermalStatus.hpp"
+#include "ThermalDecision.hpp"
+#include "SmartLearning.hpp"
 #include <atomic>
 #include <mutex>
 #include <cerrno>
 #include <string>
+#include <utility>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -94,7 +97,12 @@ public:
     void setForegroundSource(const char* source) {
         curFgSource_ = (source && *source) ? source : "unknown";
     }
-    void setLastWriteStatus(kin::WriteStatus status) { utilsLastWriteStatus_ = status; }
+    void setLastWriteStatus(kin::WriteStatus status, std::string nodeSummary = {},
+                            std::string failedNodes = {}) {
+        utilsLastWriteStatus_ = status;
+        utilsLastWriteNodes_ = std::move(nodeSummary);
+        utilsLastWriteFailedNodes_ = std::move(failedNodes);
+    }
 
     // 功耗记录: 由独立线程每 ~30s 调用一次(与情景模式无关, 始终记录)。
     // 只记原始电池量(ts,电量,电流mA绝对值,电压mV,温度deci℃,充电), App 据 cellCount 自算功率/会话/曲线。
@@ -212,6 +220,8 @@ public:
             if (tdS > sessMaxTemp_) sessMaxTemp_ = tdS;
             if (tdS >= 0 && tdS >= Config::AutoMode::warm_temp) sessWarmTicks_++;
             if (tdS >= 0 && tdS >= Config::AutoMode::veto_temp) sessThermalHit_ = true;
+            // 皮肤/外壳峰温(上游 V64 热否决加权用): 无物理外壳传感器时 skinC 恒 -1, 保持 -1。
+            if (m.skinC > 0 && m.skinC > sessMaxSkinC_) sessMaxSkinC_ = m.skinC;
             if (m.gpuPct >= 65) sessGpuHeavyTicks_++;   // ASB GAMING 阈值, 计为重载 tick
             if (m.charging) sessCharged_ = true;
             if (m.currentMa > 0 && !m.charging) { sessSumCurMa_ += m.currentMa; sessCurTicks_++; }
@@ -314,14 +324,8 @@ public:
     // 遥测/日志/热趋势/anti-clamp 仍用真实结温 m.tempC, 不走本函数。
     int thermalDecisionC(const Metrics& m) const {
         using namespace Config;
-        if (!AutoMode::thermal_skin_gate) return m.tempC;
-        const int s = m.skinC;
-        if (s <= 5 || s >= 70) return m.tempC;   // sentinel/坏读/极端 → 回退结温门(过热安全前置)
-        int td = s + (AutoMode::veto_temp - AutoMode::skin_temp);
-        if (AutoMode::junction_hard_temp > 0 && m.tempC >= 0 &&
-            m.tempC >= AutoMode::junction_hard_temp)
-            td = maxi(td, AutoMode::veto_temp);   // 结温真·失控 → 强制否决
-        return td;
+        return kin::thermalDecisionC(m.tempC, m.skinC, AutoMode::thermal_skin_gate,
+            AutoMode::veto_temp, AutoMode::skin_temp, AutoMode::junction_hard_temp);
     }
 
     // 解析当前基础档(无 FSM 时用): powersave / balance / performance
@@ -357,67 +361,6 @@ public:
         return base;
     }
 
-    // anti-clamp 攻击侧本 tick 的动作意图(由调度层执行真正的厂商节点回写, 因其掌握各簇 hw-max/CPU 映射):
-    //   act=0 不动节点; act=1 断言各簇 hw-max(抢回被压频率); act=2 按 restorePct% 还原各簇钳值(安全收手)。
-    struct AcAction { int act; int restorePct; };
-
-    // 收手时【按簇】还原的厂商钳值(kHz); 调度层 act=2 逐簇取此值写回, 0=该簇未捕获→退回比例还原。
-    int acRestoreKHz(int i) const { return (i >= 0 && i < Config::kClusterCount) ? acCapKHz_[i] : 0; }
-
-    // 强制释放/收手: 供调度层在【离开 auto / 关 FSM】等 antiClampTick 不再被调用的路径上调用, 确保
-    // 已抬起的厂商节点被还原、不会长期停在满频(否则切档后厂商热钳被永久顶开)。幂等: 未抬起则 no-op。
-    AcAction antiClampRelease() {
-        AcAction r{0, 100};
-        if (acEngaged_ || acRaised_) r = {2, acCapPct_};
-        resetAcSession(); acAsserting_ = false; acActive_ = r.act;
-        return r;
-    }
-
-    // 攻击侧状态机(仅 perfState=游戏态时可能介入)。在 sample()→fillClampMetrics() 之后、写频之时由调度层每 tick 调一次。
-    // 设计要点见 Config 注释: 进入对抗后"硬保持"hold 拍忽略被自写遮蔽的 headroom, 到点 probe 停写读真值再决定复抢;
-    // 温度≥attack_temp / 非游戏态 / 关开关 → 立即收手并按捕获比例还原(热优先)。
-    // 健壮性(对照 ASB asb_governor.c 的预算/退避/futility): 每会话只给有限次抢频预算; 预算耗尽→退避
-    // 一段时间再回满重试; 累计 max_backoffs 次仍耗尽→本会话彻底放弃(futility), 防"写了没用"的机器无限抢频。
-    AcAction antiClampTick(const Metrics& m, bool perfState, long nowMs) {
-        using namespace Config;
-        AcAction r{0, 100};
-        // 攻击侧关 / 检测总开关关 → 永不动节点; 若在对抗中则安全收手(还原一次比例钳值)并复位会话
-        if (!AutoMode::anticlamp_attack_enable || !AutoMode::anticlamp_enable) {
-            if (acEngaged_ || acRaised_) r = {2, acCapPct_};   // 探测窗(已抬起但未 engaged)也需还原, 防满频残留
-            resetAcSession(); acAsserting_ = false; acActive_ = r.act; return r;
-        }
-        const int  attackTemp = clampi(AutoMode::anticlamp_attack_temp, 30, 95);
-        const bool tooHot     = (m.tempC >= 0 && m.tempC >= attackTemp);
-        // 非游戏态 / 过热 → 不抢频; 在对抗中立即收手(热优先, 还原比例钳值)并复位会话(预算/退避/futility 归零)
-        if (!perfState || tooHot) {
-            if (acEngaged_ || acRaised_) r = {2, acCapPct_};   // 探测窗(已抬起但未 engaged)也需还原, 防满频残留
-            resetAcSession(); acAsserting_ = false; acActive_ = r.act; return r;
-        }
-        // 本会话已放弃(futility): 连续多次预算耗尽都没把频率抢回来 → 只遥测不再动节点(act=3 示意已挂起)
-        if (acFutile_) { acAsserting_ = false; acActive_ = 3; return r; }
-        // 退避中: 暂停抢频; 到点回满预算重试
-        if (acBackoffUntilMs_ > 0) {
-            if (nowMs < acBackoffUntilMs_) { acAsserting_ = false; acActive_ = 3; return r; }
-            acBackoffUntilMs_ = 0; acBudget_ = clampi(AutoMode::anticlamp_attack_budget, 1, 50);
-        }
-        // 探测窗口: 停写让厂商真值浮现(本 tick 不动节点); 末拍据干净读数决定是否复抢
-        if (acProbeLeft_ > 0) {
-            acAsserting_ = false;
-            if (--acProbeLeft_ == 0 && m.headroomValid && m.vendorClamp) tryEngageAc(m, nowMs, r);
-            acActive_ = r.act; return r;
-        }
-        // 保持中: 忽略被自写遮蔽的 headroom, 仅凭 游戏态+温度(上方已过) 维持断言
-        if (acEngaged_) {
-            r = {1, 100}; acAsserting_ = true; acTotal_++;
-            if (--acHoldLeft_ <= 0) { acEngaged_ = 0; acProbeLeft_ = clampi(AutoMode::anticlamp_attack_probe, 1, 120); }
-            acActive_ = r.act; return r;
-        }
-        // 空闲: 用干净读数判断是否首次进入对抗
-        if (m.headroomValid && m.vendorClamp) tryEngageAc(m, nowMs, r);
-        else acAsserting_ = false;
-        acActive_ = r.act; return r;
-    }
-
     // FSM 模式下的实时状态(含 FSM 状态名与本 tick 频率上限)
     void writeFsmStatus(const Metrics& m, int alpha, const char* fsmState, int maxL, int maxB,
                         const kin::PolicyDecision& decision, bool fasEngaged, bool romManaged) {
@@ -447,7 +390,7 @@ public:
             m.cpuBusy, m.currentMa, m.powerW, m.charging ? 1 : 0, m.screenOn, batteryPolicy_.engaged() ? 1 : 0,
             nightSleepMin_, nightWakeMin_, nightSamples_,
             m.headroom, m.headroomValid, m.softClamp, m.hardClamp, m.vendorClamp, clamp1hCount_,
-            acActive_, acTotal_,
+            0, 0L, // Legacy attack telemetry: vendor caps are read-only.
             explDir_, baseCostMa_[bucket],
             (dtSamples_[bucket] >= 3 ? consistencyX1000(bucket) : 1000));
         if (n > 0 && (size_t)n < sizeof(buf)) {
@@ -461,7 +404,8 @@ public:
             status += "foreground_category=" + std::to_string(curAppCategory_) + "\n";
             status += "foreground_source=" + curFgSource_ + "\n";
             status += kin::policyStatusFields(decision, fasEngaged, romManaged,
-                                               utilsLastWriteStatus_);
+                                               utilsLastWriteStatus_, "fsm_cpu_batch",
+                                               utilsLastWriteNodes_, utilsLastWriteFailedNodes_);
             status += "battery_state=";
             status += batteryPolicy_.state(m.battPct, m.charging,
                 Config::AutoMode::auto_battery_enable, Config::AutoMode::crit_batt);
@@ -622,12 +566,15 @@ private:
 
     kin::BatteryPolicy batteryPolicy_;   // 低电迟滞与 alpha 安全地板
     kin::WriteStatus utilsLastWriteStatus_ = kin::WriteStatus::Unknown;
+    std::string utilsLastWriteNodes_;        // 上一批逐节点计数摘要(空=无节点记录)
+    std::string utilsLastWriteFailedNodes_;  // 上一批失败节点路径(空=无失败)
 
     // 亮屏会话累计
     bool inSession_      = false;
     long sessStartSec_   = 0;
     int  sessBattStart_  = -1;
     int  sessMaxTemp_    = -1;
+    int  sessMaxSkinC_   = -1;   // 会话皮肤/外壳峰温(℃); -1=无物理外壳传感器或未采到
     int  sessWarmTicks_  = 0;
     int  sessTicks_      = 0;
     bool sessCharged_    = false;
@@ -873,6 +820,7 @@ private:
         // 播种也走皮肤锚定决策温: 若用 m.tempC(SM8850 结温恒 85-95)播种, 皮肤 td(~50)永远压不过初值,
         // dt_vhot(+80)每会话误加、cleanCool(-60 唯一负向项)永不可达 → 学习单向漂向省电(审查确证的回归)。
         sessMaxTemp_    = thermalDecisionC(m);
+        sessMaxSkinC_   = (m.skinC > 0) ? m.skinC : -1;
         sessWarmTicks_  = 0;
         sessTicks_      = 0;
         sessCharged_    = false;
@@ -950,14 +898,26 @@ private:
         const bool cleanCool = (sessMaxTemp_ >= 0 && sessMaxTemp_ < Config::AutoMode::cool_temp
                                 && trust == TW_CLEAN);
 
-        // 方向信号(系数默认 = ASB 真源码值, 现可由配置覆盖): 不按时长/信任加权
-        int dt = 0;
-        if      (sessMaxTemp_ >= Config::AutoMode::vhot_temp) dt += Config::AutoMode::dt_vhot;
-        else if (sessMaxTemp_ >= Config::AutoMode::hot_temp)  dt += Config::AutoMode::dt_hot;
-        if (drainy)          dt += Config::AutoMode::dt_drainy;
-        if (sustainedHeavy)  dt += Config::AutoMode::dt_sustained;
-        if (sessThermalHit_) dt += Config::AutoMode::dt_thermal_hit;
-        if (cleanCool)       dt += Config::AutoMode::dt_clean_cool;   // dt_clean_cool 默认 -60(负向项)
+        // 方向信号(系数默认 = ASB 真源码值, 现可由配置覆盖): 不按时长/信任加权。
+        // 纯函数在 include/SmartLearning.hpp: 学习方向一旦反了就是"越热越放开", 必须可单测。
+        kin::SmartSessionSignals sig;
+        sig.maxTempC       = sessMaxTemp_;
+        sig.maxSkinC       = sessMaxSkinC_;
+        sig.thermalHit     = sessThermalHit_;
+        sig.drainy         = drainy;
+        sig.sustainedHeavy = sustainedHeavy;
+        sig.cleanCool      = cleanCool;
+        kin::SmartLearnWeights w;
+        w.hot          = Config::AutoMode::dt_hot;
+        w.vhot         = Config::AutoMode::dt_vhot;
+        w.drainy       = Config::AutoMode::dt_drainy;
+        w.sustained    = Config::AutoMode::dt_sustained;
+        w.thermalHit   = Config::AutoMode::dt_thermal_hit;
+        w.thermalHitSkinCool = Config::AutoMode::dt_thermal_hit_skin_cool;
+        w.cleanCool    = Config::AutoMode::dt_clean_cool;
+        w.hotTempC     = Config::AutoMode::hot_temp;
+        w.vhotTempC    = Config::AutoMode::vhot_temp;
+        const int dt = kin::smartDtAlpha(sig, w);
 
         // 桶内一致性(批2): 更新该桶 dt 的 EWMA 均值与平均绝对偏差(均×100 定点, a=1/8)。
         // MAD 大=这个时段忽冷忽热/忽闲忽忙→行为不可复现→confOf 会据此压低该桶置信。
@@ -1348,48 +1308,6 @@ private:
     int  clamp1hCount_  = 0;
     long clamp1hStart_  = 0;
     long clampTotal_    = 0;
-    // ── anti-clamp 攻击侧状态机(详见 antiClampTick / Config 注释) ──
-    int  acEngaged_   = 0;     // 1=正在对抗(断言 hw-max)
-    int  acHoldLeft_  = 0;     // 剩余强制保持 tick(忽略被自写遮蔽的 headroom)
-    int  acProbeLeft_ = 0;     // 释放探测剩余 tick(停写以读真值)
-    int  acCapPct_    = 100;   // 进入对抗时捕获的真实 headroom%(供按比例还原各簇钳值)
-    bool acAsserting_ = false; // 上一拍是否在断言 hw-max(供 fillClampMetrics 跳过自遮蔽读数/死信号计数)
-    int  acActive_    = 0;     // 遥测: 最近 tick 动作(0=无/1=抢频/2=收手/3=退避或已放弃)
-    long acTotal_     = 0;     // 遥测: 累计抢频 tick
-    // 预算/退避/futility(对照 ASB asb_governor.c): 防"写了没用"的机器无限抢频
-    int  acBudget_        = 6; // 本会话剩余抢频次数(进入游戏态复位为 anticlamp_attack_budget)
-    long acBackoffUntilMs_= 0; // >0=退避中, 到此时刻前不抢频
-    int  acBackoffs_      = 0; // 本会话已退避次数(达 max_backoffs → futility)
-    int  acFutile_        = 0; // 1=本会话彻底放弃对抗(只遥测)
-    bool acRaised_        = false; // 已把节点抬到 hw-max: 其回读=自写满频, 在厂商夺回(读到<100)前视为自遮蔽
-    int  acCapKHz_[Config::kClusterCount]  = {0};  // 进入对抗时【按簇】捕获的厂商钳值(kHz; 供逐簇精确还原)
-    int  lastCapKHz_[Config::kClusterCount] = {0}; // 最近一次干净读到的各簇厂商上限(kHz; 供 engage 快照)
-
-    // 进入(复)对抗: 捕获真实 headroom% 与【各簇】厂商钳值作还原基准, 置硬保持 tick, 本 tick 断言 hw-max。
-    void engageAc(const Metrics& m, AcAction& r) {
-        acEngaged_  = 1;
-        acHoldLeft_ = clampi(Config::AutoMode::anticlamp_attack_hold, 1, 120);
-        acCapPct_   = (m.headroom >= 0 && m.headroom <= 100) ? m.headroom : acCapPct_;
-        for (int i = 0; i < Config::kClusterCount; i++) acCapKHz_[i] = lastCapKHz_[i];  // 逐簇捕获(厂商各簇钳幅常不同)
-        acRaised_ = true;
-        r = {1, 100}; acAsserting_ = true; acTotal_++;
-    }
-    // 受预算约束地进入对抗: 预算>0 才抢并扣 1; 预算耗尽→退避(回满重试), 累计退避达上限→本会话放弃。
-    void tryEngageAc(const Metrics& m, long nowMs, AcAction& r) {
-        if (acBudget_ > 0) { acBudget_--; engageAc(m, r); return; }
-        if (++acBackoffs_ >= clampi(Config::AutoMode::anticlamp_attack_max_backoffs, 1, 10)) acFutile_ = 1;
-        else acBackoffUntilMs_ = nowMs + (long)clampi(Config::AutoMode::anticlamp_attack_backoff_s, 1, 600) * 1000;
-        acAsserting_ = false;
-    }
-    void resetAc() { acEngaged_ = 0; acHoldLeft_ = 0; acProbeLeft_ = 0; }
-    // 会话级复位(离开游戏态/过热收手/关开关时): 连同预算/退避/futility 一并归零, 下个游戏会话重新开始。
-    void resetAcSession() {
-        resetAc();
-        acBudget_ = clampi(Config::AutoMode::anticlamp_attack_budget, 1, 50);
-        acBackoffUntilMs_ = 0; acBackoffs_ = 0; acFutile_ = 0; acRaised_ = false;
-        // 注意: 不清 acCapKHz_ —— 收手(act=2)时调度层还要读它逐簇还原(本函数在返回 act=2 前被调用)。
-    }
-
     // 读 headroom%(0..100); 设 lastHeadroom_/lastHeadroomValid_。信号不可用/死信号 → 返回 -1。
     int readHeadroom() {
         if (hwMaxP0_ == 0) {
@@ -1401,29 +1319,19 @@ private:
         ssize_t n = preadFd(17, Soc::kVendorFreqCap, buf, sizeof(buf));   // 节点路径见 Soc 适配层
         if (n <= 0) { lastHeadroomValid_ = 0; lastHeadroom_ = -1; return -1; }
         buf[(size_t)n < sizeof(buf) ? (size_t)n : sizeof(buf) - 1] = '\0';
-        // 解析 "cpu:freq ..." : 取 cpu0 算 headroom, 同时按【簇首核(=policy 号)】记录各簇厂商上限(供逐簇精确还原)
+        // Read cpu0 headroom without acquiring ownership of vendor limits.
         int cap0 = 0;
-        for (int i = 0; i < Config::kClusterCount; i++) lastCapKHz_[i] = 0;
         char* p = buf;
         while (*p) {
             int cpu = -1; long freq = 0;
             if (sscanf(p, "%d:%ld", &cpu, &freq) == 2 && freq > 0) {
                 if (cpu == 0) cap0 = (int)freq;
-                for (int i = 0; i < Config::kClusterCount; i++)
-                    if (Config::Policy::CpuPolicy[i] == cpu) { lastCapKHz_[i] = (int)freq; break; }
             }
             while (*p && *p != ' ' && *p != '\n' && *p != '\t') p++;
             while (*p == ' ' || *p == '\n' || *p == '\t' || *p == '\r') p++;
         }
         if (cap0 <= 0) { lastHeadroomValid_ = 0; lastHeadroom_ = -1; return -1; }
         int hr = clampi((int)((long)cap0 * 100 / hwMaxP0_), 0, 100);
-        // 攻击侧抢频后本节点回读=我方自写的满频, 非厂商真值: 在观测到厂商重新压回(hr<100)之前, 满频读数一律
-        // 视为自遮蔽/不可信(不计死信号、不参与压频判定); 一旦读到 <100 即厂商已夺回控制, 清标志按真值正常判定。
-        // (这才是真正会读到"自写满频"的窗口 —— 探测/空闲拍; 原先只挡断言拍的守卫挡错了地方, 会误判节点死。)
-        if (acRaised_) {
-            if (hr >= 100) { lastHeadroomValid_ = 0; lastHeadroom_ = hr; return -1; }
-            acRaised_ = false;
-        }
         // 死信号检测/恢复(与 ASB 真源码一致: 10 次满 100% 锁死, 5 次合理读数恢复)
         if (hrDeadLatch_) {
             if (hr < 100) {
@@ -1444,9 +1352,6 @@ private:
         if (!Config::AutoMode::anticlamp_enable) {
             m.headroom = -1; m.headroomValid = 0; return;
         }
-        // 攻击侧正断言 hw-max: 本 tick 回读被自写遮蔽(恒满频), 一律标不可信、不做任何压频判定,
-        // 也不刷新 1h 计数 —— 真值要等 hold 到点 probe 停写后才读得到。
-        if (acAsserting_) { m.headroom = lastHeadroom_; m.headroomValid = 0; return; }
         int hr = readHeadroom();
         m.headroom = lastHeadroom_;
         m.headroomValid = lastHeadroomValid_;

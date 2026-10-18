@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
 Kin Build & Pack Script
-Correct workflow: Compile -> Copy binary to magisk/ -> Pack ZIP
+Correct workflow: Compile -> Pack output/Kinetic with module sources
 
 Usage:
     python build_pack.py              # Full build + pack
     python build_pack.py build        # Build only
-    python build_pack.py pack         # Pack only (binary must exist)
+    python build_pack.py pack         # Pack only (output/Kinetic must exist)
     python build_pack.py clean        # Clean all
 
 Environment:
@@ -18,6 +18,9 @@ import sys
 import os
 import platform
 import shutil
+from pathlib import Path
+import stat
+import zipfile
 
 # ============ Configuration ============
 PROJECT_NAME = "Kin"
@@ -274,36 +277,56 @@ def copy_to_magisk():
 
 # ============ Pack Magisk ZIP ============
 def pack_magisk():
-    """Create Magisk module ZIP"""
-    # Check if binary exists in magisk dir
-    magisk_bin = os.path.join(MAGISK_DIR, BINARY_NAME)
-    if not os.path.exists(magisk_bin):
-        error(f"Binary not found in magisk/: {BINARY_NAME}")
-        log("Please run 'python build_pack.py build' first to compile.")
-        return False
-
+    """Rebuild the archive atomically without modifying committed module assets."""
     zip_name = f"{PROJECT_NAME}-v3.2-{DATE_CODE}.zip"
-    zip_path = os.path.join(OUTPUT_DIR, zip_name)
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-    log(f"Creating Magisk module: {zip_name}")
-
-    # Create ZIP from magisk directory (contents only, not the magisk/ folder itself)
-    # Magisk expects files at root of ZIP
-    result = subprocess.run(
-        ["zip", "-r", zip_path, "."],
-        cwd=MAGISK_DIR,
-        capture_output=True,
-        text=True
-    )
-
-    if result.returncode == 0:
-        size_kb = os.path.getsize(zip_path) / 1024
-        success(f"Magisk module created! ({size_kb:.1f} KB)")
+    zip_path = Path(OUTPUT_DIR) / zip_name
+    temporary = zip_path.with_suffix(".zip.tmp")
+    try:
+        binary = (Path(OUTPUT_DIR) / BINARY_NAME).read_bytes()
+        if (len(binary) < 64 or binary[:6] != b"\x7fELF\x02\x01" or
+                int.from_bytes(binary[18:20], "little") != 183):
+            raise ValueError("output/Kinetic is not a little-endian ARM64 ELF")
+        module = Path(MAGISK_DIR)
+        files = {}
+        for path in sorted(module.rglob("*")):
+            name = path.relative_to(module).as_posix()
+            if (not path.is_file() or any(p.startswith(".") for p in path.relative_to(module).parts)
+                    or path.suffix in (".log", ".tmp", ".bak") or path.name == "Kin_pending.apk"):
+                continue
+            files[name] = path.read_bytes()
+        files[BINARY_NAME] = binary
+        apk = os.environ.get("KIN_APK") or os.environ.get("CTS_APK")
+        if apk:
+            files["Kin.apk"] = Path(apk).read_bytes()
+        for path in sorted((Path(SCRIPT_DIR) / "Json").glob("*")):
+            if path.is_file() and path.suffix in (".json", ".txt"):
+                files["config/" + path.name] = path.read_bytes()
+        files["config.json"] = (Path(SCRIPT_DIR) / "Json/config.json").read_bytes()
+        prop = files["module.prop"].decode("utf-8").splitlines()
+        old_codes = [int(line.split("=", 1)[1]) for line in prop if line.startswith("versionCode=")]
+        version = max(VERSION_CODE, max(old_codes, default=0) + 1)
+        prop = [line for line in prop if not line.startswith("versionCode=")]
+        files["module.prop"] = ("\n".join(prop) + f"\nversionCode={version}\n").encode("utf-8")
+        zip_path.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for name, data in sorted(files.items()):
+                executable = name == BINARY_NAME or name.endswith(".sh") or name.endswith("/update-binary")
+                if name != BINARY_NAME and (executable or name.endswith((".prop", ".json", ".txt"))):
+                    data = data.decode("utf-8").replace("\r\n", "\n").encode("utf-8")
+                info = zipfile.ZipInfo(name)
+                info.create_system = 3
+                info.external_attr = (stat.S_IFREG | (0o755 if executable else 0o644)) << 16
+                info.compress_type = zipfile.ZIP_DEFLATED
+                archive.writestr(info, data)
+        with zipfile.ZipFile(temporary) as archive:
+            if archive.testzip() is not None or archive.read(BINARY_NAME) != binary:
+                raise ValueError("Archive validation failed")
+        os.replace(temporary, zip_path)
         success(f"Output: {zip_path}")
         return True
-    else:
-        error(f"Failed to create ZIP: {result.stderr}")
+    except (OSError, ValueError, KeyError, zipfile.BadZipFile) as exc:
+        temporary.unlink(missing_ok=True)
+        error(f"Failed to create ZIP: {exc}")
         return False
 
 # ============ Clean ============
@@ -328,10 +351,10 @@ def show_usage():
 Usage: python build_pack.py [command]
 
 Commands:
-    (none)     Full workflow: build -> copy -> pack
+    (none)     Full workflow: build -> pack (module sources remain unchanged)
     build      Compile binary only
     copy       Copy binary and config to magisk/
-    pack       Create Magisk ZIP (binary must be in magisk/)
+    pack       Create Magisk ZIP from output/Kinetic and module sources
     clean      Remove all build artifacts
     help       Show this help
 
@@ -347,7 +370,7 @@ Examples:
     python build_pack.py build
 
     # If you compiled manually, just pack
-    cp Kin magisk/
+    cp Kinetic output/Kinetic
     python build_pack.py pack
 """)
 
@@ -356,21 +379,14 @@ def main():
 
     if cmd in ("full", ""):
         log("=" * 50)
-        log("Step 1/3: Building binary...")
+        log("Step 1/2: Building binary...")
         log("=" * 50)
         if not build_binary():
             sys.exit(1)
 
         log("")
         log("=" * 50)
-        log("Step 2/3: Copying to magisk/...")
-        log("=" * 50)
-        if not copy_to_magisk():
-            sys.exit(1)
-
-        log("")
-        log("=" * 50)
-        log("Step 3/3: Packing Magisk ZIP...")
+        log("Step 2/2: Packing Magisk ZIP...")
         log("=" * 50)
         if not pack_magisk():
             sys.exit(1)

@@ -138,23 +138,27 @@ public:
     // 读当前节点并仅在值变化时写入。sysfs 节点通常不带换行，读取时仅去掉行尾空白。
     // 返回 false 表示节点不存在、读取失败或写入失败；同值跳过返回 true。
     bool FileWriteIfChangedBlocking(const char* filePath, const string_t& content) noexcept {
-        if (!filePath || content.empty()) {
+        if (!filePath) {
             writeStatus_.record(kin::WriteStatus::Failed);
+            return false;
+        }
+        if (content.empty()) {
+            writeStatus_.recordNode(filePath, kin::WriteStatus::Failed);
             return false;
         }
         const auto comparison = kin::compareNodeValue(
             filePath, std::string_view(content.data(), content.size()));
         if (comparison == kin::NodeComparison::Equal) {
-            writeStatus_.record(kin::WriteStatus::Unchanged);
+            writeStatus_.recordNode(filePath, kin::WriteStatus::Unchanged);
             return true;
         }
         // 不以截断或读取失败推断节点值；保留失败语义，交调用方重试/报告。
         if (comparison != kin::NodeComparison::Different) {
-            writeStatus_.record(kin::WriteStatus::Failed);
+            writeStatus_.recordNode(filePath, kin::WriteStatus::Failed);
             return false;
         }
         const bool written = FileWriteBlocking(filePath, content);
-        writeStatus_.record(written ? kin::WriteStatus::Written : kin::WriteStatus::Failed);
+        writeStatus_.recordNode(filePath, written ? kin::WriteStatus::Written : kin::WriteStatus::Failed);
         return written;
     }
 
@@ -166,6 +170,9 @@ public:
     void endWriteBatch() noexcept { writeStatus_.endBatch(); }
     kin::WriteStatus lastWriteStatus() const noexcept { return writeStatus_.get(); }
     kin::WriteStatus writeBatchStatus() const noexcept { return writeStatus_.batch(); }
+    // 本批逐节点写入结果(计数 + 失败节点路径), 供状态诊断区分"整批同值跳过"与"部分节点写失败"。
+    std::string writeBatchNodeSummary() const { return writeStatus_.batchNodeSummary(); }
+    std::string writeBatchFailedNodes() const { return writeStatus_.batchFailedNodes(); }
 
     // scaling_governor 等节点不能用 O_NONBLOCK（内核返回 EAGAIN 导致静默失败），失败时解锁权限重试
     bool FileWriteBlocking(const char* filePath, const string_t& content) noexcept {

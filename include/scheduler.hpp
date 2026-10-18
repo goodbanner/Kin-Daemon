@@ -10,6 +10,12 @@
 #include "RestorePolicy.hpp"
 #include "OwnedNode.hpp"
 #include "PresenceCache.hpp"
+#include "ProbeCadence.hpp"
+#include "ThermalDecision.hpp"
+#include "IdleUclamp.hpp"
+#include "PowerBoostNode.hpp"
+#include "PackageName.hpp"
+#include "DeviceValidation.hpp"
 #include <sys/inotify.h>
 #include <sys/resource.h>
 #include <poll.h>
@@ -83,6 +89,7 @@ private:
     AutoFas     autoFas_{logger};
     std::string lastModeLogged_;   // 仅在情景模式真正变化时打印, 避免配置重载刷屏
     SysTweaks   sysTweaks_{logger, utils};   // ASB 非 CPU 调优(VM/网络/WiFi/停服务/BG_TRIM)
+    DeviceValidation validation_{logger};
     std::string lastAutoTuneMode_;   // G1: auto 档已下发的 SysTune 基础档(powersave/balance/performance), 边沿去重(持 applyMtx)
 
     std::string lastTopApp;          // 上一次前台应用包名（用于画像切换去重）
@@ -126,19 +133,17 @@ private:
     // 取前台包名的 App 类别(ApplicationInfo.category)。首次见某包 → dumpsys package 一次并缓存;
     // 之后直接命中缓存, 绝不每 tick popen。无效/取不到 → 返回 -1(UNDEFINED)。
     int fgCategory(const std::string& pkg) {
-        if (pkg.empty() || pkg == "null") return -1;
+        if (pkg == "null" || !kin::validPackageName(pkg)) return -1;
         {
             std::lock_guard<std::mutex> lk(catMtx_);
             for (int i = 0; i < catCount_; i++)
                 if (catKey_[i] == pkg) return catVal_[i];   // 命中: 0 次 popen
         }
         // 仅取含 category 的少数行(grep 收窄缓冲, 省内存/解析); 同时捞数值版与文本版。
-        char cmd[256];
-        FastSnprintf(cmd, sizeof(cmd),
-            "dumpsys package %s 2>/dev/null | grep -m1 -iE 'categoryHint=|category=' ",
-            pkg.c_str());
         char buf[256] = {0};
-        utils.popenRead(cmd, buf, sizeof(buf));
+        kin::readPackageCategory(pkg, [&](const char* cmd) {
+            utils.popenRead(cmd, buf, sizeof(buf));
+        });
         int cat = -1;
         // ① 优先数值: AOSP "categoryHint=N"(N 即 ApplicationInfo.category)。
         const char* h = strstr(buf, "categoryHint=");
@@ -247,6 +252,7 @@ public:
         threads.emplace_back(thread(&Schedule::bgTrimTask, this));
         // 功耗记录线程(始终运行, 与情景模式无关): 供 App 首页"当前记录"卡片 + 曲线
         threads.emplace_back(thread(&Schedule::powerRecorderTask, this));
+        threads.emplace_back(thread(&Schedule::validationTask, this));
     }
 
     // 每 30s 记一条电池采样到 power_log.txt(原始量, App 自算功率/会话/曲线)
@@ -255,6 +261,18 @@ public:
         while (!shouldExit_.load()) {
             autoMode_.appendPowerSample();
             if (waitStop(30000)) break;
+        }
+    }
+
+    void validationTask() {
+        if (waitStop(12000)) return;
+        validation_.run();
+        while (!shouldExit_.load()) {
+            if (access(DeviceValidation::requestPath(), F_OK) == 0) {
+                unlink(DeviceValidation::requestPath());
+                validation_.run();
+            }
+            if (waitStop(2000)) break;
         }
     }
 
@@ -376,6 +394,7 @@ public:
         for (auto& t : threads) {
             if (t.joinable()) t.join();
         }
+        sysTweaks_.restoreAll();
         if (stopEventFd_ >= 0) {
             close(stopEventFd_);
             stopEventFd_ = -1;
@@ -773,15 +792,21 @@ public:
             }
             uclampAvail_ = uclampNode_ ? 1 : 0;
             if (!uclampAvail_) return;
-            uclampOrig_ = readSmallFile(uclampNode_);   // 快照原值(一次), 还原时写回
+        }
+        // 接管前置条件: **读不到原值就不接管** —— 否则退出时既无法还原, 又会把我们的值永久留在
+        // 节点上(相机保持同款规则: "读不到原值则跳过接管")。原值为空时本拍不动, 下拍重新快照。
+        if (uclampOrig_.empty()) {
+            uclampOrig_ = readSmallFile(uclampNode_);   // 快照原值, 还原时写回
+            if (uclampOrig_.empty()) return;
         }
         if (pct <= 0) {
             if (!uclampApplied_) return;                // 从未介入 → 不碰平台默认
-            // 还原: 仅当节点仍是我们写的值(外部/游戏引擎改过则不覆盖); 写回原值
+            // 还原: 仅当节点仍是我们写的值(外部/游戏引擎改过则不覆盖); 写回原值。
+            // 原值已在接管前确认可读, 这里不再需要 empty 例外。
             string_t cur = readSmallFile(uclampNode_);
             char mine[16]; snprintf(mine, sizeof(mine), "%d", uclampMinState_);
             const bool stillOwned = cur.empty() || str_eq(cur, string_t(mine));
-            const bool restored = !stillOwned || uclampOrig_.empty() ||
+            const bool restored = !stillOwned ||
                 utils.FileWriteIfChangedBlocking(uclampNode_, uclampOrig_);
             uclampApplied_ = kin::releaseOwned(uclampApplied_, stillOwned, restored);
             if (!uclampApplied_) uclampMinState_ = -1;
@@ -792,6 +817,54 @@ public:
         int n = snprintf(buf, sizeof(buf), "%d", pct);   // 接口接受百分比整数(0..100)
         if (n > 0 && utils.FileWriteIfChangedBlocking(uclampNode_, string_t(buf))) {
             uclampMinState_ = pct; uclampApplied_ = true;
+        }
+    }
+
+    // ── 息屏 DEEP_IDLE 背景 uclamp 上限(移植 ASB V64) ──
+    // 只压不抬, 用 OwnedNode 记原值; 离开 DEEP_IDLE / 关开关时条件还原(被外部改过就不覆盖)。
+    // 内核无 background uclamp.max 接口则整段跳过 —— 不写不存在的节点。
+    const char* bgUclampNode_[2] = { nullptr, nullptr };
+    bool        bgUclampProbed_  = false;
+    kin::OwnedNode bgUclampOwned_[2];
+    void applyDeepIdleBgUclamp(bool deepIdle) {
+        if (!bgUclampProbed_) {
+            bgUclampProbed_ = true;
+            static const char* const cands[2][3] = {
+                { "/dev/cpuctl/background/cpu.uclamp.max",
+                  "/sys/fs/cgroup/background/cpu.uclamp.max", nullptr },
+                { "/dev/cpuctl/system-background/cpu.uclamp.max",
+                  "/sys/fs/cgroup/system-background/cpu.uclamp.max", nullptr },
+            };
+            for (int g = 0; g < 2; ++g)
+                for (const char* const* c = cands[g]; *c; ++c) {
+                    struct stat st;
+                    if (stat(*c, &st) == 0) { bgUclampNode_[g] = *c; break; }
+                }
+            if (!bgUclampNode_[0] && !bgUclampNode_[1])
+                logger.Info("息屏背景 uclamp: 内核无 background uclamp.max 接口, 跳过(不写入不存在的节点)");
+        }
+        const bool wantCap = deepIdle && Config::AutoMode::bg_uclamp_enable;
+        for (int g = 0; g < 2; ++g) {
+            const char* node = bgUclampNode_[g];
+            if (!node) continue;
+            auto rd = [node] { return std::string(readSmallFile(node).c_str()); };
+            auto wr = [this, node](const std::string& v) {
+                return utils.FileWriteIfChangedBlocking(node, string_t(v.c_str()));
+            };
+            if (!wantCap) {
+                if (!bgUclampOwned_[g].held()) continue;
+                if (!bgUclampOwned_[g].restore(rd, wr))
+                    logger.Debug("息屏背景 uclamp: %s 还原未完成, 下拍重试", node);
+                continue;
+            }
+            const std::string cur = rd();
+            const int curPct = cur.empty() ? -1 : atoi(cur.c_str());
+            const int target = kin::deepIdleBgUclampTarget(curPct, true, Config::AutoMode::bg_uclamp_cap);
+            if (target < 0) continue;   // 已够低 / 读不到 / 关闭 → 不动
+            char buf[16];
+            snprintf(buf, sizeof(buf), "%d", target);
+            if (!bgUclampOwned_[g].apply(std::string(buf), rd, wr))
+                logger.Debug("息屏背景 uclamp: %s 写入失败", node);
         }
     }
 
@@ -806,7 +879,7 @@ public:
     // 边沿驱动(仅档位变化才写)。auto 启用接管此节点, 退出还原各节点原值。
     // 内核全无接口则 boost 段跳过(首次探测失败永久禁用); 压制段走 caps/关核/GPU 不受影响。
     // 返回功率档位: 0=卡顿(开boost补救) 1=中性(省电) 2=高(关boost+压大核+限GPU) 3=临界(深压+关核+限GPU); -1=旁路。
-    int  pwrBoostMode_  = 0;             // 0=未探测/无 1=cgroup 2=sysctl 3=boost
+    int  pwrBoostMode_  = 0;             // 0=未探测/无 1=cgroup 2=sched_boost
     int  pwrBoostState_ = -2;            // 当前已写的档位(-2=从未写过, -1..3=档位)
     kin::OwnedNode pwrBoostNode_;       // Only the selected boost node is owned.
     // ── boost 时间门控(防抖 + 防长期钉高) ──
@@ -851,23 +924,26 @@ public:
         return 1;
     }
     static constexpr const char* kPwrCgUclampMin  = "/sys/fs/cgroup/cpu.uclamp.min";
+    // sched_util_clamp_min 只是 UCLAMP_MIN 的"允许上限"(0..1024), 不是 boost 源 ——
+    // 保留常量仅作说明: 选型绝不能拿它的存在当依据(见 include/PowerBoostNode.hpp)。
     static constexpr const char* kPwrUclampSysctl = "/proc/sys/kernel/sched_util_clamp_min";
     static constexpr const char* kPwrSchedBoost   = "/proc/sys/kernel/sched_boost";
 
-    // 探测 UCLAMP 接口(逐级回退, 仅探测一次)。返回 1=cgroup 2=sysctl 3=boost 0=全无。
+    // 探测 UCLAMP 接口(逐级回退, 仅探测一次)。返回 1=cgroup 2=sched_boost 0=全无。
+    // 必须以【实际写入节点】是否存在为准: 原实现用 sched_util_clamp_min 的存在选中 sched_boost 模式,
+    // 在只有前者没后者的内核上会每拍重试一次写不存在的节点。
     int pwrBoostProbe() {
         if (pwrBoostMode_ != 0) return pwrBoostMode_;
         struct stat st;
-        if (stat(kPwrCgUclampMin,  &st) == 0) pwrBoostMode_ = 1;
-        else if (stat(kPwrUclampSysctl, &st) == 0) pwrBoostMode_ = 2;
-        else if (stat(kPwrSchedBoost,   &st) == 0) pwrBoostMode_ = 3;
+        const bool cg    = (stat(kPwrCgUclampMin, &st) == 0);
+        const bool boost = (stat(kPwrSchedBoost,  &st) == 0);
+        pwrBoostMode_ = kin::selectPowerBoostMode(cg, boost);
         return pwrBoostMode_;
     }
     const char* pwrBoostMainNode() {
         switch (pwrBoostMode_) {
             case 1: return kPwrCgUclampMin;
             case 2: return kPwrSchedBoost;
-            case 3: return kPwrSchedBoost;
         }
         return nullptr;
     }
@@ -961,7 +1037,7 @@ public:
             if (!wantOn) pwrBoostNoteLeave();     // 离开 boost: 起冷却计时
             if (wantOn) logger.Info("功率 boost: 开 (卡顿补救, %dW, min=%d, uclamp=%s)", lastPwrW_,
                         Config::AutoMode::power_boost_value,
-                        pwrBoostMode_ == 1 ? "cgroup" : (pwrBoostMode_ == 2 ? "sysctl" : "boost"));
+                        pwrBoostMode_ == 1 ? "cgroup" : "sched_boost");
             else if (level >= 2) logger.Info("功率 boost: 关+压制 (%dW ≥ %.1fW)", lastPwrW_,
                         (double)(level == 3 ? Config::AutoMode::power_throttle_critical_w : Config::AutoMode::power_throttle_w));
         }
@@ -1367,8 +1443,13 @@ public:
     // ── G1: auto 档让 SysTune(每档 VM/网络/WiFi) 跟随自学习基础档, 边沿触发(仅变化才下发, 不进逐 tick 写循环)──
     // 移植 ASB V57 smart 跟档语义(alpha 高/低 → 切省电/低延迟网络集)。base = powersave/balance/performance。
     void followAutoSysTune(const std::string& base) {
-        if (!Config::SysTune::enable) return;
-        std::lock_guard<std::recursive_mutex> lk(applyMtx);   // 递归锁: 从 FSM 路径调用也安全
+        std::lock_guard<std::recursive_mutex> lk(applyMtx);
+        if (!Config::SysTune::enable) {
+            sysTweaks_.restoreAll();
+            lastAutoTuneMode_.clear();
+            return;
+        }
+        if (base == "balance") sysTweaks_.restoreWifi();
         if (base == lastAutoTuneMode_) return;                // 边沿: 基础档未变则不重下发
         lastAutoTuneMode_ = base;
         sysTweaks_.applyProfileTune(base);
@@ -1404,9 +1485,6 @@ public:
                 stickyGame.clear();   // 退 auto: 粘滞归零(对称 fasWasGaming)
                 fengchiGovResetPending_ = false;   // 退 auto: 清热重载标志(对称 fengchiActive)
                 if (fasWasGaming) { autoFas_.onExitGaming(); fasWasGaming = false; }
-                // 退出 auto(切手动档等): antiClampTick 不再被调用, 若攻击侧仍抬着厂商节点则在此收手还原,
-                // 否则厂商热钳被永久顶在满频。幂等——未抬起则 no-op。
-                applyAntiClampNode(autoMode_.antiClampRelease());
                 // 退出 auto: 退出路径(onModeChanged→primeAutoFsm/online)已按非 auto 档处理核心,
                 // 这里只把去重缓存复位为全 1, 下次进 auto 不因陈旧缓存漏掉一次上线。
                 // 必须持 applyMtx: fileWatch 线程经 onModeChanged→onlineAll 在锁内写同一数组(避免 data race)。
@@ -1418,6 +1496,7 @@ public:
                   pwrParkBig_ = false;        // 退出 auto: 解除功率关核(大核随 onlineAll 重新上线)
                   applyFpsgo(false);         // 退出 auto: 还原 FPSGO
                   applyCameraHold(false);    // 退出 auto: 相机保持若在位, 条件还原 cpuset/uclamp
+                  applyDeepIdleBgUclamp(false);   // 退出 auto: 息屏背景 uclamp 若被我们压过, 条件还原
                   for (int i = 0; i < kCoreCount; i++) lastAutoOnline_[i] = 1;
                   lastAutoTuneMode_.clear(); }   // 退出 auto → 清 SysTune 基础档去重, 重进时按当时基础档重下发
                 if (waitStop(3000)) break;
@@ -1507,8 +1586,12 @@ public:
                 // 遍历所有 visible=true 的 standard Task, 只要有一个命中游戏画像就保持游戏态。
                 // 仅在尚未从 fgPkg 判出游戏时才触发(避免重复 getForegroundCached 开销)。
                 // fgHeavy: 多窗口扫出的 heavy 直接驱动风驰调速器, 与粘滞语义一致。
+                // TTL 按活动度分级(上游 V64 思路, 见 include/ProbeCadence.hpp): 安静时 120s 一次,
+                // 重载/游戏态 8s —— 原来固定 2s, 亮屏期间常驻 0.5 次/秒的 dumpsys。
                 if (!gameHint && mx.screenOn != 0) {
-                    Utils::ForegroundSnapshot snap = utils.getForegroundCached(2000);
+                    const int mwTtl = kin::multiWindowScanTtlMs(mx.gpuPct, mx.cpuBusy,
+                                                               autoFsm_.state() >= AutoFsm::HEAVY);
+                    Utils::ForegroundSnapshot snap = utils.getForegroundCached(mwTtl);
                     if (snap.valid) {
                         std::lock_guard<std::recursive_mutex> lk(applyMtx);
                         for (const auto& visiblePkg : snap.standardVisible) {
@@ -1637,8 +1720,19 @@ public:
                 // 利用率漏掉, 用 PSI 兜底抬高(取大, 只在真有等待时生效)。仅加权路径启用, 避免扰动旧调校。
                 if (tickCfg.fsmWeightedLoad && mx.cpuPsi > fsmCpu && fsmCpu >= 0)
                     fsmCpu = mx.cpuPsi;
+                // 前台包类别提前取: GAMING 包名校验与下方类别钳制共用同一份结果(命中缓存, 不增 popen)。
+                const int fgCat = (mx.screenOn != 0 && !fgPkg.empty()) ? resolveCategory(fgPkg) : -1;
+                // 上游 V64: 前台已被明确分类为非游戏 → 不让 GPU 单指标把状态推到 GAMING。
+                // gameHint 已成立(画像/系统类别/帧源)或类别未知(-1)时保持旧行为, 未分类的游戏不受影响。
+                const bool fgNotGame = (!gameHint && fgCat >= 0);
+                // 上游 V64: 两个热源打架时负载驱动的迁移多要一拍(见 ThermalDecision.hpp 的争议定义)。
+                // 热升档不受影响 —— 对传感器的不确定只该买到延迟, 不该买到安全。
+                const bool thermalDisputed = kin::thermalSourcesDisputed(
+                    mx.tempC, mx.skinC, Config::AutoMode::thermal_skin_gate,
+                    Config::AutoMode::veto_temp, Config::AutoMode::skin_temp,
+                    Config::AutoMode::junction_hard_temp);
                 bool changed = autoFsm_.update(mx.gpuPct, mx.load1, autoMode_.thermalDecisionC(mx), mx.screenOn, fsmCpu, gameHint,
-                                               mx.currentMa, mx.charging);
+                                               mx.currentMa, mx.charging, fgNotGame, thermalDisputed);
                 AutoFsm::Caps caps = autoFsm_.computeCaps(alpha);
 
                 // ── 用户 fsm_policy 覆盖内置曲线(config.json Function.AutoMode.fsm_policy) ──
@@ -1726,11 +1820,9 @@ public:
                 }
 
                 // ── 按 App 类别封顶钳制(只压不抬) ──
-                // 类别优先取既有 App 画像(perapp+Models, 用户已整理 150+ 包)→ 抖音等国产 App 也能识别;
-                // 画像未覆盖再退回系统 appCategory。fgCat 始终计算(即便不钳制)便于日志核对(类=%d)。
+                // 类别已在 FSM 更新前取好(fgCat), 这里只把结果注入 AutoMode 供状态文件/相机判定。
                 // 轻类别(视频/社交/音频)压低大核/小核 scaling_max 与 GPU 上限省电; 游戏/未知不钳制。
                 // FAS 接管(游戏帧率闭环)时不叠加, 交给帧控。结果命中缓存, 不增每 tick popen。
-                int fgCat = (mx.screenOn != 0 && !fgPkg.empty()) ? resolveCategory(fgPkg) : -1;
                 autoMode_.setForegroundCategory(fgCat);
                 // ── 相机保持检测(ASB V60 camera_hold): 前台是相机 App → 保持性能 ──
                 // 相机流式传输时 ISP+编码器吃负载但 GPU/load 不高, FSM 误判 MODERATE → 4K60 丢帧。
@@ -1880,7 +1972,9 @@ public:
                     capsToWrite.minB = resolvedCaps.minB;
                     capsToWrite.maxB = resolvedCaps.maxB;
                     writeFsmCaps(capsToWrite);
-                    autoMode_.setLastWriteStatus(utils.writeBatchStatus());
+                    autoMode_.setLastWriteStatus(utils.writeBatchStatus(),
+                                                 utils.writeBatchNodeSummary(),
+                                                 utils.writeBatchFailedNodes());
                     // 每状态 GPU 上限(对齐 ASB):空闲低、游戏满。仅在能读到合理 GPU 硬件最高频时启用,
                     // 否则跳过(沿用 config GPU)。改 GpuFreq::max_mhz 原子,由 GPU 守护线程每秒落实。
                     if (Config::GpuFreq::enable) {
@@ -1917,10 +2011,9 @@ public:
                     // ── 相机保持(ASB V60 camera_hold): 前台相机 → 接管 cpuset/uclamp(边沿驱动)。
                     // 风驰接管时已强制 false(上方); 此处处理非风驰态下的相机进出沿。
                     applyCameraHold(cameraHoldWant);
-                    // ── anti-clamp 攻击侧: 仅游戏态(命中游戏画像)才可能主动抢回被厂商无谓压掉的频率上限。
-                    // 默认关(anticlamp_attack_enable=false)→ antiClampTick 恒返回 act=0, 此处 no-op。
-                    // 在 writeFsmCaps/applyFengchiHwCaps 之后写: 厂商节点放开上限, 让刚写的 scaling_max 真正生效。
-                    applyAntiClampNode(autoMode_.antiClampTick(mx, inGaming, (long)nowMs()));
+                    // ── 息屏 DEEP_IDLE 背景 uclamp 上限(ASB V64): 只压不抬, 离开 DEEP_IDLE 条件还原 ──
+                    applyDeepIdleBgUclamp(autoFsm_.state() == AutoFsm::DEEP_IDLE);
+                    // Vendor frequency limits are read-only telemetry, never overridden.
                     // ── 关核心(可逆)对齐: FAS 接管(游戏帧控)时绝不关核(传 0=game); 否则按前台类别。
                     // game/undefined/未知 或 关核心未开 → desiredOnlineForCat 返回全核 → 自动切回(可逆)。
                     // 关核心开时本函数为在线集合唯一权威; 关核心关时 want 恒全 1, 与 onlineAll 一致。去重避免重复写。
@@ -1988,7 +2081,7 @@ public:
             }
         }   // autoModeTask 主循环结束
         // 线程退出(守护停止/重启): 游戏态调速器若在切换态, 条件还原, 不把 hm/scx 留给死守护
-        { std::lock_guard<std::recursive_mutex> lk(applyMtx); applyGamingGov(false, "auto线程退出"); applyTopAppUclampMin(0); applyPowerBoost(-1); applyFpsgo(false); applyCameraHold(false); pwrParkBig_ = false; }
+        { std::lock_guard<std::recursive_mutex> lk(applyMtx); applyGamingGov(false, "auto线程退出"); applyTopAppUclampMin(0); applyPowerBoost(-1); applyFpsgo(false); applyCameraHold(false); applyDeepIdleBgUclamp(false); pwrParkBig_ = false; }
     }
 
     static constexpr int kFsmTickMs = 2000;   // FSM 亮屏 tick 固定 2s(对齐 ASB)
@@ -2099,42 +2192,6 @@ public:
         return true;
     }
 
-    // ── anti-clamp 攻击侧: 执行 AutoMode 的动作意图, 回写厂商频率上限节点(msm_performance/cpu_max_freq) ──
-    // 该节点是 per-CPU freq-QoS(策略上限取簇内各核最小值), 故【逐核】写、不只写簇首核 —— 否则厂商若逐核
-    // 压频, 只写首核挡不住、抢频形同空操作。格式 "cpu:freq cpu:freq ..."。
-    //   act=1 抢频: 各簇写本簇 hw-max(顶回被厂商无谓压掉的上限, 让 scaling_max 真正生效);
-    //   act=2 收手: 各簇还原【进入对抗时按簇捕获】的厂商钳值(缺失则退回 hw×restorePct/100) —— 厂商各簇钳幅
-    //         常不同, 单一比例套所有簇会把大核解钳过头(违背"绝不把过热机器顶满")。
-    // 仅在意图非 0 时写。写经 utils.FileWriteBlocking(带 chmod 回退+重试+成功校验, 与触控加速同一写法)。
-    void applyAntiClampNode(const AutoModeCtl::AcAction& ac) {
-        if (ac.act == 0 || Soc::kVendorFreqCap == nullptr) return;
-        const int pct = ac.restorePct < 1 ? 1 : (ac.restorePct > 100 ? 100 : ac.restorePct);
-        // 每簇目标频
-        int cfreq[Config::kClusterCount];
-        for (int i = 0; i < Config::kClusterCount; i++) {
-            cfreq[i] = 0;
-            if (Config::Policy::CpuPolicy[i] < 0) continue;
-            const int hw = clusterHwMaxKHz(i);
-            if (hw <= 0) continue;
-            if (ac.act == 1) cfreq[i] = hw;
-            else { const int cap = autoMode_.acRestoreKHz(i); cfreq[i] = (cap > 0) ? cap : (int)((long)hw * pct / 100); }
-        }
-        // 逐核写: 每核取其所属簇的目标频
-        char val[256]; int off = 0;
-        for (int c = 0; c < kCoreCount; c++) {
-            const int pol = policyForCore(c);
-            if (pol < 0) continue;
-            int ci = -1;
-            for (int i = 0; i < Config::kClusterCount; i++)
-                if (Config::Policy::CpuPolicy[i] == pol) { ci = i; break; }
-            if (ci < 0 || cfreq[ci] <= 0) continue;
-            int w = FastSnprintf(val + off, sizeof(val) - off, "%s%d:%d", off ? " " : "", c, cfreq[ci]);
-            if (w <= 0 || off + w >= (int)sizeof(val)) break;
-            off += w;
-        }
-        if (off > 0) { val[off] = '\0'; utils.FileWriteIfChangedBlocking(Soc::kVendorFreqCap, string_t(val)); }  // 截尾, 防溢出 break 残留半个 token
-    }
-
     // 从 /sdcard/Android/Kin/AI/pkg_label.txt 加载 pkg→App名字 映射(App 写, 供日志显示 App 名字)。
     // 每行 "包名<空白>显示名"(显示名可含空格, 取包名后整段); # 注释; 读不到则清空为空表(退回包名)。
     void loadAppLabels() {
@@ -2179,7 +2236,7 @@ public:
     void applyWithProfile() {
         std::lock_guard<std::recursive_mutex> lk(applyMtx);
         int matchIdx = Config::AppProfile::currentMatch.load();
-        if (Config::AppProfile::enable && matchIdx >= 0) {
+        if (Config::AppProfile::shouldApplyProfile(matchIdx)) {
             applyAppProfile(matchIdx);
         } else {
             applyBaseMode(); // 内部已先 restoreBaseCoresIfNeeded, 不再重复
@@ -2671,6 +2728,10 @@ public:
         if (waitStop(6000)) return;   // 等启动稳定
         int interval = 2000, stable = 0;
         while (!shouldExit_.load()) {
+            {
+                std::lock_guard<std::recursive_mutex> lk(applyMtx);
+                sysTweaks_.retryRestores();
+            }
             // 息屏期间无前台切换/调度变化需要强制, 退避到 30s 省过夜累积唤醒
             // (autoModeTask 自身息屏即用 60s, 30s 仍更勤)。-1(未知)按亮屏处理, 不退避;
             // 亮屏后下一轮 stable/interval 复位, 立即恢复 2s 快节奏先做一次强制。
@@ -2827,6 +2888,7 @@ public:
     void onTopAppChanged() {
         char buf[256];
         if (!readNodeTrim(topAppPath, buf, sizeof(buf)) || !buf[0]) return;
+        if (!kin::validPackageName(buf)) return;
         bool changed;
         {
             std::lock_guard<std::mutex> lk(pushMtx_);
@@ -2918,17 +2980,13 @@ public:
         lastTopApp = pkg;
 
         // 黑名单前台(launcher/systemui/输入法等)或无匹配画像 → matched=-1
-        const bool isBlack = Config::AppProfile::isBlacklisted(pkg.c_str());
-        int matched = isBlack ? -1 : Config::AppProfile::findMatchingModel(pkg.c_str());
-
-        // 设计约定: auto 模式「智能/FSM 独占」—— 非黑名单 App 一律不套 App 画像,
-        // 也不跟随全局档(下方 perapp "*" 同样跳过), 全程由智能/FSM 接管。游戏由 FSM GAMING 态拉满。
-        if (autoActive_.load()) matched = -1;
+        const auto decision = Config::AppProfile::decideForeground(pkg.c_str(), autoActive_.load());
+        const int matched = decision.matched;
 
         // [真黑名单·方案A] 黑名单 App 前台 → 彻底松手交还系统(解锁频率+默认调速器+全核),不套任何档位。
         // 普通无匹配 App(非黑名单)仍走下方"跟随全局"。
         // 智能模式无视黑名单: FSM 全程接管(launcher/systemui 等低负载自然给低频), 不释放, 否则与 FSM 抢。
-        if (isBlack && !autoActive_.load()) {
+        if (decision.release) {
             if (!blacklistReleased) {
                 blacklistReleased = true;
                 Config::AppProfile::currentMatch.store(-1);
@@ -2952,12 +3010,7 @@ public:
 
         // 无匹配/黑名单 → 跟随全局:优先用 perapp "*" 行(全局默认),没有再回落基础档。
         // 不再强制省电;若用户想让无匹配/黑名单应用省电,设 perapp 全局行 "* powersave" 即可。
-        int newMatch = matched;
-        if (!autoActive_.load() && newMatch < 0 &&
-            !Config::AppProfile::perAppGlobal.empty()) {
-            int g = Config::AppProfile::findModelByName(Config::AppProfile::perAppGlobal.c_str());
-            if (g >= 0) newMatch = g;
-        }
+        const int newMatch = decision.selected;
 
         // 日志: 前台每变一次都打一行"应用 → 当前生效的档"(画像/全局/基础都打一次), 让用户看清切到哪个模式;
         // 到这里 pkg 必已变化(上方 pkg==lastTopApp 已早退)。实际写 sysfs 仍按去重(档没变不重复下发)。

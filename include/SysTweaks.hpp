@@ -8,6 +8,9 @@
 #include "Config.hpp"
 #include "Logger.hpp"
 #include "Utils.hpp"
+#include "WifiPowerSave.hpp"
+#include "NodeWriter.hpp"
+#include "OwnedSettings.hpp"
 #include <string>
 #include <cstdio>
 #include <cstring>
@@ -15,6 +18,25 @@
 class SysTweaks {
 public:
     SysTweaks(Logger& lg, Utils& ut) : logger_(lg), utils_(ut) {}
+
+    void restoreWifi() {
+        WifiIo io{utils_};
+        if (!wifi_.apply("auto", false, io))
+            logger_.Debug("WiFi power-save restore pending");
+    }
+
+    void restoreAll() {
+        restoreWifi();
+        NodeIo io;
+        if (!settings_.restore(io)) logger_.Debug("SysTune restore pending");
+    }
+
+    void retryRestores() {
+        WifiIo io{utils_};
+        wifi_.retryRestore(io);
+        NodeIo nodes;
+        settings_.retryRestore(nodes);
+    }
 
     // ── 每档 VM/网络/WiFi 调优(ASB profiles/*.sh 真值) ──
     struct Tune {
@@ -33,12 +55,11 @@ public:
 
     // mode: powersave/balance/performance/fast/auto/smart → 映射到 ASB 三档
     void applyProfileTune(const std::string& mode) {
-        if (!Config::SysTune::enable) return;
+        if (!Config::SysTune::enable) { restoreAll(); return; }
         const Tune& t = tuneFor(mode);
         // VM
         wsys("/proc/sys/vm/swappiness",                 t.swappiness);
-        // swappiness 镜像到 OxygenOS 私有属性(仅当已存在, 防 ROM launcher/启动期覆盖本档设置; V57)
-        mirrorSwappinessProps(t.swappiness);
+        // Do not mirror into ROM properties: no reliable ownership/restore contract.
         wsys("/proc/sys/vm/dirty_expire_centisecs",     t.dirtyExpire);
         wsys("/proc/sys/vm/dirty_writeback_centisecs",  t.dirtyWriteback);
         wsys("/proc/sys/vm/vfs_cache_pressure",         t.vfs);
@@ -85,18 +106,10 @@ public:
                       mode.c_str(), t.swappiness, t.tcpRmem, t.wifiPm, t.txqlen);
     }
 
-    // ── 开机一次性: 停调试/遥测服务 + 关 WiFi 后台扫描(ASB service.sh)。注意 pm disable 跨重启持久。 ──
+    // Legacy switch retained for config compatibility; no persistent side effects.
     void bootTrimOnce() {
         if (!Config::BootTrim::enable) return;
-        // ASB _BG_TRIM_DISABLE: 纯分析/日志类, 禁用不影响功能
-        static const char* kDisable[] = {
-            "com.oplus.midas", "com.oplus.olc", "com.oplus.crashbox", "com.oplus.logkit"
-        };
-        for (const char* p : kDisable) sh(std::string("pm disable-user --user 0 ") + p);
-        sh("stop vendor.oplus.hardware.olc2-V3-service");
-        sh("settings put global wifi_scan_always_enabled 0");
-        sh("settings put global wifi_wakeup_enabled 0");
-        logger_.Info("开机精简: 已禁用 4 个调试/遥测服务并关闭 WiFi 后台扫描(pm disable 跨重启持久)");
+        logger_.Warn("BootTrim ignored: persistent package/settings changes are unsupported");
     }
 
     // ── BG_TRIM: 周期性回收后台内存(ASB asb_bg_trim_*)。绝不杀进程/不动前台, 只 send-trim-memory。 ──
@@ -124,33 +137,70 @@ public:
 private:
     Logger& logger_;
     Utils&  utils_;
+    kin::WifiPowerSave wifi_;
+    kin::OwnedSettings settings_;
+    struct NodeIo {
+        std::string read(const std::string& path) {
+            const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+            if (fd < 0) return {};
+            char buf[4097];
+            size_t used = 0;
+            while (used < sizeof(buf)) {
+                const auto n = ::read(fd, buf + used, sizeof(buf) - used);
+                if (n > 0) { used += static_cast<size_t>(n); continue; }
+                if (n < 0 && errno == EINTR) continue;
+                if (n < 0) { close(fd); return {}; }
+                break;
+            }
+            close(fd);
+            if (used == sizeof(buf)) return {};
+            while (used && (buf[used-1] == '\n' || buf[used-1] == '\r' ||
+                            buf[used-1] == ' ' || buf[used-1] == '\t')) --used;
+            return std::string(buf, used);
+        }
+        bool write(const std::string& path, const std::string& value) {
+            return kin::writeExistingNode(path.c_str(), value).ok();
+        }
+    };
+    struct WifiIo {
+        Utils& utils;
+        std::string readIw() {
+            char buf[128];
+            utils.popenRead("iw dev wlan0 get power_save 2>/dev/null", buf, sizeof(buf));
+            return kin::parseWifiPowerSave(buf);
+        }
+        bool writeIw(const std::string& value) {
+            if (value != "on" && value != "off") return false;
+            const std::string cmd = "iw dev wlan0 set power_save " + value + " >/dev/null 2>&1";
+            return system(cmd.c_str()) == 0;
+        }
+        std::string readNode() {
+            char buf[16];
+            readFirstLine("/sys/module/wlan/parameters/wlan_pm", buf, sizeof(buf));
+            std::string value(buf);
+            while (!value.empty() && (value.back() == '\n' || value.back() == '\r')) value.pop_back();
+            return value == "0" || value == "1" ? value : std::string();
+        }
+        bool writeNode(const std::string& value) {
+            if (value != "0" && value != "1") return false;
+            return kin::writeExistingNode("/sys/module/wlan/parameters/wlan_pm", value).ok();
+        }
+    };
 
     void wsys(const char* path, const char* val) {
         if (!val || !*val) return;
-        // 普通 sysctl/sysfs 参数统一采用读后比较：同值不写，外部模块改过后
-        // 下一次应用仍会重新核对真实节点值。FileWriteIfChangedBlocking 不创建
-        // 缺失节点，保留 FileWriteExisting 的能力边界。
-        if (!utils_.FileWriteIfChangedBlocking(path, string_t(val))) {
+        NodeIo io;
+        if (!settings_.apply(path, val, io)) {
             // 缺失节点和只读节点都按单项能力不可用处理，不影响其它调优项。
             logger_.Debug("系统调优节点不可用: %s", path ? path : "(null)");
         }
     }
-    void sh(const std::string& cmd) {
-        char b[8];
-        utils_.popenRead((cmd + " >/dev/null 2>&1").c_str(), b, sizeof(b));
-    }
     void applyWifi(const char* pm, const char* txqlen) {
-        if (pm && strcmp(pm, "on") == 0) {
-            sh("iw dev wlan0 set power_save on");
-            wsys("/sys/module/wlan/parameters/wlan_pm", "1");
-        } else if (pm && strcmp(pm, "off") == 0) {
-            sh("iw dev wlan0 set power_save off");
-            wsys("/sys/module/wlan/parameters/wlan_pm", "0");
-        }
-        // "auto": 不强制, 交回系统默认
+        WifiIo io{utils_};
+        if (!wifi_.apply(pm ? pm : "auto", true, io))
+            logger_.Debug("WiFi power-save unavailable or restore pending");
         if (txqlen && *txqlen) {
             wsys("/sys/class/net/wlan0/tx_queue_len", txqlen);
-            sh(std::string("ip link set wlan0 txqueuelen ") + txqlen);
         }
     }
     // 前台跳过; 对该包所有 pid 发 trim(am send-trim-memory, 软回收不杀进程)
@@ -173,34 +223,17 @@ private:
         if (strstr(avail, "bbr"))        wsys("/proc/sys/net/ipv4/tcp_congestion_control", "bbr");
         else if (strstr(avail, "cubic")) wsys("/proc/sys/net/ipv4/tcp_congestion_control", "cubic");
     }
-    // ── tcp_mem 动态按本机 RAM(移植 ASB: 页数=MemTotal_kB/4; low 3% / pressure 6% / high 10%) ──
+    // tcp_mem counts native pages, including Android devices with 16 KiB pages.
     void applyTcpMem() {
         long kb = readMemTotalKb();
         if (kb <= 0) return;
-        long pg = kb / 4;                 // 4KB 页
+        const long pageBytes = sysconf(_SC_PAGESIZE);
+        if (pageBytes < 1024) return;
+        long pg = kb / (pageBytes / 1024);
         long low = pg * 3 / 100, pressure = pg * 6 / 100, high = pg / 10;
         char buf[64];
         snprintf(buf, sizeof(buf), "%ld %ld %ld", low, pressure, high);
         wsys("/proc/sys/net/ipv4/tcp_mem", buf);
-    }
-    // ── swappiness 镜像 OxygenOS 私有属性(仅当属性已存在才 resetprop, 不新建; 移植 ASB V57 service.sh) ──
-    void mirrorSwappinessProps(const char* val) {
-        if (!val || !*val) return;
-        static const char* kProps[] = {
-            "sys.sysctl.swappiness", "sys.mem.swappiness_on_launcher", "sys.mem.swappiness_on_start"
-        };
-        for (const char* p : kProps) {
-            char cur[48]; cur[0] = '\0';
-            char cmd[128];
-            snprintf(cmd, sizeof(cmd), "getprop %s", p);
-            utils_.popenRead(cmd, cur, sizeof(cur));
-            bool exists = false;
-            for (const char* c = cur; *c; ++c)
-                if (*c != '\n' && *c != '\r' && *c != ' ' && *c != '\t') { exists = true; break; }
-            if (!exists) continue;         // 属性不存在 → 不新建(同 ASB 语义)
-            snprintf(cmd, sizeof(cmd), "resetprop %s %s", p, val);
-            sh(cmd);
-        }
     }
     long readMemTotalKb() {
         FILE* f = fopen("/proc/meminfo", "r");

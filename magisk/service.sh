@@ -14,29 +14,7 @@ log_msg() {
 
 log_msg "service.sh 启动"
 
-cleanup_legacy() {
-  for d in \
-    /data/adb/modules/CoreTurboScheduler \
-    /data/adb/modules/Oxygen \
-    /data/adb/modules/Kinetic \
-    /data/adb/modules/CTS \
-    /data/adb/modules/Kin_legacy \
-    /data/adb/modules/OPGCE \
-    /data/adb/modules/BSwitcher \
-    /data/adb/modules/cosa_injector \
-    /data/adb/modules/qinghe8e \
-    /data/adb/modules/Thread_Config_replace \
-    /data/adb/modules/Scene_Config_replace \
-    /data/adb/modules/Config_Mount
-  do
-    [ -n "$d" ] && [ "$d" != "$MODDIR" ] && [ -d "$d" ] && {
-        command -v chattr >/dev/null 2>&1 && chattr -R -i "$d" 2>/dev/null
-        rm -rf "$d" 2>/dev/null
-        log_msg "已清理旧子模块: $d"
-    }
-  done
-}
-cleanup_legacy
+# Other modules belong to the user; resolve conflicts in the module manager.
 
 wait_boot_completed() {
   i=0

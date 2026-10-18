@@ -95,6 +95,11 @@ if(BUILD_TESTING AND NOT ANDROID)
     target_include_directories(kin_test_owned_node PRIVATE ${CMAKE_SOURCE_DIR}/include)
     add_test(NAME kin_owned_node COMMAND kin_test_owned_node)
 
+    add_executable(kin_test_owned_settings tests/test_owned_settings.cpp)
+    target_include_directories(kin_test_owned_settings PRIVATE ${CMAKE_SOURCE_DIR}/include)
+    add_test(NAME kin_owned_settings COMMAND kin_test_owned_settings)
+
+
     add_executable(kin_test_node_writer tests/test_node_writer.cpp)
     target_include_directories(kin_test_node_writer PRIVATE ${CMAKE_SOURCE_DIR}/include)
     add_test(NAME kin_node_writer COMMAND kin_test_node_writer)
@@ -142,6 +147,31 @@ if(BUILD_TESTING AND NOT ANDROID)
     target_include_directories(kin_test_policy_resolver PRIVATE ${CMAKE_SOURCE_DIR}/include)
     add_test(NAME kin_policy_resolver COMMAND kin_test_policy_resolver)
 
+    add_executable(kin_test_autofsm tests/test_autofsm.cpp)
+    target_include_directories(kin_test_autofsm PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/tests)
+    target_link_libraries(kin_test_autofsm PRIVATE Threads::Threads)
+    add_test(NAME kin_autofsm COMMAND kin_test_autofsm)
+
+    add_executable(kin_test_smart_learning tests/test_smart_learning.cpp)
+    target_include_directories(kin_test_smart_learning PRIVATE ${CMAKE_SOURCE_DIR}/include)
+    add_test(NAME kin_smart_learning COMMAND kin_test_smart_learning)
+
+    add_executable(kin_test_probe_cadence tests/test_probe_cadence.cpp)
+    target_include_directories(kin_test_probe_cadence PRIVATE ${CMAKE_SOURCE_DIR}/include)
+    add_test(NAME kin_probe_cadence COMMAND kin_test_probe_cadence)
+
+    add_executable(kin_test_idle_uclamp tests/test_idle_uclamp.cpp)
+    target_include_directories(kin_test_idle_uclamp PRIVATE ${CMAKE_SOURCE_DIR}/include)
+    add_test(NAME kin_idle_uclamp COMMAND kin_test_idle_uclamp)
+
+    add_executable(kin_test_thermal_decision tests/test_thermal_decision.cpp)
+    target_include_directories(kin_test_thermal_decision PRIVATE ${CMAKE_SOURCE_DIR}/include)
+    add_test(NAME kin_thermal_decision COMMAND kin_test_thermal_decision)
+
+    add_executable(kin_test_power_boost_node tests/test_power_boost_node.cpp)
+    target_include_directories(kin_test_power_boost_node PRIVATE ${CMAKE_SOURCE_DIR}/include)
+    add_test(NAME kin_power_boost_node COMMAND kin_test_power_boost_node)
+
     add_executable(kin_test_window_focus tests/test_window_focus.cpp)
     target_include_directories(kin_test_window_focus PRIVATE ${CMAKE_SOURCE_DIR}/include)
     add_test(NAME kin_window_focus COMMAND kin_test_window_focus)
@@ -150,10 +180,21 @@ if(BUILD_TESTING AND NOT ANDROID)
     add_test(NAME kin_appprofile COMMAND kin_test_appprofile)
 
     add_executable(kin_test_skin_thermal tests/test_skin_thermal.cpp)
+    target_include_directories(kin_test_skin_thermal PRIVATE ${CMAKE_SOURCE_DIR}/include)
     add_test(NAME kin_skin_thermal COMMAND kin_test_skin_thermal)
+
+    add_executable(kin_test_package_name tests/test_package_name.cpp)
+    target_include_directories(kin_test_package_name PRIVATE ${CMAKE_SOURCE_DIR}/include)
+    add_test(NAME kin_package_name COMMAND kin_test_package_name)
+
+    add_executable(kin_test_wifi_power_save tests/test_wifi_power_save.cpp)
+    target_include_directories(kin_test_wifi_power_save PRIVATE ${CMAKE_SOURCE_DIR}/include)
+    add_test(NAME kin_wifi_power_save COMMAND kin_test_wifi_power_save)
 
     if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux")
         find_package(Python3 REQUIRED COMPONENTS Interpreter)
+        add_test(NAME kin_build_pack
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/test_build_pack.py)
         add_test(NAME kin_module_scripts
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/test_review_scripts.py)
         add_executable(kin_test_metrics_clients tests/test_metrics_clients.cpp)

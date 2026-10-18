@@ -32,16 +32,20 @@ Use it standalone by writing `mode.txt`, or pair it with the GUI front-end [Kin 
 - 🧠 **Smart mode (auto)** — six-state load FSM + self-learned power bias + sleep-schedule learning + questionnaire correction; per-state frequency caps (`fsm_policy`) and per-category caps / core parking (`app_policy`)
 - 🎮 **FAS (frame-aware scheduling)** — closed-loop `scaling_max` control from measured FPS while gaming: steady frames → lower clocks to save power, dropped frames → open up instantly
 - 🌀 **FengChi governor switch** — apps profiled as *FengChi game* switch to `hmbird`/`scx` on game entry (fallback `walt`/`sugov_ext`), restored on exit; mutually exclusive with FAS per app
-- 🧵 **Thread allocation** — AppOpt-compatible `applist.prop` per-thread affinity + realtime priority (SCHED_FIFO/RR) + `cpu.shares` weighting + render-thread fast path for the game library + app blacklist
-- 🌐 **System-level tuning (ported from ASB)** — per-mode VM/network/WiFi tuning, boot-time trim, background memory trim
+- **System-level tuning (ported from ASB)** — per-mode VM/network/WiFi tuning and background memory trim
 
 ## Quick start
+
+Vendor-cap attack writes and boot-time property/bind-mount overrides are removed. Legacy attack and BootTrim options no longer enable those actions. SysTune snapshots VM/TCP/queue values and conditionally restores them on disable or graceful shutdown, retrying failures. Ownership is in-memory, not a crash-recovery journal. Persistent settings changed by older versions require checking against the original device configuration.
+
+Upgrades preserve existing `config.json` and App data; signature conflicts never trigger automatic App removal. Uninstall keeps Kin settings, profiles and learning data. Boot scripts no longer spoof shell temperature, stop horae or mask vendor frequency limits. Reboot after upgrading from older builds to clear their existing runtime changes.
+
+Set `ANDROID_NDK` and run `python build_pack.py` to build and pack `output/Kinetic` without changing committed module assets. `pack` requires that build output and never falls back to the bundled binary. The bundled APK is retained unless `KIN_APK` explicitly selects a replacement.
 
 ```
 /sdcard/Android/Kin/
 ├── config.json      # main config (hot-reloaded)
 ├── mode.txt         # current mode
-├── applist.prop     # thread-affinity rules (AppOpt compatible)
 └── log.txt          # runtime log
 ```
 
@@ -56,6 +60,10 @@ echo "auto"        > /sdcard/Android/Kin/mode.txt   # smart self-learning mode
 ```
 
 ## Smart mode (auto)
+
+This is heuristic adaptation, not validated energy optimization. Apps, brightness and network conditions affect session current; reward signals alone do not establish power or performance gains. Validate with matched workloads on the target device.
+
+Wi-Fi power saving is changed only after reading its original state. Balance mode, disabling SysTune and graceful shutdown conditionally restore values still owned by Kin; failed restores remain pending. Forced termination cannot guarantee restoration. Other modules are not deleted at boot; resolve conflicts in the module manager.
 
 The learning/decision algorithm is ported from [AutoSystemBoost](https://github.com/krilikd/AutoSystemBoost)'s Smart Mode (MIT, © Dima Krylov): 12-bucket habit learning, confidence gating, graded fallback, night / thermal-veto / low-battery overrides.
 
@@ -84,7 +92,7 @@ Rule of thumb: `down_rate_limit_us ≤ 4000` in powersave/balance is the key to 
 {
     "meta": { ... },            // basic info
     "Policy": { ... },          // CPU cluster index (c0/c1/... → policyN)
-    "Function": { ... },        // feature switches (AutoMode / ThreadAlloc / SysTune / ...)
+    "Function": { ... },        // feature switches (AutoMode / SysTune / ...)
     "package_blacklist": [...], // apps never taken over
     "models": [ ... ]           // per-profile frequency configs (game_heavy / video / ...)
 }

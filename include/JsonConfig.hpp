@@ -300,6 +300,8 @@ public:
         AutoMode::cool_lean = ""; AutoMode::battery_bias = 0;
         AutoMode::dt_vhot = 80; AutoMode::dt_hot = 40; AutoMode::dt_drainy = 30;
         AutoMode::dt_sustained = 20; AutoMode::dt_thermal_hit = 100; AutoMode::dt_clean_cool = -60;
+        AutoMode::dt_thermal_hit_skin_cool = 50;
+        AutoMode::bg_uclamp_enable = true; AutoMode::bg_uclamp_cap = 18;
         AutoMode::explore_enable = true; AutoMode::explore_pct = 4;
         AutoMode::explore_offset = 60; AutoMode::reward_step = 8;
         AutoMode::anticlamp_enable = true; AutoMode::anticlamp_soft_pct = 70;
@@ -671,6 +673,11 @@ private:
                 readInt (a, "dt_drainy",      AutoMode::dt_drainy);
                 readInt (a, "dt_sustained",   AutoMode::dt_sustained);
                 readInt (a, "dt_thermal_hit", AutoMode::dt_thermal_hit);
+                readInt (a, "dt_thermal_hit_skin_cool", AutoMode::dt_thermal_hit_skin_cool);
+                readBool(a, "bg_uclamp_enable", AutoMode::bg_uclamp_enable);
+                readInt (a, "bg_uclamp_cap",    AutoMode::bg_uclamp_cap);
+                if (AutoMode::bg_uclamp_cap < 0)   AutoMode::bg_uclamp_cap = 0;
+                if (AutoMode::bg_uclamp_cap > 99)  AutoMode::bg_uclamp_cap = 99;
                 readInt (a, "dt_clean_cool",  AutoMode::dt_clean_cool);
                 // 探索 + 奖励闭环
                 readBool(a, "explore_enable", AutoMode::explore_enable);
@@ -695,7 +702,8 @@ private:
                 if (AutoMode::anticlamp_backoff  < 0)   AutoMode::anticlamp_backoff  = 0;
                 if (AutoMode::anticlamp_backoff  > 200) AutoMode::anticlamp_backoff  = 200;
                 // anti-clamp 攻击侧(主动对抗抬频; 默认关)
-                readBool(a, "anticlamp_attack_enable", AutoMode::anticlamp_attack_enable);
+                // Legacy key is accepted but cannot enable vendor-limit overrides.
+                AutoMode::anticlamp_attack_enable = false;
                 readInt (a, "anticlamp_attack_temp",   AutoMode::anticlamp_attack_temp);
                 readInt (a, "anticlamp_attack_hold",   AutoMode::anticlamp_attack_hold);
                 readInt (a, "anticlamp_attack_probe",  AutoMode::anticlamp_attack_probe);

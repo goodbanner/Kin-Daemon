@@ -101,7 +101,17 @@ namespace Config {
         inline int      dt_drainy      = 30;  // 高耗电(掉电率≥drain_high 或均流≥1200mA): +30
         inline int      dt_sustained   = 20;  // 持续重载(GPU 重载多数 或 暖 tick 多数): +20
         inline int      dt_thermal_hit = 100; // 触发热否决(峰温≥veto_temp): +100
+        inline int      dt_thermal_hit_skin_cool = 50; // 同上但皮肤仍凉(<40℃): +50(ASB V64)
+                                              //   结温触发 throttle 而皮肤没热→散热吃住了、用户没感觉, 只加一半推力;
+                                              //   无物理外壳传感器时仍用 dt_thermal_hit 满推力。
         inline int      dt_clean_cool  = -60; // 干净凉爽会话(CLEAN 且峰温<cool_temp): -60(唯一负向项)
+
+        // ── 息屏背景 uclamp 上限(ASB V64) ──
+        // DEEP_IDLE(息屏)时把 background / system-background 的 cpu.uclamp.max 压到 cap 以下。
+        // 上游实测 140 mA → 50 mA。只压不抬, 离开 DEEP_IDLE 条件还原原值; 内核无接口则整段跳过。
+        // 真机上若发现息屏后大文件下载/备份变慢, 把 enable 设 false 即可(会立即还原)。
+        inline bool     bg_uclamp_enable = true;   // 总开关
+        inline int      bg_uclamp_cap    = 18;     // 上限百分比(1..99); 18=上游值, 0=不压
 
         // ── 探索 + 奖励闭环(补齐"纯利用零探索/无奖励"的最致命缺点) ──
         // 仅在已过门控(conf≥350)的桶里, 以小概率对本会话 alpha 做 ±explore_offset 的小扰动;
@@ -481,6 +491,30 @@ namespace Config {
                 if (idx >= 0) return idx;
             }
             return -1;
+        }
+    }
+
+    namespace AppProfile {
+        struct ForegroundDecision {
+            int matched = -1;
+            int selected = -1;
+            bool release = false;
+            bool applyProfile = false;
+        };
+
+        inline bool shouldApplyProfile(int selected) {
+            return enable && selected >= 0;
+        }
+
+        inline ForegroundDecision decideForeground(const char* pkg, bool autoActive) {
+            std::lock_guard<std::recursive_mutex> lk(profileMtx);
+            if (autoActive || !pkg || !*pkg) return {};
+            if (isBlacklisted(pkg)) return {-1, -1, true, false};
+            const int matched = findMatchingModel(pkg);
+            int selected = matched;
+            if (selected < 0 && !perAppGlobal.empty())
+                selected = findModelByName(perAppGlobal.c_str());
+            return {matched, selected, false, shouldApplyProfile(selected)};
         }
     }
 

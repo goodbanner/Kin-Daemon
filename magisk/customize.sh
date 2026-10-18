@@ -62,22 +62,6 @@ lock_file() {
     [ -e "$1" ] && chattr +i "$1" 2>/dev/null
 }
 
-# 安装时清理本项目的旧模块(改名前的代号), 免得新旧模块同时挂载互相打架。
-# CoreTurboScheduler / Oxygen / Kinetic / CTS 都是本项目历史 id; 当前 id 为 Kin。
-remove_legacy_modules() {
-    for base in /data/adb/modules /data/adb/modules_update /data/adb/ksu/modules /data/adb/ap/modules; do
-        for id in CoreTurboScheduler Oxygen Kinetic CTS Kin_legacy; do
-            d="$base/$id"
-            [ "$d" = "$MODPATH" ] && continue
-            [ -d "$d" ] || continue
-            command -v chattr >/dev/null 2>&1 && chattr -R -i "$d" 2>/dev/null
-            touch "$d/remove" 2>/dev/null     # 优雅卸载标记(重启移除)
-            rm -rf "$d" 2>/dev/null           # 直接删, KernelSU/部分 Magisk 立即生效
-            ui_print "  ↪ 已清理旧模块: $id"
-        done
-    done
-}
-
 deploy_cts_daemon() {
     ui_print "[INFO] 部署 Kin 调度调度进程 + 配置"
 
@@ -142,13 +126,18 @@ deploy_cts_daemon() {
     done
 
     command -v chattr >/dev/null 2>&1 && chattr -i "$CTS_DIR/config.json" 2>/dev/null
-    # config.json 每次安装/更新都覆盖为模块最新默认(确保拿到新频率表/新字段)。
-    # 注:学习状态 auto_state.txt 不在此处,更新不会被清除。
-    rm -f "$CTS_DIR/config.json" 2>/dev/null
-    cp -af "$SRC_CFG" "$CTS_DIR/config.json" 2>/dev/null
+    # Preserve user overrides on upgrade; publish defaults only on first install.
+    if [ ! -e "$CTS_DIR/config.json" ]; then
+        if cp "$SRC_CFG" "$CTS_DIR/config.json.tmp" 2>/dev/null \
+            && cmp -s "$SRC_CFG" "$CTS_DIR/config.json.tmp"; then
+            mv -f "$CTS_DIR/config.json.tmp" "$CTS_DIR/config.json" 2>/dev/null
+        else
+            rm -f "$CTS_DIR/config.json.tmp" 2>/dev/null
+        fi
+    fi
     cp -af "$SRC_CFG" "$MODPATH/config/.config_backup" 2>/dev/null
     if [ -s "$CTS_DIR/config.json" ]; then
-        ui_print "  ✓ config.json 已部署到 $CTS_DIR"
+        ui_print "  ✓ config.json 已就绪（升级保留用户配置）: $CTS_DIR"
     else
         ui_print "  ⚠️ config.json 部署失败"
     fi
@@ -222,15 +211,7 @@ install_cts_apk() {
 
     ui_print "[INFO] 安装内置 Kin 控制 APP..."
 
-    # 改名清理: 旧版包名(com.ktwo.cts / com.ktwo.kinetic / com.ktwo.oxygen)与新包 com.ktwo.kin 不同,
-    # 不会被覆盖安装替换 → 主动卸载旧 App, 免得桌面残留多个图标。学习/卡密已迁移到 /sdcard, 卸载不丢。
-    if command -v pm >/dev/null 2>&1; then
-        for oldpkg in com.ktwo.cts com.ktwo.kinetic com.ktwo.oxygen; do
-            if pm list packages 2>/dev/null | grep -q "$oldpkg\$"; then
-                pm uninstall "$oldpkg" >/dev/null 2>&1 && ui_print "  ↪ 已自动卸载旧版 App($oldpkg)"
-            fi
-        done
-    fi
+    # Never uninstall an existing App: its private data may not be backed up.
 
     if command -v pm >/dev/null 2>&1; then
         local size result
@@ -242,18 +223,10 @@ install_cts_apk() {
             rm -f "$MODPATH/.kin_apk_pending" "$MODPATH/Kin_pending.apk" 2>/dev/null
             return 0
         fi
-        # 签名不一致(旧版与本包 debug 签名不同)→ 覆盖装会被拒。
-        # 卸载旧包后全新安装;配置在 /sdcard/Android/Kin,卸载不受影响。
+        # Signature conflicts require an explicit user decision, not data deletion.
         if echo "$result" | grep -qiE "SIGNATURE|INSTALL_FAILED_UPDATE_INCOMPATIBLE|INCONSISTENT_CERTIFICATES|signatures do not match"; then
-            ui_print "  ℹ 签名不一致,卸载旧版后重装(配置保留在 /sdcard)..."
-            pm uninstall com.ktwo.cts >/dev/null 2>&1
-            result=$(pm install -d -S "$size" < "$APK" 2>&1) \
-                || result=$(pm install -d "$APK" 2>&1)
-            if echo "$result" | grep -qi "Success"; then
-                ui_print "  ✓ 卸载旧版后安装成功"
-                rm -f "$MODPATH/.kin_apk_pending" "$MODPATH/Kin_pending.apk" 2>/dev/null
-                return 0
-            fi
+            ui_print "  签名不一致，保留原 App 和数据，请手动处理。"
+            return 1
         fi
         ui_print "  ⚠️ 当前环境安装失败,改为开机后重试"
     else
@@ -268,29 +241,11 @@ install_cts_apk() {
 
 ui_print "Kin 安装开始"
 
-ui_print "清理旧版模块"
-LEGACY_MODS="Thread_Config_replace Config_Mount Scene_Config_replace Kin_legacy OPGCE BSwitcher qinghe8e"
-CLEANED=0
-for mid in $LEGACY_MODS; do
-    [ "$mid" = "Kin" ] && continue
-    for base in /data/adb/modules /data/adb/modules_update; do
-        target="$base/$mid"
-        if [ -d "$target" ]; then
-            command -v chattr >/dev/null 2>&1 && chattr -R -i "$target" 2>/dev/null
-            if rm -rf "$target" 2>/dev/null; then
-                CLEANED=$((CLEANED + 1))
-            else
-                ui_print "⚠️ 清理失败: $base/$mid"
-            fi
-        fi
-    done
-done
-[ "$CLEANED" -gt 0 ] && ui_print "已清理旧版模块: $CLEANED"
+ui_print "其他模块保持不变；请在模块管理器中停用冲突的调度模块。"
 
 command -v chattr >/dev/null 2>&1 && chattr -i /data/coreturbo_powermode 2>/dev/null
 rm -f /data/coreturbo_powermode 2>/dev/null
 
-remove_legacy_modules
 deploy_cts_daemon
 install_cts_apk
 

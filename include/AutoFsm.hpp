@@ -12,6 +12,13 @@
 // 频率界按 lerp(floor, ceil, level) 插值, 并由 Smart alpha 在 battery↔balanced 包络间混合。
 // 频率界常量取自 asb_fsm_bounds.generated.h(SM8850/骁龙8 Elite Gen5; 小核/大核)。
 //
+// 上游同步记录(对齐 ASB V65 module.prop / V64 Release Notes):
+//   · 频率界 12 个常量逐行核对 asb_fsm_bounds.generated.h, 与上游 V65 完全一致(无需改动)。
+//   · 已移植 V64「GAMING 需要包名表同意」(asb_fsm.h:1204 pkg_agrees) —— 见 update()/desired()。
+//   · 已移植 V64「MODERATE↔HEAVY / MODERATE↔SUSTAINED 多要一拍确认」(asb_fsm.h:2025)。
+//   · 未移植(需设备/架构前提, 见 OPTIMIZATION_PROGRESS.md): 皮肤温感知的 thermal_hit 权重、
+//     DEEP_IDLE 背景 uclamp 封顶 18%、争议传感器的 +1 拍确认(Kin 无 source_confidence 概念)。
+//
 // 适配 Kin: 只在 auto 模式接管 CPU 频率上下限(GPU 仍交基础档/守护), 且【App 画像优先时 FSM 让位】;
 // 其余模式(powersave/balance/performance/fast)完全不受影响。MIT→GPL-3.0 兼容, 保留上游版权声明。
 #pragma once
@@ -35,8 +42,13 @@ public:
 
     // 喂入本 tick 指标, 推进状态; 返回是否发生状态切换。gpu/temp 为 -1 表示未知。
     // gameHint=true: 前台是已知游戏 App → 直接判为 GAMING(不只看 GPU)。
+    // fgNotGame=true: 前台包名已被明确分类为【非游戏】(视频/社交/地图/音频…)。此时 GPU 单指标
+    //   不再把状态推到 GAMING(上游 V64)。类别未知(未分类的第三方游戏)传 false, 保持旧行为。
+    // thermalDisputed=true: 两个热源给出相反结论(见 ThermalDecision.hpp)。负载驱动的迁移多要一拍
+    //   确认(上游 V64); 热升档不受影响 —— 不确定只该买到延迟, 不该买到安全。
     bool update(int gpuPct, float load1, int tempC, int screenOn, int cpuBusy = -1, bool gameHint = false,
-                int currentMa = -1, bool charging = false) {
+                int currentMa = -1, bool charging = false, bool fgNotGame = false,
+                bool thermalDisputed = false) {
         if (!hwProbed_) probeHwmax();
         const State prev = state_;
         const long now = nowSec();
@@ -71,7 +83,7 @@ public:
                                    !(tempC >= 0 && tempC >= Config::AutoMode::fsm_warmup_bypass_temp));
         bool thermalToSustained = false;
         const State d = desired(gpuPct, load1, screenOn, tempC, cpuS, gameHint,
-                                currentMa, charging, warmupActive, thermalToSustained);
+                                currentMa, charging, warmupActive, thermalToSustained, fgNotGame);
 
         // 前台已知游戏 → 即时进入 GAMING(兑现 desired()「直接判 GAMING」的设计承诺), 跳过升档窗口确认。
         // 仅作用于上行进入 GAMING(gameHint 是用户配置的显式信号, 稳定不抖); 退出 GAMING 仍走
@@ -84,6 +96,20 @@ public:
         else               { pendingTicks_++; }
 
         int window = (d > state_) ? UP_WINDOW : DOWN_WINDOW;
+        // 上游 V64(移植): MODERATE↔HEAVY、MODERATE↔SUSTAINED 这两对相邻档位多要一拍确认。
+        // 现场日志: 一次会话 20 次切换里 14 次是 MODERATE↔HEAVY 来回, 而 CPU 负载全程只有 8.9% ——
+        // 不是两种负载在交替, 是在追一个自己会越过阈值的指标(GPU 在 0~61% 摆动)。每次切换 =
+        // 重算 caps + 一轮 sysfs 写 + 所有权检查, 约 4.5 次写; 短跳一档换不到性能, 只多付电压和热。
+        // 热限升档(thermalToSustained)豁免: 真烫必须立刻降档, 对传感器的不确定只该买到延迟。
+        if (!thermalToSustained &&
+            ((state_ == MODERATE && (d == HEAVY || d == SUSTAINED)) ||
+             ((state_ == HEAVY || state_ == SUSTAINED) && d == MODERATE)) &&
+            window < kPairConfirmWindow) {
+            window = kPairConfirmWindow;
+        }
+        // 上游 V64(移植): 两个热源打架时, 负载驱动的迁移再多要一拍。对传感器的不确定只该买到
+        // 延迟, 不该买到安全 —— 热升档(thermalToSustained)仍然不受影响。
+        if (thermalDisputed && !thermalToSustained) window += 1;
         // 热入 SUSTAINED 改用正常升档窗口(2 tick≈4s)确认, 不再单 tick 即跳 ——
         // 防性能核瞬时升温 + 一次负载尖峰就闪进/闪出「持续高负载」。
 
@@ -209,6 +235,8 @@ private:
     static constexpr int   CUR_MOD_MA       = 120;     // ≥120mA 单独判中载
     static constexpr int   UP_WINDOW        = 2;   // ×tick(2s)=4s 升档
     static constexpr int   DOWN_WINDOW      = 5;   // ×tick(2s)=10s 降档
+    // 上游 V64: 相邻档位对(MODERATE↔HEAVY / MODERATE↔SUSTAINED)的最少确认拍数, 见 update()。
+    static constexpr int   kPairConfirmWindow = 3;
     // 热限进/出温度改读 config(Function.AutoMode.fsm_sustained_enter/exit), 供 App 调节;
     // 默认 54/48(ASB V54 热经济档, 原 57/49; 见 Config.hpp:152-153)。解析时已保证 enter>exit。
     static int SUSTAINED_ENTER() { return Config::AutoMode::fsm_sustained_enter; }
@@ -340,7 +368,8 @@ private:
     static int lerp(int a, int b, float t) { return (int)(a + (b - a) * t + 0.5f); }
 
     State desired(int gpu, float load1, int screenOn, int tempC, int cpuBusy, bool gameHint,
-                  int currentMa, bool charging, bool warmupActive, bool& thermalToSustained) {
+                  int currentMa, bool charging, bool warmupActive, bool& thermalToSustained,
+                  bool fgNotGame) {
         thermalToSustained = false;
         if (screenOn == 0) return DEEP_IDLE;
 
@@ -352,6 +381,13 @@ private:
 
         if (gpu >= GAMING_GPU_ENTER) { if (gamingStreak_ < 100000) gamingStreak_++; }
         else if (gpu >= 0 && gpu < GAMING_GPU_EXIT) { gamingStreak_ = 0; }
+
+        // 上游 V64(移植): GPU 高≠游戏。视频播放、地图渲染、信息流动图同样能把 GPU 打满,
+        // 而 GAMING 是整条阶梯里护栏最松的一档 —— 误判要付热和电, 且正好落在最常见的刷信息流场景。
+        // 前台已被明确分类为非游戏时, GPU 单指标不再进 GAMING, 改按「CPU 在做什么」评级(与上游
+        // "graded by what the CPU is doing" 一致): GPU 重载仍到 HEAVY, 但要 CPU 一起忙才算。
+        // 类别未知时保持旧行为 —— 没被画像/系统类别覆盖的游戏不受影响。
+        const bool gamingByGpu = (gpu >= GAMING_GPU_ENTER) && !fgNotGame;
 
         // HEAVY 滞回: 已在 HEAVY/上层时用退出阈值, 否则用进入阈值(ASB heavy_gpu_exit)
         const int heavyGpuTh = (state_ >= HEAVY) ? HEAVY_GPU_EXIT : HEAVY_GPU_ENTER;
@@ -376,7 +412,7 @@ private:
         //             或(读不到 CPU% 时)电流单独佐证。
         //  ※ 已去掉"屏亮+GPU≥30→中载"的 UI 突发规则 —— 高刷屏日用(滚动/视频)GPU 常驻 50–60%,
         //    那条会把日常误判成中载; 日用应停在低负载, 触控由内核 input boost 自然提频。
-        if (gpu >= GAMING_GPU_ENTER)
+        if (gamingByGpu)
             d = (gamingStreak_ >= GAMING_CONFIRM) ? GAMING : HEAVY;
         else if (cpuHeavy || (gpuHeavy && cpuSome))
             d = (!maValid || currentMa >= CUR_HEAVY_MA) ? HEAVY : MODERATE;

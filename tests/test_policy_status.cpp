@@ -26,5 +26,21 @@ int main() {
         const auto taken = kin::policyStatusFields(decision, false, true, status);
         if (taken.find("last_write_result=unknown\n") == std::string::npos) return 5;
     }
-    std::puts("PASS policy status: CPU scope, ROM takeover, write result, safe tokens");
+    // 逐节点明细: 默认不输出(保持旧输出字节不变), 有明细时追加两个诊断键。
+    if (normal.find("last_write_nodes") != std::string::npos) return 6;
+    const auto detailed = kin::policyStatusFields(decision, false, false, kin::WriteStatus::Failed,
+                                                  "fsm_cpu_batch", "total=3,written=2,unchanged=0,failed=1",
+                                                  "/dev/cpuset/top-app/cpus");
+    if (detailed.find("\nlast_write_nodes=total=3,written=2,unchanged=0,failed=1\n") == std::string::npos ||
+        detailed.find("\nlast_write_failed=/dev/cpuset/top-app/cpus\n") == std::string::npos) return 7;
+    const auto cleanBatch = kin::policyStatusFields(decision, false, false, kin::WriteStatus::Unchanged,
+                                                    "fsm_cpu_batch", "total=2,written=0,unchanged=2,failed=0");
+    if (cleanBatch.find("last_write_nodes=total=2") == std::string::npos ||
+        cleanBatch.find("last_write_failed") != std::string::npos) return 8;
+    // 风驰接管时整批未执行, 不得附带节点明细。
+    const auto takenDetailed = kin::policyStatusFields(decision, false, true, kin::WriteStatus::Written,
+                                                       "fsm_cpu_batch", "total=1,written=1,unchanged=0,failed=0",
+                                                       "/dev/cpuset/cpus");
+    if (takenDetailed.find("last_write_nodes") != std::string::npos) return 9;
+    std::puts("PASS policy status: CPU scope, ROM takeover, write result, per-node detail, safe tokens");
 }

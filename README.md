@@ -35,11 +35,10 @@
   每状态频率上限可自定义(fsm_policy),按应用分类封顶/关核省电(app_policy)
 - 🎮 **FAS 帧感知调频** —— 游戏内按实际帧率闭环调 scaling_max:帧稳降频省电,掉帧秒放开追帧
 - 🌀 **风驰调度交接** —— 「风驰游戏」档解除 Kin 的频率上限并放权 governor，由 ROM/风驰(hmbird/scx 等)接管；Kin 不强制写兜底 governor，与 FAS 按应用互斥
-- 🧵 **线程分配** —— AppOpt 兼容 applist.prop 逐线程绑核 + 实时优先级(SCHED_FIFO/RR) + cpu.shares 权重 + 游戏库渲染线程快路径 + 应用黑名单
 - ⚙️ **governor 自主调频** —— 用 `up_rate_limit_us` / `down_rate_limit_us` / `hispeed_load` 精细控制升降频节奏
 - 📉 **真正能降频** —— 修复退出游戏后 SchedParam 不还原、场景频繁重写上限导致 CPU 粘高频的老问题
 - 🧩 **配置精简** —— 常用模块默认开启,config 只写需要覆盖的部分
-- 🌐 **系统级调优(移植 ASB)** —— 每档 VM/网络/WiFi 调优 + 开机停调试服务 + BG_TRIM 后台内存回收
+- **系统级调优(移植 ASB)** —— 每档 VM/网络/WiFi 调优 + BG_TRIM 后台内存回收
 
 ### 系统级优化（移植自 AutoSystemBoost，非 CPU 部分）
 
@@ -48,10 +47,22 @@
 | 开关 | 默认 | 作用（ASB 真值） |
 |---|---|---|
 | `SysTune.enable` | **开** | 每档 VM(`swappiness`/`dirty_*`/`vfs_cache_pressure`) + 网络(`tcp_rmem/wmem`/`fastopen`/`keepalive`/V57 TCP 与缓冲节点) + WiFi(`power_save`/`tx_queue_len`)。省电档省、性能档激进；仅写已存在节点，缺失能力跳过并记录，重启自动还原。 |
-| `BootTrim.enable` | 关 | 开机一次性禁用 4 个纯分析/遥测服务(midas/olc/crashbox/logkit) + 关 WiFi 后台扫描。⚠️ `pm disable` 跨重启持久。 |
+| `BootTrim.enable` | 已停用 | 旧开关保留兼容，不再永久禁用系统包或修改 WiFi 扫描设置。 |
 | `BgTrim.enable` | 关 | 周期性软回收后台内存(`am send-trim-memory`)：重度社交/流媒体常驻回收，息屏再回收相册/音乐工作集。**绝不杀进程、不动前台/系统应用**(同 ASB)。`interval_s` 默认 90。 |
 
 > 不移植 ASB 的音频/相机 vendor 分区改写——那属另一类模块，不塞进 CPU 调度器。
+
+Wi-Fi 节能接管前先读取原值；切回均衡档、关闭 SysTune 或守护正常退出时，仅在当前值仍由 Kin 持有时恢复。读不到原值则跳过接管；恢复失败保留待恢复状态。强制终止或设备断电不保证执行恢复。
+
+SysTune 的 VM、TCP 和发送队列节点也记录原值，关闭 SysTune 或正常退出时条件恢复，失败由现有巡检重试；不再镜像 ROM 属性。恢复记录仅在进程内，尚不支持崩溃后的持久化重放。`post-fs-data.sh` 不再设置系统属性或使用 bind-mount 禁用 GPU/帧提频。旧版写入的持久属性和禁用包不能凭猜测恢复，需要按原始配置核对。
+
+模块不会在开机时删除其他模块；如有调度冲突，请在模块管理器中自行停用冲突项。
+
+安装升级保留已有 `config.json` 和 App 数据，APK 签名冲突时不自动卸载旧 App；卸载模块保留 Kin 的应用策略和学习数据。首次安装才写入默认主配置。
+
+启动脚本不再伪造外壳温度、停止 horae 或遮蔽厂商限频接口。从旧版升级后需要重启，才能清除旧启动脚本已经建立的挂载和运行时修改。未经过真机验收的构建应先备份再测试。
+
+本地打包：设置 `ANDROID_NDK` 后运行 `python build_pack.py`，直接从新编译的 `output/Kinetic` 生成 ZIP；`pack` 子命令也只使用该路径，不回退到仓库内的旧二进制。默认沿用内置 APK，指定 `KIN_APK` 可显式替换。
 
 > **设计思路**参考 [yumi](https://github.com/imacte/yumi) 与 [MW_CpuTurboScheduler](https://github.com/MoWei-2077/MW_CpuTurboScheduler)。
 >
@@ -85,6 +96,8 @@ echo "auto"        > /sdcard/Android/Kin/mode.txt   # 自动（按温度/电量/
 
 ## 自动模式（auto）——自适应自学习
 
+这里的“自学习”是基于时段、温度和电流反馈的启发式自适应，不是经过同负载对照验证的能效最优化。不同应用、亮度和网络条件会影响会话均流，奖励信号不能单独证明调参带来省电或性能收益。效果需要在具体设备上用相同工作负载验证。
+
 `auto` 的**学习/决策算法移植自 [AutoSystemBoost](https://github.com/krilikd/AutoSystemBoost) 的
 Smart Mode**（真实源码 `asb_smart_defs.h` / `asb_smart.h`，MIT，© Dima Krylov），
 忠实复刻其 12 桶学习、置信门控、分级回退、夜间/热否决/低电覆盖与阈值常量；
@@ -117,9 +130,7 @@ battery↔balanced 包络间混合后直接写各簇。频率界常量按 SM8650
   避免"刚开游戏/应用的加载发热尖峰"把人卡一下；温度 ≥ `fsm_warmup_bypass_temp`（默认 60℃）则旁路、照常降频，不牺牲热安全。设 0 关闭。
 - 想关掉回到"按 alpha 选整档"：`Function.AutoMode.fsm_enable = false`。
 
-> **anti-clamp（厂商压频对抗）移植进度**：检测 + 遥测 + 软钳降激进（第 1 步）已移植；**主动「抬频对抗」的攻击侧
-> 现已补齐，但默认关闭**（`anticlamp_attack_enable=false`）——需先用第 1 步遥测在真机确认 headroom 信号是活的再开
-> （见下方「anti-clamp 攻击侧」与 SM8850 提醒）。其余 ASB 细节（warmup grace、re-entry blocking 等）仍未移植。
+> **厂商压频保护**：保留检测、遥测和软钳降激进；主动抬高厂商频率上限的功能已停用，旧 `anticlamp_attack_enable` 配置不会重新启用它。
 
 **自学习（每桶 `alpha` 0–1000 越大越省电 + 置信度，逐项对照 ASB 真源码 `asb_smart.h`）**：
 每个亮屏会话结束按方向信号累加 `dt_alpha`（极热≥80℃ +80 / 热≥70℃ +40 / 高耗电 +30 /
@@ -157,24 +168,7 @@ battery↔balanced 包络间混合后直接写各簇。频率界常量按 SM8650
 > 标 `headroom_valid=0`、**只遥测不参与决策**；之后连续 5 次合理读数再恢复。所以即使信号不可靠也不会乱调。
 > 设 `anticlamp_backoff=0` 可让第 1 步退化成"纯遥测不调频"。
 
-**anti-clamp 攻击侧（主动对抗抬频，第 2 步，默认关）**：在第 1 步检测之上补主动对抗——**只在游戏态（FSM=GAMING）**
-且检测到**疑似厂商压频**（硬钳且温度不高，即 `vendor_clamp=1`）时，直接回写厂商节点
-`msm_performance/cpu_max_freq`，把各簇上限顶回**本簇硬件最高频**（每簇用首核=policy 号代表，格式 `pol:freq`），
-抢回被厂商无谓压掉的频率，让 FSM 刚写的 `scaling_max` 真正生效。**温度 ≥ `anticlamp_attack_temp`（默认 46℃）
-/ 离开游戏态 / 关检测总开关 → 立即收手**，并按进入时捕获的真实 headroom 比例还原各簇钳值，把控制权安全交回厂商
-（**热优先，绝不把过热机器解钳顶满**）。
-
-> **自遮蔽处理**：抢频后该节点回读会变满频（`headroom=100`），若直接据此判定会误以为"钳已解除"而每 tick 抖动。
-> 故进入对抗后按 `anticlamp_attack_hold`（默认 8 tick）**硬保持**（忽略被自写遮蔽的读数，仅凭游戏态+温度维持），
-> 到点后停写 `anticlamp_attack_probe`（默认 4 tick）**探测真值**，再决定是否复抢；断言期间也不计入死信号检测。
-> 遥测新增 `anticlamp_attack`（0 无 / 1 抢频 / 2 收手 / 3 退避或已放弃）与 `anticlamp_attack_total`（累计抢频 tick）写进 `auto_status.txt`。
-> **默认关**：`anticlamp_attack_enable=true` 才启用。建议先用第 1 步遥测确认 `headroom_valid` 常为 1、`vendor_clamp` 真有触发再开。
-
-> **预算 / 退避 / 放弃（对照上游 ASB `asb_governor.c` 的 budget/BACKOFF/futility，防"写了没用"的机器无限抢频）**：
-> 每个游戏会话给 `anticlamp_attack_budget`（默认 6）次抢频预算，耗尽后**退避** `anticlamp_attack_backoff_s`（默认 30s）
-> 再回满预算重试；累计退避达 `anticlamp_attack_max_backoffs`（默认 2）次仍耗尽 → **本会话彻底放弃**（只遥测、不再动节点）。
-> 离开游戏态 / 过热收手 / 关开关时整会话复位，下个游戏会话重新开始。这样即使在 headroom 节点假死或内核忽略写入的机器上，
-> 也不会每帧白写厂商节点。
+**主动抬频已移除**：不再写厂商频率上限，也不使用旧快照覆盖厂商后续限制。`anticlamp_attack` 和 `anticlamp_attack_total` 保留协议字段，恒为 0。
 
 **覆盖层（安全优先，上抬 alpha 并与学习叠加，强制值同 ASB）**：
 - 夜间安全：时段∈{睡,深夜,醒} + 息屏 + 未充电 → `alpha≥900`
@@ -222,14 +216,7 @@ battery↔balanced 包络间混合后直接写各簇。频率界常量按 SM8650
         "anticlamp_hard_pct": "45",   // headroom<此% 且温度不高=疑似厂商压频(计 1h 计数)
         "anticlamp_backoff": "40",    // 软钳时上抬 alpha 的幅度(设 0=只遥测、不调频)
 
-        // ── anti-clamp 攻击侧(第2步: 主动对抗抬频; 默认关, 真机验证 headroom 活后再开) ──
-        "anticlamp_attack_enable": "false", // 攻击侧总开关; true=游戏态遇疑似厂商压频时回写厂商节点抢回上限
-        "anticlamp_attack_temp": "46",      // 温度≥此值(℃)绝不抢频/立即收手(热安全硬闸; 30..95)
-        "anticlamp_attack_hold": "8",       // 进入对抗后强制保持的 tick 数(忽略自遮蔽读数; 1..120)
-        "anticlamp_attack_probe": "4",      // hold 到点后停写探测真值的 tick 数(1..120)
-        "anticlamp_attack_budget": "6",       // 每游戏会话抢频次数预算(耗尽→退避; 1..50)
-        "anticlamp_attack_backoff_s": "30",   // 预算耗尽后退避秒数(到点回满预算重试; 1..600)
-        "anticlamp_attack_max_backoffs": "2", // 累计退避达此次仍耗尽→本会话彻底放弃(1..10)
+        // 旧 anticlamp_attack_* 字段仅兼容读取，不执行主动抬频。
 
         // ── 置信度方差修正 + eff_obs 滑窗 ──
         "conf_var_enable": "true",    // 置信度乘"桶内一致性因子"; false=回到纯样本计数(原行为)

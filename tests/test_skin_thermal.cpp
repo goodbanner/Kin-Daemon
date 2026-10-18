@@ -1,14 +1,9 @@
-// 验证皮肤锚定决策温 thermalDecisionC 的安全兜底(复刻 AutoMode.hpp 的逻辑与默认值)
+// Exercise the decision function used by AutoModeCtl, not a test-side copy.
+#include "ThermalDecision.hpp"
 #include <cstdio>
 static int veto_temp=60, skin_temp=47, junction_hard=100; static bool gate=true;
-static int maxi(int a,int b){return a>b?a:b;}
 int thermalDecisionC(int tempC,int skinC){
-    if(!gate) return tempC;
-    int s=skinC;
-    if(s<=5||s>=70) return tempC;                  // sentinel/坏读/极端→回退结温(下界5, 与死传感器判据对齐)
-    int td=s+(veto_temp-skin_temp);
-    if(junction_hard>0 && tempC>=0 && tempC>=junction_hard) td=maxi(td,veto_temp);
-    return td;
+    return kin::thermalDecisionC(tempC,skinC,gate,veto_temp,skin_temp,junction_hard);
 }
 int main(){
   struct C{const char*n;int tj,sk,want;bool vetoWant;};
