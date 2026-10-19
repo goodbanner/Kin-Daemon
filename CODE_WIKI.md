@@ -800,32 +800,13 @@ python3 build_pack.py
 - `workflow_dispatch` 或打 tag 触发 bundle + GitHub Release
 - 滚动发布（nightly）：手动触发，发布到公开 Releases
 
-### 7.5 License Server 部署
+### 7.5 授权服务部署（外部私有组件）
 
-#### Docker（[Dockerfile](license-server/Dockerfile)）
+授权服务（Express.js + libSQL/Turso）负责卡密生成/校验、设备绑定、支付回调与后台管理，
+**不随本仓库分发**，部署方式、环境变量与数据库结构见其所属私有仓库。
 
-```bash
-cd license-server
-docker build -t kin-license .
-docker run -p 3000:3000 \
-  -e DATABASE_URL=... \
-  -e JWT_SECRET=... \
-  -e LICENSE_SIGNING_PRIVATE_KEY=... \
-  -e API_KEY=... \
-  -e ADMIN_PASSWORD=... \
-  kin-license
-# CMD: node init-db.js && node server.js
-```
-
-#### Vercel（[api/index.js](license-server/api/index.js)）
-
-注入环境变量后部署为 serverless。
-
-#### 数据库（[init-db.js](license-server/init-db.js)）
-
-幂等建表：`products` / `license_keys` / `api_keys` / `admins` / `verify_logs` / `tamper_reports` / `device_blacklist` / `plans` / `orders` / `order_images` / `paid_txns` / `shell_logs` / `device_commands`
-
-默认套餐：月卡 ¥9.90 / 季卡 ¥25 / 年卡 ¥88 / 永久 ¥168
+本仓库只包含客户端侧逻辑：Ed25519 验签（`include/License.hpp` + `src/tweetnacl.c`）、
+短时令牌校验与离线宽限。
 
 ### 7.6 卡密激活与令牌流转
 
