@@ -22,7 +22,7 @@
 **Kin** 是面向 Android 平台的 CPU 调度守护进程:
 它设定各模式的频率上下限与 governor 参数,把实际的升降频节奏交给内核 governor(walt / schedutil / hmbird)自己完成 —— 既省电又跟手;智能模式下再叠加负载状态机与帧感知闭环。
 
-可单独用 `mode.txt` 切换模式;也可搭配图形前端 [Kin 接管助手](https://github.com/kktwo2923-creator/CTS) 按应用画像自动接管。
+可单独用 `mode.txt` 切换模式;也可搭配图形前端 [Kin 接管助手](https://github.com/kktwo2923-creator/Kin) 按应用画像自动接管。
 
 - **多 SoC 支持**:骁龙 8 至尊版(8e5/8E)/8G1/8G2/8G3/8G5/7P3 · 天玑 9300/9400(内置 10 份出厂配置,刷入时按机型自动选择)
 
@@ -69,6 +69,19 @@ SysTune 的 VM、TCP 和发送队列节点也记录原值，关闭 SysTune 或�
 > **无场景识别**:不再做 Scenes / Standby / HeavyLoad / Touch 检测,频率响应统一交给 governor 的 `up_rate_limit_us` / `down_rate_limit_us`。
 
 ---
+
+## 构建
+
+前置:Android NDK(`ANDROID_NDK` 环境变量指向 NDK 目录)、CMake ≥ 3.22、Python 3(打包用)。
+
+```bash
+export ANDROID_NDK=/path/to/android-ndk   # 未设置时 build.sh 会直接报错退出
+./build.sh                  # 编译 arm64-v8a 二进制到 output/arm64/Kinetic
+python build_pack.py pack   # 与 magisk/ 模块源打包成可刷入的 zip(output/ 下)
+```
+
+`build.sh` 读取 `BUILD_TYPE`(默认 Release)与 `ANDROID_PLATFORM`(默认 android-29)。
+仓库根目录的 `Kinetic` 是预编译二进制,`pack` 会直接用它;自己改过源码请先跑 `build.sh`。
 
 ## 快速上手
 
@@ -474,7 +487,7 @@ Kin 的应对：
 - **频率响应交给 governor** —— 用 `up_rate_limit_us` / `down_rate_limit_us` / `hispeed_load` 控制升降频节奏,governor 有足够时间自然回落
 - **SoC 适配层（`include/Soc.hpp`）** —— 所有机型/平台相关的 sysfs 路径（measured_fps / GPU / 电流 / 背光 / headroom 节点 / 温度传感器关键字）与参考频率（`REF_HWMAX_*`）集中在一个文件。**适配 MTK / 其它骁龙只需改这一处**：路径都是"候选列表"，运行时逐个探测、命中即用，多写几个不同平台的候选是安全的（读不到自动跳过）。算法逻辑（AutoMode/AutoFsm/AutoFas）不再内嵌任何硬编码路径。
 
-> 逐条改动历史见 [CHANGES.md](./CHANGES.md)。
+> 逐条改动历史见 [changelog.md](./changelog.md)。
 
 ---
 

@@ -10,7 +10,7 @@ Battery-first · self-learning smart mode · per-app profiles · governor-driven
 
 [![License](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](#license)
 [![Governor](https://img.shields.io/badge/Governor-walt%20·%20schedutil%20·%20hmbird-brightgreen.svg)](#)
-[![App](https://img.shields.io/badge/Front--end-Kin%20Companion-orange)](https://github.com/kktwo2923-creator/CTS)
+[![App](https://img.shields.io/badge/Front--end-Kin%20Companion-orange)](https://github.com/kktwo2923-creator/Kin)
 
 </div>
 
@@ -20,7 +20,7 @@ Battery-first · self-learning smart mode · per-app profiles · governor-driven
 
 **Kin** is a CPU scheduling daemon for Android. It sets per-mode frequency limits and governor parameters, then leaves the actual up/down-scaling rhythm to the kernel governor (walt / schedutil / hmbird) — power-efficient yet responsive. In smart mode it adds a load state machine and a frame-aware closed loop on top.
 
-Use it standalone by writing `mode.txt`, or pair it with the GUI front-end [Kin Companion](https://github.com/kktwo2923-creator/CTS) for per-app automatic takeover.
+Use it standalone by writing `mode.txt`, or pair it with the GUI front-end [Kin Companion](https://github.com/kktwo2923-creator/Kin) for per-app automatic takeover.
 
 - **Multi-SoC**: Snapdragon 8 Elite Gen 5 (8e5/8E) / 8G1 / 8G2 / 8G3 / 8G5 / 7P3 · Dimensity 9300 / 9400 — ships 10 factory configs, auto-selected at flash time.
 
@@ -33,6 +33,19 @@ Use it standalone by writing `mode.txt`, or pair it with the GUI front-end [Kin 
 - 🎮 **FAS (frame-aware scheduling)** — closed-loop `scaling_max` control from measured FPS while gaming: steady frames → lower clocks to save power, dropped frames → open up instantly
 - 🌀 **FengChi governor switch** — apps profiled as *FengChi game* switch to `hmbird`/`scx` on game entry (fallback `walt`/`sugov_ext`), restored on exit; mutually exclusive with FAS per app
 - **System-level tuning (ported from ASB)** — per-mode VM/network/WiFi tuning and background memory trim
+
+## Build
+
+Requirements: Android NDK (`ANDROID_NDK` pointing at the NDK directory), CMake >= 3.22, Python 3 (for packaging).
+
+```bash
+export ANDROID_NDK=/path/to/android-ndk   # build.sh exits with an error if unset
+./build.sh                  # builds the arm64-v8a binary into output/arm64/Kinetic
+python build_pack.py pack   # packs it with the magisk/ module sources into a flashable zip
+```
+
+`build.sh` honours `BUILD_TYPE` (default `Release`) and `ANDROID_PLATFORM` (default `android-29`).
+The `Kinetic` file at the repo root is a prebuilt binary that `pack` reuses directly — run `build.sh` first if you changed the sources.
 
 ## Quick start
 

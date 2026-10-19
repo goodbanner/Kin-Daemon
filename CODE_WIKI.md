@@ -3,8 +3,8 @@
 > 本文档由对仓库源码的结构化分析整理而成，目标是让阅读者在不逐行阅读代码的前提下，快速建立对项目整体架构、模块职责、关键类与函数、依赖关系与运行方式的完整心智模型。
 >
 > - 仓库主体：`Kinetic` —— 一个运行于 Android 用户态的 CPU/系统调度守护进程（Magisk 模块）
-> - 配套：卡密授权服务器（`license-server/`）、可选 eBPF 后端（`src/bpf/`）、配套 App（仓库外 `Kin.apk`）
-> - 模块标识：`id=Kin`，对外名 `OnePlus V Pro`，当前版本 `Ⅴ⁰⁵`（[module.prop](file:///workspace/magisk/module.prop)）
+> - 配套：卡密授权服务器（**独立私有仓库，不随本仓库分发**）、可选 eBPF 后端（**未随仓库分发**）、配套 App（`magisk/Kin.apk`）
+> - 模块标识：`id=Kin`，对外名 `OnePlus V Pro`，当前版本 `Ⅴ⁰⁵`（[module.prop](magisk/module.prop)）
 
 ---
 
@@ -96,7 +96,7 @@
 └─────────────────────────────────────────────────────────────────────┘
                 ▲
 ┌───────────────┴─────────────────────────────────────────────────────┐
-│              license-server (Express.js, 仓库内 license-server/)    │
+│        授权服务 (Express.js, 独立私有仓库, 不随本仓库分发)          │
 │   卡密生成/验证 / 设备绑定 / 远程命令下发 / 支付回调 / 后台管理     │
 │   libSQL(Turso) ── products/license_keys/orders/admins/...          │
 └─────────────────────────────────────────────────────────────────────┘
@@ -106,13 +106,13 @@
 
 | 进程 | 启动方式 | 权限域 | 职责 |
 | --- | --- | --- | --- |
-| `Kinetic` | [magisk/service.sh](file:///workspace/magisk/service.sh) 每 2s 拉起 | magisk/su/ksu | 调度守护、状态上报、卡密读取 |
+| `Kinetic` | [magisk/service.sh](magisk/service.sh) 每 2s 拉起 | magisk/su/ksu | 调度守护、状态上报、卡密读取 |
 | `Kin.apk` | 用户启动 App | untrusted_app | UI、卡密激活、模式切换、Metrics 消费 |
-| `license-server` | Docker / Vercel | node:20 | 卡密服务、支付、远程命令 |
+| `license-server` | Docker / Vercel(外部) | node:20 | 卡密服务、支付、远程命令 |
 
 ### 2.3 守护线程模型
 
-`Schedule` 类启动 **9 个后台线程**（见 [include/scheduler.hpp](file:///workspace/include/scheduler.hpp)）：
+`Schedule` 类启动 **9 个后台线程**（见 [include/scheduler.hpp](include/scheduler.hpp)）：
 
 | 线程 | 周期/触发 | 职责 |
 | --- | --- | --- |
@@ -179,18 +179,7 @@
 │   ├── config_D9300.json        # 天玑 9300 (mt6989)
 │   ├── config_D9400.json        # 天玑 9400 (mt6991)
 │   └── perapp_powermode.txt     # 预填应用画像表
-├── license-server/              # 卡密授权服务（Express.js）
-│   ├── server.js                # 主服务 (991 行)
-│   ├── db.js                    # libSQL 封装
-│   ├── init-db.js               # 幂等建表 (225 行)
-│   ├── api/index.js             # Vercel serverless 入口
-│   ├── Dockerfile               # node:20-alpine
-│   └── package.json
-├── tools/
-│   └── normalize_config.py      # 规整 config JSON 键顺序
-├── tests/
-│   ├── test_appprofile.cpp
-│   └── test_skin_thermal.cpp
+├── tests/                       # 单元测试 (31 个: FSM/自学习/节点写入/配置校验/前台缓存…)
 ├── CMakeLists.txt               # CMake 构建 (项目名 Kin VERSION 3.2)
 ├── build.sh                     # bash 构建脚本
 ├── build_pack.py                # Python 一键构建+打包
@@ -208,52 +197,51 @@
 
 | 模块 | 头文件 | 职责 |
 | --- | --- | --- |
-| **入口** | [src/main.cpp](file:///workspace/src/main.cpp) | 信号处理、`g_paid` 全局、eventfd 可中断等待、构造 `Schedule` |
-| **中央协调器** | [include/scheduler.hpp](file:///workspace/include/scheduler.hpp) | `Schedule` 类，启动 9 线程，统一调度所有子系统 |
-| **AutoMode 自学习** | [include/AutoMode.hpp](file:///workspace/include/AutoMode.hpp) | 12 桶学习、置信门控、分级回退、ε-greedy 探索 |
-| **6 状态 FSM** | [include/AutoFsm.hpp](file:///workspace/include/AutoFsm.hpp) | 状态评估、频率界计算、迟滞、最小驻留 |
-| **帧感知调度** | [include/AutoFas.hpp](file:///workspace/include/AutoFas.hpp) | GAMING 态 P 控制器闭环帧率 |
-| **配置中心** | [include/Config.hpp](file:///workspace/include/Config.hpp) | 14 子命名空间全局配置、CatPolicy、AppProfile |
-| **JSON 解析** | [include/JsonConfig.hpp](file:///workspace/include/JsonConfig.hpp) | config.json 热重载解析 |
-| **节点写入** | [include/Function.hpp](file:///workspace/include/Function.hpp) | cpuset/GPU/CFS/FAS 节点写入封装 |
-| **系统调优** | [include/SysTweaks.hpp](file:///workspace/include/SysTweaks.hpp) | VM/TCP/WiFi/BootTrim/BgTrim |
-| **事件监控** | [include/EventMonitor.hpp](file:///workspace/include/EventMonitor.hpp) | proc connector fork/exec 事件 |
-| **线程规则** | [include/ThreadRules.hpp](file:///workspace/include/ThreadRules.hpp) + [ThreadPriorityRules.hpp](file:///workspace/include/ThreadPriorityRules.hpp) | 绑核 + RT 优先级规则匹配 |
-| **Metrics 上报** | [include/MetricsServer.hpp](file:///workspace/include/MetricsServer.hpp) | 抽象 socket + memfd 零拷贝 |
-| **卡密** | [include/License.hpp](file:///workspace/include/License.hpp) | 读取 auth.json，返回付费状态 |
-| **日志** | [include/Logger.hpp](file:///workspace/include/Logger.hpp) | 落盘 /sdcard/Android/Kin/log.txt，512KB 轮转 |
-| **平台适配** | [include/Soc.hpp](file:///workspace/include/Soc.hpp) | sysfs 路径候选、频率基准、热优先级 |
-| **工具** | [include/Utils.hpp](file:///workspace/include/Utils.hpp) | 文件写、top-app 读取、dumpsys 解析 |
-| **加密** | [include/tweetnacl.h](file:///workspace/include/tweetnacl.h) + [src/tweetnacl.c](file:///workspace/src/tweetnacl.c) | Ed25519 签名（公有领域实现） |
+| **入口** | [src/main.cpp](src/main.cpp) | 信号处理、`g_paid` 全局、eventfd 可中断等待、构造 `Schedule` |
+| **中央协调器** | [include/scheduler.hpp](include/scheduler.hpp) | `Schedule` 类，启动 9 线程，统一调度所有子系统 |
+| **AutoMode 自学习** | [include/AutoMode.hpp](include/AutoMode.hpp) | 12 桶学习、置信门控、分级回退、ε-greedy 探索 |
+| **6 状态 FSM** | [include/AutoFsm.hpp](include/AutoFsm.hpp) | 状态评估、频率界计算、迟滞、最小驻留 |
+| **帧感知调度** | [include/AutoFas.hpp](include/AutoFas.hpp) | GAMING 态 P 控制器闭环帧率 |
+| **配置中心** | [include/Config.hpp](include/Config.hpp) | 14 子命名空间全局配置、CatPolicy、AppProfile |
+| **JSON 解析** | [include/JsonConfig.hpp](include/JsonConfig.hpp) | config.json 热重载解析 |
+| **节点写入** | [include/Function.hpp](include/Function.hpp) | cpuset/GPU/CFS/FAS 节点写入封装 |
+| **系统调优** | [include/SysTweaks.hpp](include/SysTweaks.hpp) | VM/TCP/WiFi/BootTrim/BgTrim |
+| **事件监控** | [include/EventMonitor.hpp](include/EventMonitor.hpp) | proc connector fork/exec 事件 |
+| **线程规则** | [include/ThreadRules.hpp](include/ThreadRules.hpp) + [ThreadPriorityRules.hpp](include/ThreadPriorityRules.hpp) | 绑核 + RT 优先级规则匹配 |
+| **Metrics 上报** | [include/MetricsServer.hpp](include/MetricsServer.hpp) | 抽象 socket + memfd 零拷贝 |
+| **卡密** | [include/License.hpp](include/License.hpp) | 读取 auth.json，返回付费状态 |
+| **日志** | [include/Logger.hpp](include/Logger.hpp) | 落盘 /sdcard/Android/Kin/log.txt，512KB 轮转 |
+| **平台适配** | [include/Soc.hpp](include/Soc.hpp) | sysfs 路径候选、频率基准、热优先级 |
+| **工具** | [include/Utils.hpp](include/Utils.hpp) | 文件写、top-app 读取、dumpsys 解析 |
+| **加密** | [include/tweetnacl.h](include/tweetnacl.h) + [src/tweetnacl.c](src/tweetnacl.c) | Ed25519 签名（公有领域实现） |
 
 ### 4.2 Magisk 模块
 
 | 文件 | 时机 | 职责 |
 | --- | --- | --- |
-| [customize.sh](file:///workspace/magisk/customize.sh) | 安装时 | SoC 识别、清理 legacy 模块、部署 config.json + Kinetic、安装 Kin.apk、热更新二进制 |
-| [post-fs-data.sh](file:///workspace/magisk/post-fs-data.sh) | 早期启动 | bind-mount 锁定 OPlus 节点、关 oplus_frame_boost、SLC XML 部署 |
-| [service.sh](file:///workspace/magisk/service.sh) | boot_completed 后 | 等 boot/login、拉起 Kinetic、mode.txt 合法性、cpuset 兜底、写 status |
-| [action.sh](file:///workspace/magisk/action.sh) | 用户点击 | 显示状态、挂载健康检查、守护兜底重启 |
-| [system.prop](file:///workspace/magisk/system.prop) | 系统启动 | 墓碑冻结、VSync、日志关闭、热限关闭、Vulkan safe mode、LMK 阈值、高刷解禁 |
-| [sepolicy.rule](file:///workspace/magisk/sepolicy.rule) | 系统启动 | 共享内存零拷贝 SELinux 放行 |
-| [vtools/init_vtools.sh](file:///workspace/magisk/vtools/init_vtools.sh) | 安装时 | 部署 powercfg.sh/json、初始化 mode.txt |
+| [customize.sh](magisk/customize.sh) | 安装时 | SoC 识别、清理 legacy 模块、部署 config.json + Kinetic、安装 Kin.apk、热更新二进制 |
+| [post-fs-data.sh](magisk/post-fs-data.sh) | 早期启动 | bind-mount 锁定 OPlus 节点、关 oplus_frame_boost、SLC XML 部署 |
+| [service.sh](magisk/service.sh) | boot_completed 后 | 等 boot/login、拉起 Kinetic、mode.txt 合法性、cpuset 兜底、写 status |
+| [action.sh](magisk/action.sh) | 用户点击 | 显示状态、挂载健康检查、守护兜底重启 |
+| [system.prop](magisk/system.prop) | 系统启动 | 墓碑冻结、VSync、日志关闭、热限关闭、Vulkan safe mode、LMK 阈值、高刷解禁 |
+| [sepolicy.rule](magisk/sepolicy.rule) | 系统启动 | 共享内存零拷贝 SELinux 放行 |
+| [vtools/init_vtools.sh](magisk/vtools/init_vtools.sh) | 安装时 | 部署 powercfg.sh/json、初始化 mode.txt |
 
-### 4.3 卡密授权服务
+### 4.3 卡密授权服务（外部组件）
 
-| 文件 | 职责 |
-| --- | --- |
-| [license-server/server.js](file:///workspace/license-server/server.js) | Express.js 主服务：卡密生成/验证/绑定/解绑、JWT 后台、远程 shell、远程命令、易支付/支付宝 |
-| [license-server/db.js](file:///workspace/license-server/db.js) | libSQL 客户端封装（本地 SQLite 或 Turso 云端） |
-| [license-server/init-db.js](file:///workspace/license-server/init-db.js) | 幂等建表：products/license_keys/api_keys/admins/verify_logs/... |
-| [license-server/api/index.js](file:///workspace/license-server/api/index.js) | Vercel serverless 入口，注入环境变量 |
-| [license-server/Dockerfile](file:///workspace/license-server/Dockerfile) | node:20-alpine 镜像 |
-
-### 4.4 可选 eBPF 后端
+授权服务（Express.js + libSQL/Turso）负责卡密生成/验证/设备绑定/解绑、JWT 后台、支付回调与远程命令下发。
+它**不在本仓库内**，也不随本仓库分发；本仓库只包含消费方逻辑：
 
 | 文件 | 职责 |
 | --- | --- |
-| [src/bpf/monitor.bpf.c](file:///workspace/src/bpf/monitor.bpf.c) | tracepoint: sched_process_fork/exec + sys_enter_sched_setaffinity，perf_event_array 上报 |
-| [src/bpf/README.md](file:///workspace/src/bpf/README.md) | proc connector（默认）vs 真·eBPF（可选）说明 |
+| [include/License.hpp](include/License.hpp) | 客户端验签：Ed25519 公钥校验服务端签发的短时令牌 |
+| [src/tweetnacl.c](src/tweetnacl.c) | Ed25519 验签实现（NaCl） |
+
+### 4.4 可选 eBPF 后端（未随仓库分发）
+
+前台/线程采集默认走 proc connector；真·eBPF 后端（tracepoint `sched_process_fork`/`exec`、
+`sys_enter_sched_setaffinity`，perf_event_array 上报）为可选组件，**未包含在本仓库中**，
+需自行实现并接入构建。
 
 ---
 
@@ -261,7 +249,7 @@
 
 ### 5.1 `Schedule`（中央协调器）
 
-**位置**：[include/scheduler.hpp](file:///workspace/include/scheduler.hpp)（2467 行）
+**位置**：[include/scheduler.hpp](include/scheduler.hpp)（2467 行）
 
 `Schedule` 是整个守护进程的中枢，所有子系统的入口都由它驱动。
 
@@ -293,7 +281,7 @@
 
 ### 5.2 `AutoModeCtl`（自学习）
 
-**位置**：[include/AutoMode.hpp](file:///workspace/include/AutoMode.hpp)（1650 行）
+**位置**：[include/AutoMode.hpp](include/AutoMode.hpp)（1650 行）
 
 移植自 ASB Smart Mode。
 
@@ -340,7 +328,7 @@ EXACT → DAYPART_ONLY → CLASS → GLOBAL → SAFE
 
 ### 5.3 `AutoFsm`（6 状态 FSM）
 
-**位置**：[include/AutoFsm.hpp](file:///workspace/include/AutoFsm.hpp)（335 行）
+**位置**：[include/AutoFsm.hpp](include/AutoFsm.hpp)（335 行）
 
 #### 6 状态
 
@@ -375,7 +363,7 @@ struct Caps {
 
 ### 5.4 `AutoFas`（帧感知调度）
 
-**位置**：[include/AutoFas.hpp](file:///workspace/include/AutoFas.hpp)（358 行）
+**位置**：[include/AutoFas.hpp](include/AutoFas.hpp)（358 行）
 
 仅在 GAMING 态启用，闭环控制大核频率界以维持目标帧率。
 
@@ -400,7 +388,7 @@ struct Out {
 
 ### 5.5 `Config`（全局配置中心）
 
-**位置**：[include/Config.hpp](file:///workspace/include/Config.hpp)（377 行）
+**位置**：[include/Config.hpp](include/Config.hpp)（377 行）
 
 #### 14 个子命名空间
 
@@ -426,7 +414,7 @@ struct Out {
 
 ### 5.6 `JsonConfig`（配置解析）
 
-**位置**：[include/JsonConfig.hpp](file:///workspace/include/JsonConfig.hpp)（727 行）
+**位置**：[include/JsonConfig.hpp](include/JsonConfig.hpp)（727 行）
 
 #### `readConfig()`
 
@@ -442,7 +430,7 @@ struct Out {
 
 ### 5.7 `Function`（节点写入封装）
 
-**位置**：[include/Function.hpp](file:///workspace/include/Function.hpp)（921 行）
+**位置**：[include/Function.hpp](include/Function.hpp)（921 行）
 
 #### 四类功能
 
@@ -467,7 +455,7 @@ Mali devfreq  →  qcom kgsl  →  pwrlevel 兜底
 
 ### 5.8 `SysTweaks`（系统调优）
 
-**位置**：[include/SysTweaks.hpp](file:///workspace/include/SysTweaks.hpp)（247 行）
+**位置**：[include/SysTweaks.hpp](include/SysTweaks.hpp)（247 行）
 
 移植自 ASB 非 CPU 调优部分。
 
@@ -491,7 +479,7 @@ Mali devfreq  →  qcom kgsl  →  pwrlevel 兜底
 
 ### 5.9 `EventMonitor`（事件监控）
 
-**位置**：[include/EventMonitor.hpp](file:///workspace/include/EventMonitor.hpp)（98 行）
+**位置**：[include/EventMonitor.hpp](include/EventMonitor.hpp)（98 行）
 
 #### 后端
 
@@ -503,7 +491,7 @@ Mali devfreq  →  qcom kgsl  →  pwrlevel 兜底
 
 ### 5.10 `ThreadRules` + `ThreadPriorityRules`
 
-**位置**：[include/ThreadRules.hpp](file:///workspace/include/ThreadRules.hpp)（241 行）+ [ThreadPriorityRules.hpp](file:///workspace/include/ThreadPriorityRules.hpp)（212 行）
+**位置**：[include/ThreadRules.hpp](include/ThreadRules.hpp)（241 行）+ [ThreadPriorityRules.hpp](include/ThreadPriorityRules.hpp)（212 行）
 
 #### 规则格式
 
@@ -525,7 +513,7 @@ pkg{thread}=POLICY PRIO    # 如 com.netease.cloudmusic{ExoPlayer}=SCHED_FIFO 2
 
 ### 5.11 `MetricsServer`（共享内存上报）
 
-**位置**：[include/MetricsServer.hpp](file:///workspace/include/MetricsServer.hpp)（329 行）
+**位置**：[include/MetricsServer.hpp](include/MetricsServer.hpp)（329 行）
 
 #### 抽象 socket
 
@@ -542,7 +530,7 @@ pkg{thread}=POLICY PRIO    # 如 com.netease.cloudmusic{ExoPlayer}=SCHED_FIFO 2
 
 ### 5.12 `License`（卡密）
 
-**位置**：[include/License.hpp](file:///workspace/include/License.hpp)（90 行）
+**位置**：[include/License.hpp](include/License.hpp)（90 行）
 
 #### `lic::readAuth()`
 
@@ -568,7 +556,7 @@ struct Result {
 
 ### 5.13 `Logger`（日志）
 
-**位置**：[include/Logger.hpp](file:///workspace/include/Logger.hpp)（205 行）
+**位置**：[include/Logger.hpp](include/Logger.hpp)（205 行）
 
 - 落盘 `/sdcard/Android/Kin/log.txt`
 - 512KB 轮转
@@ -578,7 +566,7 @@ struct Result {
 
 ### 5.14 `Soc`（平台适配）
 
-**位置**：[include/Soc.hpp](file:///workspace/include/Soc.hpp)（74 行）
+**位置**：[include/Soc.hpp](include/Soc.hpp)（74 行）
 
 #### 频率基准
 
@@ -601,7 +589,7 @@ struct Result {
 
 ### 5.15 `Utils`（系统工具）
 
-**位置**：[include/Utils.hpp](file:///workspace/include/Utils.hpp)（441 行）
+**位置**：[include/Utils.hpp](include/Utils.hpp)（441 行）
 
 | 方法 | 说明 |
 | --- | --- |
@@ -611,13 +599,13 @@ struct Result {
 
 ### 5.16 `LibUtils`
 
-**位置**：[include/LibUtils.hpp](file:///workspace/include/LibUtils.hpp)（110 行）
+**位置**：[include/LibUtils.hpp](include/LibUtils.hpp)（110 行）
 
 `Fastatoi` / `FastSnprintf` —— 极简 `vsnprintf`，只支持 `%d` / `%s` / `%%`，避免 libc `snprintf` 在热路径上的开销。
 
 ### 5.17 `main` 入口
 
-**位置**：[src/main.cpp](file:///workspace/src/main.cpp)
+**位置**：[src/main.cpp](src/main.cpp)
 
 - 设置 `SIGTERM` / `SIGINT` / `SIGPIPE` 信号处理
 - `g_paid` 全局原子读取 `auth.json`
@@ -709,7 +697,7 @@ struct Result {
 
 ### 7.1 用户视角：安装与启动
 
-#### 安装流程（[customize.sh](file:///workspace/magisk/customize.sh)）
+#### 安装流程（[customize.sh](magisk/customize.sh)）
 
 1. **SoC 识别** `identify_chip`：根据 `/proc/cpuinfo` 匹配 SoC（sm8750→8E / sm8850→8E5 / sm8650→8G3 / sm8550→8G2 / sm8450→8G1 / sm8845→8G5 / sm7675→7P3 / mt6989→D9300 / mt6991→D9400）
 2. **清理 legacy** `remove_legacy_modules`：卸载 CoreTurboScheduler / Oxygen / Kinetic / CTS / Kin_legacy 等旧模块
@@ -718,7 +706,7 @@ struct Result {
 5. **热更新**：杀旧守护 + 覆盖到 live 目录
 6. **vtools 部署** `init_vtools.sh`：部署 `powercfg.sh/json`，初始化 `mode.txt`（默认 `balance`）
 
-#### 启动流程（[service.sh](file:///workspace/magisk/service.sh)）
+#### 启动流程（[service.sh](magisk/service.sh)）
 
 ```
 开机
@@ -788,7 +776,7 @@ python3 build_pack.py
 # 从兄弟目录 CTS/cts 寻找 Kin.apk
 ```
 
-#### 构建开关（[CMakeLists.txt](file:///workspace/CMakeLists.txt)）
+#### 构建开关（[CMakeLists.txt](CMakeLists.txt)）
 
 | 开关 | 说明 |
 | --- | --- |
@@ -798,7 +786,7 @@ python3 build_pack.py
 
 `-Os -flto -fno-rtti -fvisibility=hidden` —— 体积优先，无 RTTI，符号隐藏。输出二进制名 `Kinetic`。
 
-### 7.4 CI 构建（[.github/workflows/build.yml](file:///workspace/.github/workflows/build.yml)）
+### 7.4 CI 构建（[.github/workflows/build.yml](.github/workflows/build.yml)）
 
 双版本并行：
 
@@ -814,7 +802,7 @@ python3 build_pack.py
 
 ### 7.5 License Server 部署
 
-#### Docker（[Dockerfile](file:///workspace/license-server/Dockerfile)）
+#### Docker（[Dockerfile](license-server/Dockerfile)）
 
 ```bash
 cd license-server
@@ -829,11 +817,11 @@ docker run -p 3000:3000 \
 # CMD: node init-db.js && node server.js
 ```
 
-#### Vercel（[api/index.js](file:///workspace/license-server/api/index.js)）
+#### Vercel（[api/index.js](license-server/api/index.js)）
 
 注入环境变量后部署为 serverless。
 
-#### 数据库（[init-db.js](file:///workspace/license-server/init-db.js)）
+#### 数据库（[init-db.js](license-server/init-db.js)）
 
 幂等建表：`products` / `license_keys` / `api_keys` / `admins` / `verify_logs` / `tamper_reports` / `device_blacklist` / `plans` / `orders` / `order_images` / `paid_txns` / `shell_logs` / `device_commands`
 
@@ -951,7 +939,7 @@ threadAllocTask
 3. Config.hpp 编译期默认值            # 兜底
 ```
 
-### 9.2 config.json 结构（由 [JsonConfig.hpp](file:///workspace/include/JsonConfig.hpp) 解析）
+### 9.2 config.json 结构（由 [JsonConfig.hpp](include/JsonConfig.hpp) 解析）
 
 ```jsonc
 {
@@ -985,7 +973,7 @@ threadAllocTask
 
 ### 9.3 每 SoC 配置文件
 
-[Json/](file:///workspace/Json) 目录下每个 `config_<SoC>.json` 是该 SoC 的出厂默认。`customize.sh` 安装时按识别结果复制为 `config.json`。
+[Json/](Json) 目录下每个 `config_<SoC>.json` 是该 SoC 的出厂默认。`customize.sh` 安装时按识别结果复制为 `config.json`。
 
 | 文件 | SoC | 设备示例 |
 | --- | --- | --- |
@@ -1001,9 +989,9 @@ threadAllocTask
 
 ### 9.4 perapp_powermode.txt
 
-[Json/perapp_powermode.txt](file:///workspace/Json/perapp_powermode.txt) —— 预填应用画像表，包名通配符 → CatPolicy / 覆盖模式。`AppProfileModel::matchPackage` 用迭代式通配符匹配。
+[Json/perapp_powermode.txt](Json/perapp_powermode.txt) —— 预填应用画像表，包名通配符 → CatPolicy / 覆盖模式。`AppProfileModel::matchPackage` 用迭代式通配符匹配。
 
-### 9.5 system.prop（[magisk/system.prop](file:///workspace/magisk/system.prop)）
+### 9.5 system.prop（[magisk/system.prop](magisk/system.prop)）
 
 | 类别 | 关键属性 | 作用 |
 | --- | --- | --- |
@@ -1021,7 +1009,7 @@ threadAllocTask
 
 ## 10. 构建与发布
 
-### 10.1 CMakeLists.txt 要点（[CMakeLists.txt](file:///workspace/CMakeLists.txt)）
+### 10.1 CMakeLists.txt 要点（[CMakeLists.txt](CMakeLists.txt)）
 
 - 项目名 `Kin`，VERSION `3.2`
 - 语言：`CXX`（C++23）+ `C`（C99）
@@ -1030,20 +1018,20 @@ threadAllocTask
 - 输出二进制名：`Kinetic`
 - `tweetnacl.c` 作为独立 C 编译单元（不参与 C++ RTTI）
 
-### 10.2 build.sh（[build.sh](file:///workspace/build.sh)）
+### 10.2 build.sh（[build.sh](build.sh)）
 
 - bash 脚本，支持 `arm64-v8a`
 - 依赖 `ANDROID_NDK` 环境变量
 - 使用 Ninja
 
-### 10.3 build_pack.py（[build_pack.py](file:///workspace/build_pack.py)）
+### 10.3 build_pack.py（[build_pack.py](build_pack.py)）
 
 - Python 一键构建+打包
 - `versionCode` 用 Unix 纪元秒保证递增
 - 先编 `tweetnacl.c` 为 `.o`，再编 `main.cpp`
 - 从兄弟目录 `CTS/cts` 寻找 `Kin.apk`
 
-### 10.4 CI 双版本（[.github/workflows/build.yml](file:///workspace/.github/workflows/build.yml)）
+### 10.4 CI 双版本（[.github/workflows/build.yml](.github/workflows/build.yml)）
 
 | 阶段 | 触发 | 产物 |
 | --- | --- | --- |
@@ -1054,12 +1042,12 @@ threadAllocTask
 
 ### 10.5 模块更新
 
-- [update.json](file:///workspace/update.json)：`version` / `versionCode` / `zipUrl` / `changelog`，供 Magisk 内置更新检查
+- [update.json](update.json)：`version` / `versionCode` / `zipUrl` / `changelog`，供 Magisk 内置更新检查
 - 当前 `version=Ⅴ⁰⁵`，`versionCode=260615`
 
 ### 10.6 eBPF 后端构建（可选）
 
-需额外：`clang-bpf` / `bpftool` / `libbpf` + 内核 BTF 支持。详见 [src/bpf/README.md](file:///workspace/src/bpf/README.md)。
+需额外：`clang-bpf` / `bpftool` / `libbpf` + 内核 BTF 支持。该后端未随本仓库分发，需自行实现。
 
 ---
 
