@@ -2,7 +2,6 @@
 build/
 build-android-arm64/
 build-host*/
-.mimosa/
 output/
 obj/
 libs/

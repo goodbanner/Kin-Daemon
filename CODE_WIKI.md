@@ -195,7 +195,6 @@
 ├── build.sh                     # bash 构建脚本
 ├── build_pack.py                # Python 一键构建+打包
 ├── README.md                    # 项目说明
-├── CLAUDE.md                    # Claude 协作规范
 ├── changelog.md                 # 变更日志
 ├── update.json                  # 模块更新元信息
 └── .github/workflows/build.yml  # CI 双版本构建
