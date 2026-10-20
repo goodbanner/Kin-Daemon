@@ -391,7 +391,25 @@ ls /sys/devices/system/cpu/cpufreq/
 ]
 ```
 
-### 5) models（核心）
+### 5) 游戏识别兜底与自动免打扰（auto 模式）
+
+```json
+"auto": {
+    "gamelist_enable": true,    // 内置游戏包名清单兜底(默认开), 误判可关
+    "auto_dnd": false           // 游戏态自动免打扰(默认关), 进 GAMING 切「仅优先」, 退出还原
+}
+```
+
+**`gamelist_enable`**：守护内置 531 个主流手游包名（来源见 `THIRD_PARTY_LICENSES.md`）。
+大量手游不声明 `android:appCategory`，无障碍推送失效时也识别不出游戏 —— 这个清单是不依赖任何
+运行时链路的最后一道保险。判定优先级：**用户手动绑的画像 > 系统 category=GAME > 内置清单 > 负载推断**。
+想追加自己的游戏，写到 `/sdcard/Android/Kin/AI/gamelist.txt`（一行一个包名，`#` 注释），
+配置热重载时自动重新读取。
+
+**`auto_dnd`**：进入 GAMING 时把免打扰切到「仅优先」并记住你原来的设置，退出游戏/守护退出时
+原样还原（不会覆盖你自己设的值）。默认关闭，因为它会改变系统可见行为。
+
+### 6) models（核心）
 
 ```json
 {

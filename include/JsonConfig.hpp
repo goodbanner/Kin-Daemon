@@ -315,6 +315,7 @@ public:
         AutoMode::fsm_sustained_enter = 54; AutoMode::fsm_sustained_exit = 48;
         AutoMode::fsm_warmup_grace_s = 45; AutoMode::fsm_warmup_bypass_temp = 60;
         AutoMode::fas_enable = true; AutoMode::fas_target_fps = 0; AutoMode::fas_auto_game = false;
+        AutoMode::gamelist_enable = true; AutoMode::auto_dnd = false;
         AutoMode::fsm_weighted_load = true; AutoMode::fsm_joint_dvfs = true; AutoMode::game_uclamp_min = 20;
         AutoMode::game_fpsgo = false;
         AutoMode::power_enable = true; AutoMode::power_boost_value = 128;
@@ -631,6 +632,8 @@ private:
                 readInt (a, "power_throttle_gpu_mhz",          AutoMode::power_throttle_gpu_mhz);
                 readInt (a, "power_throttle_critical_gpu_mhz", AutoMode::power_throttle_critical_gpu_mhz);
                 readBool(a, "fas_auto_game",   AutoMode::fas_auto_game);
+                readBool(a, "gamelist_enable", AutoMode::gamelist_enable);
+                readBool(a, "auto_dnd",        AutoMode::auto_dnd);
                 readStr (a, "gaming_gov",      AutoMode::gaming_gov);
                 readInt (a, "fas_target_fps",  AutoMode::fas_target_fps);
                 readStr (a, "thermal_path", AutoMode::thermal_path);

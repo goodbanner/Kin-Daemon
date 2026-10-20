@@ -254,6 +254,13 @@ namespace Config {
         // 仅当【检测到游戏渲染层(SurfaceView/BLAST) + GPU≥地板 持续 + 亮屏】才认; 面板 measured_fps 高刷滚动也到
         // ~120, 单看它会把滚动误判成游戏, 故【绝不】用 measured_fps 作进入信号。默认关(需用户显式开)。
         inline bool     fas_auto_game  = false;  // 默认 OFF: 帧时辅助自动进 GAMING(无白名单); 开则按渲染层+GPU 地板判
+        // ── 游戏识别的兜底清单(见 GameList.hpp) ──
+        // 大量手游不声明 android:appCategory, 用户也不手动绑画像; 无障碍/类别失效时靠包名清单兜底。
+        // 优先级: 用户显式画像 > 系统 category > 本清单。误判可置 false 关掉。
+        inline bool     gamelist_enable = true;
+        // ── 游戏态自动免打扰(见 DndControl.hpp): 进 GAMING 切「仅优先」, 退出还原 ──
+        // 默认 OFF: 会改变用户可见的系统行为, 需用户显式开启。
+        inline bool     auto_dnd = false;
 
         // ── 游戏态调速器切换(风驰内核 hm(全名 hmbird)/scx 等) ──
         // 仅当前台命中 game_heavy(风驰游戏)画像时才切换。进入沿先不动调速器,

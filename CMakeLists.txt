@@ -127,6 +127,10 @@ if(BUILD_TESTING AND NOT ANDROID)
     add_test(NAME kin_foreground_cache COMMAND kin_test_foreground_cache)
     set_tests_properties(kin_foreground_cache PROPERTIES TIMEOUT 10)
 
+    add_executable(kin_test_gamelist tests/test_gamelist.cpp)
+    target_include_directories(kin_test_gamelist PRIVATE ${CMAKE_SOURCE_DIR}/include)
+    add_test(NAME kin_gamelist COMMAND kin_test_gamelist)
+
     add_executable(kin_test_node_value tests/test_node_value.cpp)
     target_include_directories(kin_test_node_value PRIVATE ${CMAKE_SOURCE_DIR}/include)
     add_test(NAME kin_node_value COMMAND kin_test_node_value)

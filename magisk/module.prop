@@ -5,4 +5,4 @@ version=V60+V61+oiface
 author=Ktwo
 description=OnePlus V Pro 多 SoC 智能动态调度模块（App 输入卡密激活）
 banner=Kin.png
-updateJson=https://raw.githubusercontent.com/kktwo2923-creator/cts-daemon/main/update.json
+updateJson=https://raw.githubusercontent.com/kktwo2923-creator/Kin-Daemon/main/update.json

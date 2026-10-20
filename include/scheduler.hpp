@@ -16,6 +16,8 @@
 #include "PowerBoostNode.hpp"
 #include "PackageName.hpp"
 #include "DeviceValidation.hpp"
+#include "GameList.hpp"
+#include "DndControl.hpp"
 #include <sys/inotify.h>
 #include <sys/resource.h>
 #include <poll.h>
@@ -87,6 +89,7 @@ private:
     AutoModeCtl autoMode_{logger};
     AutoFsm     autoFsm_{logger};
     AutoFas     autoFas_{logger};
+    kin::DndControl dnd_;            // 游戏态自动免打扰(默认关, config auto_dnd)
     std::string lastModeLogged_;   // 仅在情景模式真正变化时打印, 避免配置重载刷屏
     SysTweaks   sysTweaks_{logger, utils};   // ASB 非 CPU 调优(VM/网络/WiFi/停服务/BG_TRIM)
     DeviceValidation validation_{logger};
@@ -234,6 +237,7 @@ public:
     Schedule() {
         pinSelfToLittleCores();   // 必须在创建工作线程前设主线程亲和性，新线程继承之
         Init();
+        Config::GameList::loadUserList();   // 用户追加的游戏包名(启动一次)
         autoMode_.writeCapabilities();
         stopEventFd_ = eventfd(0, EFD_CLOEXEC);
         // 单 inotify 线程监控三个配置文件，替代原 config/json/perapp 三线程
@@ -395,6 +399,7 @@ public:
             if (t.joinable()) t.join();
         }
         sysTweaks_.restoreAll();
+        dnd_.release();   // 守护退出/重载: 把免打扰还回用户原值, 别把用户留在静音状态
         if (stopEventFd_ >= 0) {
             close(stopEventFd_);
             stopEventFd_ = -1;
@@ -1581,6 +1586,13 @@ public:
                     // 与白名单取【或】, 独立于实验开关 fas_auto_game; 视频(category=2)等不命中, 不会误入。
                     // fgCategory 仅首次见该包 popen 一次, 之后命中缓存 → 不增每 tick 开销。
                     if (!gameHint && fgCategory(fgPkg) == 0) gameHint = true;
+                    // 内置游戏清单兜底(见 GameList.hpp): 系统未声明 appCategory、用户也没绑画像时,
+                    // 靠包名清单识别。不依赖无障碍推送/系统类别, 是这条链路失效时的最后一道保险。
+                    if (!gameHint && Config::AutoMode::gamelist_enable &&
+                        Config::GameList::contains(fgPkg.c_str())) {
+                        gameHint = true;
+                        logger.Debug("游戏清单命中: %s", fgPkg.c_str());
+                    }
                 }
                 // ── 多窗口游戏扫描: 小窗/分屏时前台包名只有顶层一个, 但游戏可能在后台可见窗口里。
                 // 遍历所有 visible=true 的 standard Task, 只要有一个命中游戏画像就保持游戏态。
@@ -1599,6 +1611,13 @@ public:
                             if (Config::AppProfile::isBlacklisted(visiblePkg.c_str())) continue;
                             if (visiblePkg == fgPkg) continue;   // fgPkg 已检测过
                             int gm = Config::AppProfile::findMatchingModel(visiblePkg.c_str(), false);
+                            // 清单命中且用户没绑画像时, 用轻量档(game_lite)画像名参与后续判定:
+                            // 只借"是游戏"这一结论, 不改用户配置(fgHeavy 仍为 false)。
+                            if (gm < 0 && Config::AutoMode::gamelist_enable &&
+                                Config::GameList::contains(visiblePkg.c_str())) {
+                                gameHint = true;
+                                if (fgPkg.empty() || fgPkg == "null") fgPkg = visiblePkg;
+                            }
                             if (gm >= 0 && Config::AppProfile::Models[gm].isGame) {
                                 gameHint = true;
                                 gameByProfile = true;
@@ -2056,6 +2075,14 @@ public:
                                 capsToWrite.maxL / 1000, capsToWrite.maxB / 1000);
                 }
                 autoMode_.setForegroundApp(observedForeground.c_str());
+                // 游戏态自动免打扰: 进 GAMING 切「仅优先」, 离开立刻还原(engage/release 幂等)。
+                // 默认关; 用户中途关掉开关时也会走到 else 分支把之前的临时值还回去。
+                if (Config::AutoMode::auto_dnd) {
+                    if (autoFsm_.state() == AutoFsm::GAMING) dnd_.engage();
+                    else                                     dnd_.release();
+                } else {
+                    dnd_.release();
+                }
                 autoMode_.writeFsmStatus(mx, alpha, autoFsm_.stateName(),
                                          capsToWrite.maxL / 1000, capsToWrite.maxB / 1000,
                                          policyResolver.result(), fasEngaged, fengchiActive);
@@ -2481,6 +2508,7 @@ public:
         std::lock_guard<std::recursive_mutex> lk(applyMtx);
         if (conf.readConfig()) {
             applyAllConfig();
+            Config::GameList::loadUserList();   // 用户可能刚改了 gamelist.txt
             configGeneration_.fetch_add(1, std::memory_order_release);
             wakeFsm();
             lastHash = h;
