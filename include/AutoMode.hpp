@@ -401,12 +401,13 @@ public:
     }
 
     // 非 auto 的前台/画像变化帧。不打开 1Hz, 也不清掉 writeInactiveStatus 的闩。
-    // auto 实时采样期间直接丢弃。同一组 mode/fg_pkg/profile/policy_reason/oiface 不重复写。
-    // 数值决策字段保持 PR#2 的 -1; batt/cur_ma/temp 也写 -1, 让 App 显示破折号而不是旧遥测。
+    // auto 实时采样期间直接丢弃。同一组 mode/fg_pkg/profile/policy_reason/oiface/batt/cur_ma/temp 不重复写。
+    // FSM 数值和频率字段保持 PR#2 的 -1。batt/cur_ma/temp 写调用方刚采样的实时值, 传感器未知时才是 -1。
     // 契约键: fsm=INACTIVE, mode, fg_pkg, profile, policy_reason, oiface=0/1。
     // 另外保留 resolved=<与 mode 相同的 token>, 供仍在读 resolved 的一侧使用。policy_reason 只写一次。
     void writeManualForeground(const char* mode, const char* fgPkg, const char* profile,
-                               const char* policyReason, int oiface) {
+                               const char* policyReason, int oiface,
+                               int batt, int curMa, int temp) {
         std::lock_guard<std::recursive_mutex> lk(mtx_);
         if (autoStatusLive_) return;
         char modeTok[40];
@@ -419,7 +420,9 @@ public:
         sanitizeStatusToken(policyReason, reasonTok, sizeof(reasonTok), false);
         const int oi = (oiface == 1) ? 1 : 0;
         const std::string sig = std::string(modeTok) + "\n" + pkgTok + "\n" + profTok + "\n" +
-                                 reasonTok + "\n" + (oi ? "1" : "0");
+                                 reasonTok + "\n" + (oi ? "1" : "0") + "\n" +
+                                 std::to_string(batt) + "\n" + std::to_string(curMa) + "\n" +
+                                 std::to_string(temp);
         if (manualStatusSig_ == sig) return;
         manualStatusSig_ = sig;
         std::string status;
@@ -437,7 +440,9 @@ public:
         status += "\noiface=";
         status += oi ? "1" : "0";
         status += "\nalpha=-1\ncpu_max_little=-1\ncpu_max_big=-1\n";
-        status += "batt=-1\ncur_ma=-1\ntemp=-1\n";
+        status += "batt=" + std::to_string(batt) + "\n";
+        status += "cur_ma=" + std::to_string(curMa) + "\n";
+        status += "temp=" + std::to_string(temp) + "\n";
         status += "schema_version=2\nseq=";
         status += std::to_string(++fsmStatusSeq_);
         status += "\ntimestamp=";

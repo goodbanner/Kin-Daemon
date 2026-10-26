@@ -271,7 +271,6 @@
             "model_name": "game_heavy",
             "is_game": true,
             "packages": [
-                "com.tencent.tmgp.*",
                 "com.miHoYo.Yuanshen",
                 "com.miHoYo.ys.mi",
                 "com.miHoYo.hkrpg",

@@ -87,7 +87,7 @@ int main() {
     ctl.writeFsmStatus(metrics(80, 400, 36), 500, "GAMING", 1800, 2400, decision, false, false);
     const std::string live = readFile(path);
     if (expectEq(live, "fsm", "GAMING", 2)) return 2;
-    ctl.writeManualForeground("balance", "com.tencent.tmgp.sgame", "game_heavy", "fengchi_takeover", 1);
+    ctl.writeManualForeground("balance", "com.tencent.tmgp.sgame", "game_heavy", "fengchi_takeover", 1, 80, 600, 42);
     if (readFile(path) != live) {
         std::printf("FAIL live frame changed after manual write\n");
         return 3;
@@ -103,7 +103,7 @@ int main() {
     if (expectEq(inactive, "cpu_max_little", "-1", 9)) return 9;
     if (expectEq(inactive, "alpha", "-1", 10)) return 10;
 
-    ctl.writeManualForeground("balance", "com.tencent.tmgp.sgame", "game_heavy", "fengchi_takeover", 1);
+    ctl.writeManualForeground("balance", "com.tencent.tmgp.sgame", "game_heavy", "fengchi_takeover", 1, 80, 600, 42);
     const std::string fengchi = readFile(path);
     if (fengchi == inactive) {
         std::printf("FAIL manual frame was not written\n");
@@ -119,19 +119,24 @@ int main() {
     if (expectEq(fengchi, "cpu_max_little", "-1", 19)) return 19;
     if (expectEq(fengchi, "cpu_max_big", "-1", 20)) return 20;
     if (expectEq(fengchi, "alpha", "-1", 21)) return 21;
-    if (expectEq(fengchi, "batt", "-1", 22)) return 22;
-    if (expectEq(fengchi, "cur_ma", "-1", 23)) return 23;
-    if (expectEq(fengchi, "temp", "-1", 24)) return 24;
+    if (expectEq(fengchi, "batt", "80", 22)) return 22;
+    if (expectEq(fengchi, "cur_ma", "600", 23)) return 23;
+    if (expectEq(fengchi, "temp", "42", 24)) return 24;
     if (expectEq(fengchi, "event", "foreground", 25)) return 25;
     if (expectEq(fengchi, "reason", "manual_foreground", 26)) return 26;
 
-    ctl.writeManualForeground("balance", "com.tencent.tmgp.sgame", "game_heavy", "fengchi_takeover", 1);
+    ctl.writeManualForeground("balance", "com.tencent.tmgp.sgame", "game_heavy", "fengchi_takeover", 1, 80, 600, 42);
     if (readFile(path) != fengchi) {
         std::printf("FAIL dedup rewrote the same foreground\n");
         return 27;
     }
+    ctl.writeManualForeground("balance", "com.tencent.tmgp.sgame", "game_heavy", "fengchi_takeover", 1, 81, 600, 42);
+    if (readFile(path) == fengchi || expectEq(readFile(path), "batt", "81", 271)) {
+        std::printf("FAIL telemetry change did not publish\n");
+        return 271;
+    }
 
-    ctl.writeManualForeground("balance", "com.android.launcher3", "", "global", 0);
+    ctl.writeManualForeground("balance", "com.android.launcher3", "", "global", 0, 55, 210, 33);
     const std::string left = readFile(path);
     if (expectEq(left, "fsm", "INACTIVE", 28)) return 28;
     if (expectEq(left, "mode", "balance", 29)) return 29;
@@ -141,6 +146,9 @@ int main() {
     if (expectEq(left, "oiface", "0", 33)) return 33;
     if (expectEq(left, "cpu_max_little", "-1", 34)) return 34;
     if (expectEq(left, "alpha", "-1", 35)) return 35;
+    if (expectEq(left, "batt", "55", 351)) return 351;
+    if (expectEq(left, "cur_ma", "210", 352)) return 352;
+    if (expectEq(left, "temp", "33", 353)) return 353;
 
     ctl.writeFsmStatus(metrics(10, 10, 10), 1, "IDLE", 100, 100, decision, true, true);
     ctl.writeInactiveStatus(metrics(11, 11, 11), "performance");
@@ -149,7 +157,7 @@ int main() {
         return 36;
     }
 
-    ctl.writeManualForeground("auto\nbalance", "com.foo;rm -rf", "game heavy", "bad reason", 2);
+    ctl.writeManualForeground("auto\nbalance", "com.foo;rm -rf", "game heavy", "bad reason", 2, 9, 8, 7);
     const std::string dirty = readFile(path);
     if (expectEq(dirty, "mode", "unknown", 37)) return 37;
     if (expectEq(dirty, "resolved", "unknown", 38)) return 38;
@@ -158,6 +166,9 @@ int main() {
     if (expectEq(dirty, "policy_reason", "unknown", 41)) return 41;
     if (expectEq(dirty, "oiface", "0", 42)) return 42;
     if (expectEq(dirty, "fsm", "INACTIVE", 43)) return 43;
+    if (expectEq(dirty, "batt", "9", 431)) return 431;
+    if (expectEq(dirty, "cpu_max_big", "-1", 432)) return 432;
+    if (expectEq(dirty, "alpha", "-1", 433)) return 433;
 
     ctl.armAutoStatus();
     ctl.writeFsmStatus(metrics(70, 300, 35), 400, "IDLE", 1200, 1600, decision, false, false);
@@ -165,6 +176,6 @@ int main() {
     if (expectEq(resumed, "fsm", "IDLE", 44)) return 44;
     if (expectEq(resumed, "resolved", "fsm", 45)) return 45;
 
-    std::printf("PASS: manual foreground frames keep INACTIVE numerics and the invalidate latch\n");
+    std::printf("PASS: manual frames keep FSM numerics invalid and write live batt/cur_ma/temp\n");
     return 0;
 }

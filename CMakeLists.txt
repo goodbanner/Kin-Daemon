@@ -125,6 +125,11 @@ if(BUILD_TESTING AND NOT ANDROID)
     target_link_libraries(kin_test_fengchi_takeover PRIVATE Threads::Threads)
     add_test(NAME kin_fengchi_takeover COMMAND kin_test_fengchi_takeover)
 
+    add_executable(kin_test_oiface_backup tests/test_oiface_backup.cpp)
+    target_include_directories(kin_test_oiface_backup PRIVATE ${CMAKE_SOURCE_DIR}/include)
+    target_link_libraries(kin_test_oiface_backup PRIVATE Threads::Threads)
+    add_test(NAME kin_oiface_backup COMMAND kin_test_oiface_backup)
+
     add_executable(kin_test_manual_status tests/test_manual_status.cpp)
     target_include_directories(kin_test_manual_status PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/tests)
     target_link_libraries(kin_test_manual_status PRIVATE Threads::Threads)

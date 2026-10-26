@@ -1254,7 +1254,14 @@ public:
     void oifaceEnter() {
         if (!Config::AutoMode::oiface_keepalive_enable) return;
         OifaceShell ops{this};
-        oiface_.enter(ops);
+        oiface_.enter(ops, kin::kOifaceBackupPath);
+    }
+
+    // 上次接管没走正常退出时, 备份文件还在。无论本次是否允许保活 oiface, 都先把原值写回去。
+    void recoverOifaceBackup() {
+        OifaceShell ops{this};
+        if (!kin::OifaceTakeover::recoverBackup(ops, kin::kOifaceBackupPath)) return;
+        logger.Info("启动恢复oiface备份");
     }
 
     void oifaceExit() {
@@ -1310,8 +1317,10 @@ public:
         }
         const char* mode = conf.mode.c_str();
         if (conf.mode == "auto" || conf.mode.empty()) mode = "balance";
+        const auto telem = autoMode_.sample();
         autoMode_.writeManualForeground(mode, pkg.c_str(), profile, reason,
-                                        oiface_.engaged() ? 1 : 0);
+                                        oiface_.engaged() ? 1 : 0,
+                                        telem.battPct, telem.currentMa, telem.tempC);
     }
 
     void publishCurrentManual() {
@@ -3377,6 +3386,7 @@ public:
         }
 
         logger.clear_log();
+        recoverOifaceBackup();
         bool configOk = conf.readConfig();
         logger.Info("%s v%d · %s · 日志=%s · 构建 %s %s",
                     Meta::name.c_str(), Meta::version, Meta::author.c_str(),

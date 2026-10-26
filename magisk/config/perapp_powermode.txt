@@ -1,7 +1,7 @@
 # 应用画像: 包名 模式
 * balance
 
-com.tencent.tmgp.* game_heavy
+# com.tencent.tmgp.* 不绑定画像, 跟随全局模式。只有用户把具体包显式写成 game_heavy 才进入风驰。
 com.miHoYo.Yuanshen game_heavy
 com.miHoYo.ys.mi game_heavy
 com.miHoYo.hkrpg game_heavy

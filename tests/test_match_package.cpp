@@ -39,14 +39,7 @@ int checkShippedRules() {
             if (name.rfind("config", 0) == 0 && path.extension() == ".json") {
                 const std::string body = readFile(path);
                 CHECK(!body.empty());
-                CHECK(body.find("\"com.tencent.tmgp.*\"") != std::string::npos);
-                CHECK(body.find("\"com.tencent.tmgp.sgame\"") == std::string::npos);
-                size_t pos = 0;
-                while ((pos = body.find("\"com.tencent.tmgp.", pos)) != std::string::npos) {
-                    const std::string token = "\"com.tencent.tmgp.*\"";
-                    CHECK(body.compare(pos, token.size(), token) == 0);
-                    pos += token.size();
-                }
+                CHECK(body.find("com.tencent.tmgp.") == std::string::npos);
                 ++jsonCount;
             }
         }
@@ -60,14 +53,12 @@ int checkShippedRules() {
             if (end == std::string::npos) end = body.size();
             std::string row = body.substr(line, end - line);
             if (!row.empty() && row.back() == '\r') row.pop_back();
-            if (row.rfind("com.tencent.tmgp.", 0) == 0) {
-                CHECK(row == "com.tencent.tmgp.* game_heavy");
+            if (!row.empty() && row[0] != '#' && row.rfind("com.tencent.tmgp.", 0) == 0)
                 ++wildcard;
-            }
             if (end == body.size()) break;
             line = end + 1;
         }
-        CHECK(wildcard == 1);
+        CHECK(wildcard == 0);
         ++perappCount;
     }
     CHECK(jsonCount >= 20);
@@ -155,7 +146,49 @@ int main() {
     CHECK(profileIfExplicit(findMatchingModel("com.tencent.tmgp.sgame", false)) == 0);
     CHECK(profileIfExplicit(findMatchingModel("com.tencent.tmgpx", false)) == -1);
 
+    // AC-3b: 没有自己的规则时走全局基础档; 用户显式写成 game_heavy 才接管。
+    modelCount = 2;
+    Models[0].modelName = "game_heavy";
+    Models[0].isGame = true;
+    Models[0].packageCount = 0;
+    Models[1].modelName = "balance";
+    Models[1].isGame = false;
+    Models[1].packageCount = 0;
+    perAppCount = 0;
+    perAppGlobal = "balance";
+    blacklistCount = 0;
+    const char* unsetTmgp[] = {
+        "com.tencent.tmgp.sgame",
+        "com.tencent.tmgp.jjds",
+        "com.tencent.tmgp.qz",
+        "com.tencent.tmgp.carrot3dj",
+        "com.tencent.tmgp.gnyx",
+    };
+    for (const char* pkg : unsetTmgp) {
+        CHECK(profileIfExplicit(findMatchingModel(pkg, false)) == -1);
+        const int base = findMatchingModel(pkg, true);
+        CHECK(base == 1);
+        CHECK(Models[base].modelName == "balance");
+    }
+    perAppCount = 1;
+    perAppPkg[0] = "com.tencent.tmgp.sgame";
+    perAppModel[0] = "game_heavy";
+    perAppFps[0] = 0;
+    const int explicitHeavy = profileIfExplicit(findMatchingModel("com.tencent.tmgp.sgame", false));
+    CHECK(explicitHeavy == 0);
+    CHECK(Models[explicitHeavy].modelName == "game_heavy");
+    CHECK(profileIfExplicit(findMatchingModel("com.tencent.tmgp.jjds", false)) == -1);
+    CHECK(findMatchingModel("com.tencent.tmgp.gnyx", true) == 1);
+    perAppCount = 0;
+    Models[0].packageCount = 1;
+    Models[0].packages[0] = "com.tencent.tmgp.gnyx";
+    const int fromConfig = profileIfExplicit(findMatchingModel("com.tencent.tmgp.gnyx", false));
+    CHECK(fromConfig == 0);
+    CHECK(Models[fromConfig].modelName == "game_heavy");
+    CHECK(profileIfExplicit(findMatchingModel("com.tencent.tmgp.qz", false)) == -1);
+    CHECK(findMatchingModel("com.tencent.tmgp.carrot3dj", true) == 1);
+
     CHECK(checkShippedRules() == 0);
-    std::puts("PASS: prefix/glob/exact match, tmgp wildcard, no default game_lite");
+    std::puts("PASS: prefix/glob/exact match, unset tmgp follows base, explicit game_heavy takes over");
     return 0;
 }
