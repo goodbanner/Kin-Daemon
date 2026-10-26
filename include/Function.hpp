@@ -18,6 +18,7 @@
 #include "Config.hpp"
 #include "Utils.hpp"
 #include "Logger.hpp"
+#include "FengchiTakeover.hpp"
 
 using namespace Config;
 
@@ -573,6 +574,7 @@ public:
     }
 
     void gpuFreqControl() {
+        if (kin::fengchiHandsOff.load(std::memory_order_acquire) != 0) return;
         int mhzMin = Fastatoi(GpuFreq::min_freq.c_str());
         int mhzMax = Fastatoi(GpuFreq::max_freq.c_str());
 
@@ -608,6 +610,7 @@ public:
     }
 
     void gpuFreqControlCustom(const string_t& customMin, const string_t& customMax) {
+        if (kin::fengchiHandsOff.load(std::memory_order_acquire) != 0) return;
         int mhzMin = Fastatoi(customMin.c_str());
         int mhzMax = Fastatoi(customMax.c_str());
 
@@ -786,6 +789,13 @@ public:
             // 读原子快照而非全局 string：重载线程并发改写 string 时读 c_str() 是悬垂指针 UB
             int mhzMin = GpuFreq::min_mhz.load(std::memory_order_relaxed);
             int mhzMax = GpuFreq::max_mhz.load(std::memory_order_relaxed);
+            // 风驰接管期间不把基础档 GPU 上限写回去。清掉上次目标, 松手后的新目标会重新落地。
+            if (kin::fengchiHandsOff.load(std::memory_order_acquire) != 0) {
+                lastTargetMin = -1;
+                lastTargetMax = -1;
+                mhzMin = 0;
+                mhzMax = 0;
+            }
 
             if (mhzMin <= 0 && mhzMax <= 0) {
                 intervalMs   = kFastMs;

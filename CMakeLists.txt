@@ -114,6 +114,22 @@ if(BUILD_TESTING AND NOT ANDROID)
     target_link_libraries(kin_test_auto_status_invalidate PRIVATE Threads::Threads)
     add_test(NAME kin_auto_status_invalidate COMMAND kin_test_auto_status_invalidate)
 
+    add_executable(kin_test_match_package tests/test_match_package.cpp)
+    target_include_directories(kin_test_match_package PRIVATE ${CMAKE_SOURCE_DIR}/include)
+    target_compile_definitions(kin_test_match_package PRIVATE KIN_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+    target_link_libraries(kin_test_match_package PRIVATE Threads::Threads)
+    add_test(NAME kin_match_package COMMAND kin_test_match_package)
+
+    add_executable(kin_test_fengchi_takeover tests/test_fengchi_takeover.cpp)
+    target_include_directories(kin_test_fengchi_takeover PRIVATE ${CMAKE_SOURCE_DIR}/include)
+    target_link_libraries(kin_test_fengchi_takeover PRIVATE Threads::Threads)
+    add_test(NAME kin_fengchi_takeover COMMAND kin_test_fengchi_takeover)
+
+    add_executable(kin_test_manual_status tests/test_manual_status.cpp)
+    target_include_directories(kin_test_manual_status PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/tests)
+    target_link_libraries(kin_test_manual_status PRIVATE Threads::Threads)
+    add_test(NAME kin_manual_status COMMAND kin_test_manual_status)
+
     add_executable(kin_test_config_validation tests/test_config_validation.cpp)
     target_include_directories(kin_test_config_validation PRIVATE ${CMAKE_SOURCE_DIR}/include)
     add_test(NAME kin_config_validation COMMAND kin_test_config_validation)

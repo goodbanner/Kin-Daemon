@@ -19,6 +19,7 @@
 #include "DeviceValidation.hpp"
 #include "GameList.hpp"
 #include "DndControl.hpp"
+#include "FengchiTakeover.hpp"
 #include <sys/inotify.h>
 #include <sys/resource.h>
 #include <poll.h>
@@ -106,6 +107,8 @@ private:
     int         heldMissStreak_ = 0;        // 连续未查到保活进程的轮数(查到即清零)
     static constexpr int kHeldMissMax = 3;  // 达到此轮数才判定游戏真退出
     bool        blacklistReleased = false;  // [真黑名单·方案A] 当前是否已对黑名单前台"释放接管"(交还系统)
+    kin::OifaceTakeover oiface_;            // 风驰进入/退出时保存并还原 oiface 属性与服务
+    kin::FengchiPhase fengchiPhase_ = kin::FengchiPhase::Idle;
 
     // App 无障碍服务(AppSwitchService)推送的前台包名 + 接收时刻; 新鲜则优先于 dumpsys, 省 popen。
     // 服务未启用/被杀 → 推送变陈旧 → 自动回退 dumpsys, 不影响"不开 App 也能用"。
@@ -453,6 +456,8 @@ public:
 
     // 传引用避免每次调用 3 个 string_t 堆拷贝
     void FreqWriter(const int Policy, const string_t& MinFreq, const string_t& MaxFreq, const string_t& Governor) {
+        // 风驰接管: 不写 scaling_min/max, 也不写 governor。退出路径会先清掉这个标志再写基础档。
+        if (kin::fengchiHandsOff.load(std::memory_order_acquire) != 0) return;
         std::lock_guard<std::mutex> lock(mtx);
         int cluster = -1;
         for (int i = 0; i < kClusterCount; i++) {
@@ -1205,16 +1210,143 @@ public:
         }
     }
 
-    // 风驰游戏态 oiface 保活: 进入风驰沿调用一次(边沿驱动, 非 tick 内重复)。
-    // oiface 是 ColorOS/OxygenOS(风驰内核)游戏调度链的关键系统组件, 缺失则风驰调度协同断链。
-    // 强拉方式对齐用户提供的脚本: setprop 开启 + init start 拉起。幂等——已存活时 start 无副作用。
-    // 【退出风驰不还原】: 用户要求 oiface 保持存活, 退出游戏也不断链(下次进游戏即时可用)。
-    void ensureOifaceAlive() {
+    // oiface 属性读写。命令本身是固定字符串; setprop 的值只接受最多 8 位数字, 空值单独还原。
+    struct OifaceShell {
+        Schedule* self;
+        std::string readEnable() {
+            char buf[128];
+            self->utils.popenRead("getprop persist.sys.oiface.enable", buf, sizeof(buf));
+            return std::string(buf);
+        }
+        bool readRunning() {
+            char buf[128];
+            self->utils.popenRead("getprop init.svc.oiface", buf, sizeof(buf));
+            char* s = buf;
+            while (*s == ' ' || *s == '\t') ++s;
+            size_t n = std::strlen(s);
+            while (n > 0 && (s[n - 1] == '\n' || s[n - 1] == '\r' || s[n - 1] == ' ' || s[n - 1] == '\t'))
+                s[--n] = '\0';
+            return std::strcmp(s, "running") == 0;
+        }
+        void setEnable(const char* v) {
+            char out[64];
+            if (!v || !v[0]) {
+                self->utils.popenRead("setprop persist.sys.oiface.enable \"\"", out, sizeof(out));
+                return;
+            }
+            if (std::strlen(v) > 8) return;
+            for (const char* p = v; *p; ++p)
+                if (*p < '0' || *p > '9') return;
+            char cmd[96];
+            snprintf(cmd, sizeof(cmd), "setprop persist.sys.oiface.enable %s", v);
+            self->utils.popenRead(cmd, out, sizeof(out));
+        }
+        void start() {
+            char out[64];
+            self->utils.popenRead("start oiface", out, sizeof(out));
+        }
+        void stop() {
+            char out[64];
+            self->utils.popenRead("stop oiface", out, sizeof(out));
+        }
+    };
+
+    void oifaceEnter() {
         if (!Config::AutoMode::oiface_keepalive_enable) return;
-        logger.Info("正在恢复oiface服务");
-        char buf[64];
-        utils.popenRead("setprop persist.sys.oiface.enable 2", buf, sizeof(buf));
-        utils.popenRead("start oiface >/dev/null 2>&1", buf, sizeof(buf));
+        OifaceShell ops{this};
+        oiface_.enter(ops);
+    }
+
+    void oifaceExit() {
+        OifaceShell ops{this};
+        oiface_.exit(ops);
+    }
+
+    // 显式 perapp/config 命中的 game_heavy。全局 "*" 行不算, 黑名单也不算。
+    bool explicitGameHeavy(const char* pkg, int* explicitIdx) {
+        if (explicitIdx) *explicitIdx = -1;
+        if (!pkg || !pkg[0]) return false;
+        const int idx = Config::AppProfile::profileIfExplicit(
+            Config::AppProfile::findMatchingModel(pkg, false));
+        if (explicitIdx) *explicitIdx = idx;
+        if (idx < 0 || idx >= Config::AppProfile::modelCount) return false;
+        return std::strcmp(Config::AppProfile::Models[idx].modelName.c_str(), "game_heavy") == 0;
+    }
+
+    kin::FengchiEdge syncFengchi(bool active, const char* label) {
+        const kin::FengchiEdge edge = kin::stepFengchi(fengchiPhase_, active);
+        fengchiPhase_ = edge.phase;
+        applyGamingGov(edge.phase == kin::FengchiPhase::Active);
+        if (edge.entered) {
+            kin::fengchiHandsOff.store(1, std::memory_order_release);
+            invalidateFreqCache();
+            if (Config::GpuFreq::enable) {
+                Config::GpuFreq::min_mhz.store(0, std::memory_order_relaxed);
+                Config::GpuFreq::max_mhz.store(0, std::memory_order_relaxed);
+            }
+            logger.Info("风驰接管: %s", (label && label[0]) ? label : "-");
+            oifaceEnter();
+        } else if (edge.suppressCpuWrites) {
+            kin::fengchiHandsOff.store(1, std::memory_order_release);
+        } else if (edge.exited) {
+            // 先放开写入, 调用方随后才能把基础档 governor/频率写回去。
+            kin::fengchiHandsOff.store(0, std::memory_order_release);
+            logger.Info("恢复基础档");
+            oifaceExit();
+        }
+        return edge;
+    }
+
+    void publishManualForeground(const std::string& pkg, int explicitIdx, bool gameHeavy) {
+        if (autoActive_.load()) return;
+        const char* profile = "";
+        const char* reason = "global";
+        if (gameHeavy) {
+            profile = "game_heavy";
+            reason = "fengchi_takeover";
+        } else if (explicitIdx >= 0 && explicitIdx < Config::AppProfile::modelCount) {
+            profile = Config::AppProfile::Models[explicitIdx].modelName.c_str();
+            reason = "profile";
+        }
+        const char* mode = conf.mode.c_str();
+        if (conf.mode == "auto" || conf.mode.empty()) mode = "balance";
+        autoMode_.writeManualForeground(mode, pkg.c_str(), profile, reason,
+                                        oiface_.engaged() ? 1 : 0);
+    }
+
+    void publishCurrentManual() {
+        if (autoActive_.load()) return;
+        std::string pkg = getForegroundPkg(false);
+        if (pkg == "null") pkg.clear();
+        int idx = -1;
+        bool heavy = false;
+        if (!pkg.empty()) heavy = explicitGameHeavy(pkg.c_str(), &idx);
+        publishManualForeground(pkg, idx, heavy);
+    }
+
+    // 切到非 auto 时, 前台若已是显式 game_heavy, 保持松手, 不把基础档频率写上去。
+    bool adoptFengchiForeground() {
+        std::string pkg = getForegroundPkg(false);
+        if (pkg.empty() || pkg == "null") return false;
+        int idx = -1;
+        if (!explicitGameHeavy(pkg.c_str(), &idx)) return false;
+        syncFengchi(true, labelForLog(pkg).c_str());
+        Config::AppProfile::currentMatch.store(idx);
+        heldPkg.clear();
+        heldMissStreak_ = 0;
+        lastTopApp = pkg;
+        blacklistReleased = false;
+        publishManualForeground(pkg, idx, true);
+        return true;
+    }
+
+    // auto 退出风驰后, 把 scaling_min 重新放开到硬件最低。上限和 governor 由随后的 writeFsmCaps 写。
+    void restoreAutoMinFloor() {
+        for (int i = 0; i < kClusterCount; i++) {
+            const int pol = Config::Policy::CpuPolicy[i];
+            if (pol < 0) continue;
+            FreqWriter(pol, string_t("0"), string_t(), string_t());
+        }
     }
 
     // 相机保持态下, 把 FSM 算出的 caps 软钳到 camera_hold_max_pct × hwmax/100(够 4K60 又不冲满)。
@@ -1245,6 +1377,7 @@ public:
 
     // 优先级：AppProfile > Performances；空字段回退到 Performances；GPU/核心仅在画像中定义时才覆盖
     void applyAppProfile(int modelIdx) {
+        if (kin::fengchiHandsOff.load(std::memory_order_acquire) != 0) return;
         if (modelIdx < 0 || modelIdx >= Config::AppProfile::modelCount) {
             // 无匹配画像，回到基础 mode
             applyBaseMode();
@@ -1339,6 +1472,7 @@ public:
     }
 
     void applyBaseMode() {
+        if (kin::fengchiHandsOff.load(std::memory_order_acquire) != 0) return;
         // 先上线核心再写 governor/频率，否则离线核收不到 governor 写入
         restoreBaseCoresIfNeeded();
 
@@ -1357,6 +1491,7 @@ public:
 
     // 退出画像时主动还原基础 GPU 频率，否则要等 gpuFreqGuard 最长 15s 才生效
     void applyBaseGpu() {
+        if (kin::fengchiHandsOff.load(std::memory_order_acquire) != 0) return;
         if (!Config::GpuFreq::enable) return;
         JsonConfig::publishGpuSnapshot();
         if (Config::GpuFreq::min_freq.empty() && Config::GpuFreq::max_freq.empty()) {
@@ -1375,6 +1510,7 @@ public:
     }
 
     void Reset() {
+        if (kin::fengchiHandsOff.load(std::memory_order_acquire) != 0) return;
         invalidateFreqCache();
         for (int i = 0; i < kClusterCount; i++) {
             if (Policy::CpuPolicy[i] == -1) continue;
@@ -1419,33 +1555,46 @@ public:
         if (logMode) logger.Info("情景模式: %s 已启用", conf.mode.c_str());
 
         // 自动模式: auto 自成一档。FSM 实时调频, 不加载任何基础档 —— 只放开下限+governor,
-        // 上限交 FSM 持续写。
+        // 上限交 FSM 持续写。前台已是风驰游戏时先置 handsOff, 下面的 prime 写不进频率节点。
         if (conf.mode == "auto" && Config::AutoMode::enable) {
             autoActive_.store(true);
+            Config::AppProfile::currentMatch.store(-1);
             autoMode_.armAutoStatus();
             if (logMode) logger.Info("智能档已接管 (FSM 实时调频, 不挂基础档)");
+            std::string fg = getForegroundPkg(false);
+            if (!fg.empty() && fg != "null" && explicitGameHeavy(fg.c_str(), nullptr))
+                syncFengchi(true, labelForLog(fg).c_str());
+            else
+                syncFengchi(false, "进入auto");
             primeAutoFsm();
             return;
         }
 
         autoActive_.store(false);
-        // 离开 auto 写恰好一帧失效快照(刷新 batt/cur_ma/temp/timestamp), 然后停更。
-        // enable=false 时 mode.txt 仍是 auto, 实际退回的基础档是 balance。
-        // 非 auto 之间换档(balance→powersave)不再写, 避免把遥测重新刷成"还在更新"。
+        // 离开 auto 仍先写恰好一帧失效快照(刷新 batt/cur_ma/temp/timestamp)。
+        // 这一帧之后的前台帧由 writeManualForeground 另写, 不恢复 1Hz, 也不拆掉这道闩。
+        // 清 lastTopApp, 避免下一次前台评估因包名未变而跳过 AC-5 那一帧。
         if (wasAuto) {
+            lastTopApp.clear();
             const char* inactiveMode = (conf.mode == "auto") ? "balance" : conf.mode.c_str();
             autoMode_.writeInactiveStatus(autoMode_.sample(), inactiveMode);
         }
+        // 前台仍是显式 game_heavy: 任何全局模式都继续松手, 不把基础档频率写回去。
+        if (adoptFengchiForeground()) return;
+        syncFengchi(false, "模式切换");
         if (conf.mode == "auto") {
             logger.Warn("mode=auto 但 AutoMode.enable=false → 退回基础档 balance");
             applyWithProfile();
+            publishCurrentManual();
             return;
         }
         if (conf.mode == "fast" && OfficialMode::enable) {
             Reset();
+            publishCurrentManual();
             return;
         }
         applyWithProfile();
+        publishCurrentManual();
     }
 
     // auto 的 FSM 预置: auto 自成一档, 不加载任何 config 基础档(省电/均衡/性能)。
@@ -1513,7 +1662,9 @@ public:
                 // 非 auto 不刷新 auto_status, 也不把 FSM cap 当成仍在生效。
                 // 离开 auto 的那一帧失效快照已在 applyCurrentMode 写过, 这里只休眠。
                 lastResolved.clear(); lastFsmState = -1; lastGpuMax = -1; fsmPrimed = false;
-                fengchiActive = false;   // 退 auto: 风驰态归零(下次进 auto 不残留)
+                // 只清本循环的局部标志。共享相位交给 syncFengchi:
+                // 退 auto 时若游戏仍在前台, applyCurrentMode 会保持松手, 这里不能再退出一次。
+                fengchiActive = false;
                 lastLoggedFgPkg_ = "\x01"; lastLoggedFgCat_ = -2; lastLogMs_ = 0;
                 stickyGame.clear();   // 退 auto: 粘滞归零(对称 fasWasGaming)
                 fengchiGovResetPending_ = false;   // 退 auto: 清热重载标志(对称 fengchiActive)
@@ -1639,8 +1790,8 @@ public:
                             if (Config::AppProfile::isBlacklisted(visiblePkg.c_str())) continue;
                             if (visiblePkg == fgPkg) continue;   // fgPkg 已检测过
                             int gm = Config::AppProfile::findMatchingModel(visiblePkg.c_str(), false);
-                            // 清单命中且用户没绑画像时, 用轻量档(game_lite)画像名参与后续判定:
-                            // 只借"是游戏"这一结论, 不改用户配置(fgHeavy 仍为 false)。
+                            // 清单命中且没有自己的画像时只记 gameHint, 不套 game_lite, 也不改用户配置。
+                            // 没有 perapp/config 规则的游戏跟随全局模式。fgHeavy 仍为 false。
                             if (gm < 0 && Config::AutoMode::gamelist_enable &&
                                 Config::GameList::contains(visiblePkg.c_str())) {
                                 gameHint = true;
@@ -1788,12 +1939,8 @@ public:
                 // 钳制仍在其后生效 —— 帧控可继续下调、轻类别封顶仍只压不抬, 原有语义不变。
                 // 持 applyMtx 复制(配置热重载会整表重写 fsmPolicyTable, 防读到撕裂值), 与下方 catPolicy 同款。
                 Config::AutoMode::FsmPolicy fpol;
-                bool gamingGovOn;      // 风驰调速器功能是否开(gaming_gov 非空); 锁内快照防热重载撕裂
-                bool fengchiInPlace;   // 风驰已确认在位, 或尚未尝试切换(首拍先按意图挡 FAS, 防一拍进出抖动)
                 { std::lock_guard<std::recursive_mutex> lk(applyMtx);
-                  fpol = Config::AutoMode::fsmPolicy(caps.state);
-                  gamingGovOn = !Config::AutoMode::gaming_gov.empty();
-                  fengchiInPlace = gamingGovActive_ ? gamingGovEngaged_ : true; }
+                  fpol = Config::AutoMode::fsmPolicy(caps.state); }
                 // 百分比换算后钳到 [cpuinfo_min, hwmax](与内置曲线 scale() 的包络一致):
                 // 小核最低频常占最高频 15% 左右, 用户拖到 10% 时若不钳地板, 写出的
                 // scaling_max 低于硬件最低频, 内核可能拒写(旧上限残留)或自行收紧, 行为不可预期。
@@ -1826,12 +1973,13 @@ public:
                 // 与风驰调速器互斥: 风驰游戏(game_heavy 画像)切到 hmbird/scx 后由内核调度器自主调频,
                 // FAS 再压 scaling_max 会跟它打架 → 风驰【真在位】时 game_heavy 不走 FAS;
                 // 本机没有 hm/hmbird/scx(仅 walt/sugov_ext 回退)时 game_heavy 仍享受 FAS。
-                // 非风驰游戏(game_lite/GPU 进入)照常 FAS; 风驰功能关(gaming_gov 空)时 FAS 对所有游戏生效。
+                // 非风驰游戏(game_lite/GPU 进入)照常 FAS。显式 game_heavy 前台由风驰松手, 不再写 scaling_max,
+                // 所以 FAS 也不进(与 gaming_gov 是否为空无关)。
                 // 天玑 FPSGO 互斥: 开 FPSGO 的 game_heavy 交给厂商帧引擎, 同样不走 Kin FAS(防两个帧控打架)。
                 const bool fpsgoOn = tickCfg.gameFpsgo && fgHeavy && inGaming && fpsgoUsable();
-                // 风驰接管(前台命中 game_heavy 风驰游戏画像即触发, 不再要求 GAMING 状态): 跳过 FAS —— 硬件极限频率下帧控会与满频矛盾。
-                const bool fengchiTakeover = fgHeavy && gamingGovOn;
-                const bool fasBlocked = (fgHeavy && gamingGovOn && fengchiInPlace) || fpsgoOn || fengchiTakeover;
+                // 风驰接管只看前台是不是显式 game_heavy。进入后不写频率/governor, 因此跳过 FAS。
+                const bool fengchiTakeover = fgHeavy;
+                const bool fasBlocked = fengchiTakeover || fpsgoOn;
                 if (tickCfg.fasEnable && inGaming && !fasBlocked &&
                     mx.screenOn != 0 && autoFas_.available()) {
                     // perapp 第三列的每游戏目标帧率(持 applyMtx 查表, 防热重载撕裂; 0=自动学习)
@@ -1904,35 +2052,29 @@ public:
                     std::lock_guard<std::recursive_mutex> lk(applyMtx);
                     if (!autoActive_.load() ||
                         configGeneration_.load(std::memory_order_acquire) != tickGeneration) continue;
-                    // 风驰游戏态只解除频率限制并启动 OIface，governor 全程由 ROM/风驰接管。
-                    // Kin 不做 3 秒兜底强切，也不在退出时恢复 governor，避免与系统争抢。
+                    // 风驰游戏态: 不写 scaling_min/max, 不写 governor, 不叠基础档上限。
+                    // 退出沿先清 handsOff, 再把 auto 的下限放开, 随后的 writeFsmCaps 写回上限和 governor。
                     if (fengchiGovResetPending_) {
                         fengchiGovResetPending_ = false;
-                        if (fengchiActive) fengchiActive = false;
+                        // 不把相位打回 Idle。前台仍是 game_heavy 时不能先退出再进入。
                     }
-                    if (fengchiTakeover && !fengchiActive) {
-                        fengchiActive = true;
-                        ensureOifaceAlive();
-                        applyGamingGov(true);
-                        logger.Info("游戏态 governor 已放权，交给 ROM/风驰接管");
-                    } else if (!fengchiTakeover && fengchiActive) {
-                        fengchiActive = false;
-                        applyGamingGov(false);
-                        if (Config::GpuFreq::enable) {
-                            Config::GpuFreq::min_mhz.store(0, std::memory_order_relaxed);
-                            lastGpuMax = -1;
-                        }
-                    }
+                    const kin::FengchiEdge fengchiEdge =
+                        syncFengchi(fengchiTakeover, fgPkg.empty() ? "" : labelForLog(fgPkg).c_str());
+                    fengchiActive = kin::fengchiHandsOff.load(std::memory_order_acquire) != 0;
                     if (fengchiActive) {
-                        // 风驰接管: 写硬件极限 CPU/GPU 频率，governor 保持空写。
-                        applyFengchiHwCaps();
-                        // FAS/类别钳制/zTT/每状态 GPU 上限全部跳过(硬件极限下帧控与钳制无意义)。
-                        // 风驰游戏态下相机保持不接管(游戏优先, 且游戏时不会同时开相机流)。
+                        // 不调用 applyFengchiHwCaps: 那条路径会写 cpuinfo min/max。
                         applyCameraHold(false);
-                        // 功率 boost 旁路: 风驰内核自主调频, 不介入 UCLAMP(还原各节点原值)。
                         applyPowerBoost(-1);
-                        pwrParkBig_ = false;   // 风驰接管: 解除功率关核, 让大核重新可用(游戏需要)
+                        pwrParkBig_ = false;
                     } else {
+                    if (fengchiEdge.exited) {
+                        restoreAutoMinFloor();
+                        if (Config::GpuFreq::enable) {
+                            const int mn = Fastatoi(Config::GpuFreq::min_freq.c_str());
+                            Config::GpuFreq::min_mhz.store(mn > 0 ? mn : 0, std::memory_order_relaxed);
+                        }
+                        lastGpuMax = -1;
+                    }
                     // ── 相机保持 caps 软钳(ASB V60): 相机时把 FSM caps 压到够用值, 不冲满 ──
                     // 在 writeFsmCaps 前修改 capsToWrite, 与类别钳制叠加(取更严者)。
                     const AutoFsm::Caps beforeCamera = capsToWrite;
@@ -2064,7 +2206,8 @@ public:
                     // ── 关核心(可逆)对齐: FAS 接管(游戏帧控)时绝不关核(传 0=game); 否则按前台类别。
                     // game/undefined/未知 或 关核心未开 → desiredOnlineForCat 返回全核 → 自动切回(可逆)。
                     // 关核心开时本函数为在线集合唯一权威; 关核心关时 want 恒全 1, 与 onlineAll 一致。去重避免重复写。
-                    reconcileAutoCores(fasEngaged ? 0 : fgCat, inGaming || stickyHolding);
+                    if (!fengchiActive)
+                        reconcileAutoCores(fasEngaged ? 0 : fgCat, inGaming || stickyHolding);
                 }
                 // ── G1: auto 档让 SysTune(每档 VM/网络/WiFi) 跟随自学习基础档(移植 ASB V57 smart 跟档)──
                 // 复用本 tick 已算 alpha 解析基础档, 边沿触发: 仅基础档变化才重下发(纯 sysctl, 不进逐 tick 写循环)。
@@ -2212,41 +2355,7 @@ public:
         utils.endWriteBatch();
     }
 
-    // ── 风驰游戏态: 主动写硬件极限频率(替代 FSM caps 接管) ──
-    // 触发条件: auto 模式 + FSM + game_heavy(风驰游戏)画像命中(由 fengchiTakeover 驱动)。
-    // 行为: 各簇 scaling_min=cpuinfo_min_freq, scaling_max=cpuinfo_max_freq(主动写硬件极限, 非放手);
-    //       GPU min_mhz=硬件最低频, max_mhz=硬件最高频(主动写硬件极限)。
-    // governor 由 ROM/OIface 接管，本函数不碰 governor（传空，与 writeFsmCaps 同款）。
-    // 退出(离开 game_heavy): 调用方还原 governor + 让 FSM 重新接管 caps + GPU 交回 FSM 每状态上限。
-    // 返回 true 表示本拍已接管(调用方跳过 writeFsmCaps/FAS/类别钳制/GPU 每状态上限); false 表示未接管。
-    bool applyFengchiHwCaps() {
-        // CPU: 逐簇写 cpuinfo_min ~ cpuinfo_max
-        char bmin[16], bmax[16];
-        for (int i = 0; i < Config::kClusterCount; i++) {
-            int pol = Config::Policy::CpuPolicy[i];
-            if (pol < 0) continue;
-            int hmin = clusterHwMinKHz(i);
-            int hmax = clusterHwMaxKHz(i);
-            if (hmax <= 0) continue;   // 读不到硬件上限的簇跳过(避免误写 0)
-            if (hmin <= 0 || hmin > hmax) hmin = hmax;   // 防倒挂
-            // governor 传空: 风驰调速器由 applyGamingGov 管辖, 不在此重申(否则会盖回风驰)。
-            FastSnprintf(bmin, sizeof(bmin), "%d", hmin);
-            FastSnprintf(bmax, sizeof(bmax), "%d", hmax);
-            FreqWriter(pol, string_t(bmin), string_t(bmax), string_t());
-        }
-        // GPU: 主动写硬件极限(min=硬件最低, max=硬件最高)。改 GpuFreq::min/max_mhz 原子,
-        // 由 GPU 守护线程每秒落实并纠漂(与 FSM 每状态上限同一通道, 切回 FSM 时复用同一原子)。
-        if (Config::GpuFreq::enable) {
-            int gmin = function.gpuHwMinMhz();
-            int gmax = function.gpuHwMaxMhz();
-            if (gmax > 0) {
-                if (gmin <= 0 || gmin > gmax) gmin = gmax;   // 防倒挂
-                Config::GpuFreq::min_mhz.store(gmin, std::memory_order_relaxed);
-                Config::GpuFreq::max_mhz.store(gmax, std::memory_order_relaxed);
-            }
-        }
-        return true;
-    }
+    // 风驰接管不再写 cpuinfo min/max。进入后 FreqWriter 直接返回; 退出后再由基础档或 FSM caps 写回。
 
     // 从 /sdcard/Android/Kin/AI/pkg_label.txt 加载 pkg→App名字 映射(App 写, 供日志显示 App 名字)。
     // 每行 "包名<空白>显示名"(显示名可含空格, 取包名后整段); # 注释; 读不到则清空为空表(退回包名)。
@@ -2290,6 +2399,7 @@ public:
 
     // 统一频率应用入口：有匹配画像则用画像，否则用基础 mode
     void applyWithProfile() {
+        if (kin::fengchiHandsOff.load(std::memory_order_acquire) != 0) return;
         std::lock_guard<std::recursive_mutex> lk(applyMtx);
         int matchIdx = Config::AppProfile::currentMatch.load();
         if (Config::AppProfile::shouldApplyProfile(matchIdx)) {
@@ -2316,6 +2426,7 @@ public:
     }
 
     void online() {
+        if (kin::fengchiHandsOff.load(std::memory_order_acquire) != 0) return;
         // auto(智能档)永不按基础档关核 —— 一律全核在线。这是核心控制的唯一闸口:
         // applyAllConfig()/init()/restoreBaseCoresIfNeeded() 都在 applyCurrentMode(→primeAutoFsm
         // 已 onlineAll)之后又调 online(), 若按 Performances::Online[](残留均衡/省电档=Core7=0)
@@ -2445,6 +2556,7 @@ public:
     }
 
     void SchedParam() {
+        if (kin::fengchiHandsOff.load(std::memory_order_acquire) != 0) return;
         // auto(智能档): 不写 config 的 governor 调速参数(up_rate_limit_us 等),让 governor 跑内核默认、
         // 完全由 FSM/智能定频,而非按 config 静态配置。 (用户要求: auto 下不读 config 参数)
         if (autoActive_.load()) return;
@@ -2478,14 +2590,14 @@ public:
         // 保活中且游戏进程仍在 → 重应用游戏画像(用新配置), 不因重载切到当前前台:
         // 防 Scene/编辑配置触发的重载在开着小窗时把游戏档丢掉。否则清保活按当前前台重评。
         if (!heldPkg.empty() && utils.isPackageRunning(heldPkg.c_str())) {
-            int m = Config::AppProfile::findMatchingModel(heldPkg.c_str());
-            if (m >= 0) {
+            int m = Config::AppProfile::findMatchingModel(heldPkg.c_str(), false);
+            const bool heldHeavy = m >= 0 &&
+                strcmp(Config::AppProfile::Models[m].modelName.c_str(), "game_heavy") == 0;
+            // game_heavy 跟前台走, 不因进程还在就继续保活。落到下面的前台重评。
+            if (m >= 0 && !heldHeavy) {
                 Config::AppProfile::currentMatch.store(m);
                 applyWithProfile();
-                // config 重载后 applyWithProfile 用画像 governor(sugov_ext) 覆盖了 scx,
-                // 必须重切游戏态调速器, 否则游戏在前台但跑在 sugov_ext 下
-                applyGamingGov(strcmp(Config::AppProfile::Models[m].modelName.c_str(),
-                                      "game_heavy") == 0, "配置重载(保活中重应用画像)");
+                applyGamingGov(false, "配置重载(保活中重应用画像)");
                 return;
             }
         }
@@ -2707,6 +2819,7 @@ public:
     // 对抗 ROM/perf HAL 运行时改写。返回是否检测到漂移并已写回。
     bool enforceState() {
         std::lock_guard<std::recursive_mutex> lk(applyMtx);
+        if (kin::fengchiHandsOff.load(std::memory_order_acquire) != 0) return false;
         // auto+FSM 接管中且无 App 画像: FSM 每 2s 自重写频率界, 此处不再纠偏(否则会写静态基础档与 FSM 打架)。
         if (autoActive_.load() &&
             Config::AppProfile::currentMatch.load() < 0) {
@@ -2749,6 +2862,7 @@ public:
     // 仅作用于 isGame 且该簇配置 governor 为空; 显式配置的簇不动。返回是否写入。
     bool propagateGameGovernor() {
         std::lock_guard<std::recursive_mutex> lk(applyMtx);
+        if (kin::fengchiHandsOff.load(std::memory_order_acquire) != 0) return false;
         if (gamingGovActive_) return false;   // ROM/OIface 放权窗口内 Kin 绝不写 scaling_governor
         int cur = Config::AppProfile::currentMatch.load();
         if (cur < 0 || cur >= Config::AppProfile::modelCount) return false;
@@ -2995,13 +3109,29 @@ public:
             return;
         }
         if (!heldPkg.empty()) {
-            if (utils.isPackageRunning(heldPkg.c_str())) {
+            // 风驰跟前台走。进程还在也不能把档位留在游戏上, 否则回桌面要等进程退出才还原。
+            if (explicitGameHeavy(heldPkg.c_str(), nullptr)) {
+                bool drop = false;
+                if (!fresh) {
+                    drop = !utils.isPackageRunning(heldPkg.c_str());
+                    if (!drop) return;
+                } else {
+                    std::string cur = getForegroundPkg(true);
+                    if (cur.empty() || cur == "null" || cur == heldPkg) return;
+                    drop = true;
+                }
+                if (drop) {
+                    heldPkg.clear();
+                    heldMissStreak_ = 0;
+                    lastTopApp.clear();
+                }
+            } else if (utils.isPackageRunning(heldPkg.c_str())) {
                 heldMissStreak_ = 0;  // 进程在 → 清空连续未命中计数
                 if (!fresh) return;   // 空闲复查: 进程在就维持, 不取前台
                 std::string cur = getForegroundPkg(true);
                 if (cur.empty() || cur == "null" || cur == heldPkg) return;   // 还在游戏/取不到 → 维持
                 int m = Config::AppProfile::isBlacklisted(cur.c_str())
-                          ? -1 : Config::AppProfile::findMatchingModel(cur.c_str());
+                          ? -1 : Config::AppProfile::findMatchingModel(cur.c_str(), false);
                 // 切到普通 App / 黑名单(launcher/systemui/本App)但游戏仍在 → 维持游戏档, 不掉
                 if (m < 0 || !(Config::AppProfile::Models[m].isGame ||
                                Config::AppProfile::Models[m].keepAlive)) return;
@@ -3025,40 +3155,62 @@ public:
                 heldPkg.clear();
                 Config::AppProfile::currentMatch.store(-1);
                 lastTopApp.clear();
-                applyWithProfile();   // 立即落基础, 防去重跳过致高频残留
-                applyGamingGov(false, "保活解除/游戏进程退出");   // 游戏退出: 风驰调速器条件还原(下方取不到新前台时也不悬空)
+                syncFengchi(false, "保活解除");   // 先放开 FreqWriter, 下面的基础档才能写进去
+                applyWithProfile();
             }
         }
 
         std::string pkg = getForegroundPkg(fresh);
-        if (pkg.empty() || pkg == "null") return;
+        if (pkg.empty() || pkg == "null") {
+            publishManualForeground("", -1, false);
+            return;
+        }
 
         if (pkg == lastTopApp) return;
         lastTopApp = pkg;
 
         // 黑名单前台(launcher/systemui/输入法等)或无匹配画像 → matched=-1
         const auto decision = Config::AppProfile::decideForeground(pkg.c_str(), autoActive_.load());
-        const int matched = decision.matched;
+        int explicitIdx = -1;
+        const bool gameHeavy = !decision.release && explicitGameHeavy(pkg.c_str(), &explicitIdx);
 
         // [真黑名单·方案A] 黑名单 App 前台 → 彻底松手交还系统(解锁频率+默认调速器+全核),不套任何档位。
-        // 普通无匹配 App(非黑名单)仍走下方"跟随全局"。
+        // 从风驰退出落到桌面时例外: 要恢复基础档, 不能写 0..INT_MAX。
         // 智能模式无视黑名单: FSM 全程接管(launcher/systemui 等低负载自然给低频), 不释放, 否则与 FSM 抢。
         if (decision.release) {
-            if (!blacklistReleased) {
+            const kin::FengchiEdge edge = syncFengchi(false, labelForLog(pkg).c_str());
+            if (edge.exited) {
+                int baseIdx = -1;
+                if (!Config::AppProfile::perAppGlobal.empty())
+                    baseIdx = Config::AppProfile::findModelByName(Config::AppProfile::perAppGlobal.c_str());
+                Config::AppProfile::currentMatch.store(baseIdx);
+                applyWithProfile();
+                blacklistReleased = true;
+            } else if (!blacklistReleased) {
                 blacklistReleased = true;
                 Config::AppProfile::currentMatch.store(-1);
                 logger.Info("前台: %s → 释放接管(黑名单, 交还系统默认)", labelForLog(pkg).c_str());
-                applyGamingGov(false, "黑名单前台/释放接管");   // 交还系统前先条件还原风驰调速器(releaseControl 会写默认 governor)
                 releaseControl();
             }
+            publishManualForeground(pkg, -1, false);
             return;
         }
         blacklistReleased = false;
 
+        const kin::FengchiEdge edge = syncFengchi(gameHeavy, labelForLog(pkg).c_str());
+        if (gameHeavy) {
+            heldPkg.clear();
+            heldMissStreak_ = 0;
+            logger.Info("前台: %s → 画像档[game_heavy] (游戏)", labelForLog(pkg).c_str());
+            Config::AppProfile::currentMatch.store(explicitIdx);
+            publishManualForeground(pkg, explicitIdx, true);
+            return;
+        }
+
         // 建立保活须在去重之外: 重载清掉 heldPkg 后 match 可能不变(被去重跳过), 仍要恢复持有。
-        // 两种检测模式都建立(匹配到游戏/保活画像即持有); auto 下 matched 已为 -1, 不会建立。
-        if (matched >= 0) {
-            const auto& mdl = Config::AppProfile::Models[matched];
+        // 只保活显式画像。game_heavy 已在上面返回, 不进保活。
+        if (explicitIdx >= 0) {
+            const auto& mdl = Config::AppProfile::Models[explicitIdx];
             if (mdl.isGame || mdl.keepAlive) {
                 if (heldPkg != pkg) heldMissStreak_ = 0;   // 换保活目标: 清掉上一个包的未命中计数
                 heldPkg = pkg;
@@ -3071,9 +3223,10 @@ public:
 
         // 日志: 前台每变一次都打一行"应用 → 当前生效的档"(画像/全局/基础都打一次), 让用户看清切到哪个模式;
         // 到这里 pkg 必已变化(上方 pkg==lastTopApp 已早退)。实际写 sysfs 仍按去重(档没变不重复下发)。
+        // 风驰游戏已在上面返回, 不会走到“基础档”。
         int oldMatch = Config::AppProfile::currentMatch.load();
-        if (matched >= 0) {
-            const auto& mdl = Config::AppProfile::Models[matched];
+        if (explicitIdx >= 0) {
+            const auto& mdl = Config::AppProfile::Models[explicitIdx];
             logger.Info("前台: %s → 画像档[%s]%s", labelForLog(pkg).c_str(), mdl.modelName.c_str(),
                         mdl.isGame ? (pushMode ? " (游戏)" : " (游戏, 保活至退出)") : "");
         } else if (newMatch >= 0) {
@@ -3082,17 +3235,11 @@ public:
         } else {
             logger.Info("前台: %s → 基础档[%s]", labelForLog(pkg).c_str(), conf.mode.c_str());
         }
-        if (newMatch != oldMatch) {
+        if (newMatch != oldMatch || edge.restoreBase) {
             Config::AppProfile::currentMatch.store(newMatch);
             applyWithProfile();
         }
-        // ── 风驰 governor 放权(gaming_gov): 画像模式命中 game_heavy 时拉起 OIface，
-        // 不指定/还原 scaling_governor，由 ROM/风驰选择；其它前台恢复 Kin 的普通 governor 管理。 ──
-        const bool romFengchi = matched >= 0 &&
-            strcmp(Config::AppProfile::Models[matched].modelName.c_str(), "game_heavy") == 0 &&
-            !Config::AutoMode::gaming_gov.empty();
-        if (romFengchi) ensureOifaceAlive();
-        applyGamingGov(romFengchi);
+        publishManualForeground(pkg, explicitIdx, false);
     }
 
     void appProfileTask() {
