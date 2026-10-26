@@ -3,6 +3,7 @@
 MODDIR="${0%/*}"
 [ "$MODDIR" = "." ] && MODDIR="$(pwd)"
 cd "$MODDIR" 2>/dev/null
+[ -f "$MODDIR/kinetic_lock.sh" ] && . "$MODDIR/kinetic_lock.sh"
 
 KIN_DIR="/sdcard/Android/Kin"
 ST="$KIN_DIR/AI/auto_status.txt"
@@ -163,9 +164,30 @@ redeploy_cts() {
     [ -f "$KIN_DIR/mode.txt" ] || echo "balance" > "$KIN_DIR/mode.txt"
     chmod 0755 "$MODDIR/Kinetic" 2>/dev/null
     sh "$MODDIR/vtools/init_vtools.sh" 2>/dev/null
+    _locked=0
+    _try=0
+    while [ "$_try" -lt 5 ]; do
+        if ! command -v kinetic_lock_acquire >/dev/null 2>&1; then
+            break
+        fi
+        if kinetic_lock_acquire "$KIN_DIR"; then
+            _locked=1
+            break
+        fi
+        _try=$((_try + 1))
+        sleep 1
+    done
+    if command -v kinetic_lock_acquire >/dev/null 2>&1 && [ "$_locked" -ne 1 ]; then
+        echo "  ⚠️ 另一路正在启动守护, 请稍后重新打开面板"
+        return 1
+    fi
     _kp=$(pidof Kinetic); [ -n "$_kp" ] && kill $_kp 2>/dev/null; sleep 1
-    LD_LIBRARY_PATH="$MODDIR/lib/arm64:$LD_LIBRARY_PATH" nohup "$MODDIR/Kinetic" >> "$KIN_DIR/log.txt" 2>&1 &
-    sleep 1
+    if ! pidof Kinetic >/dev/null 2>&1; then
+        LD_LIBRARY_PATH="$MODDIR/lib/arm64:$LD_LIBRARY_PATH" nohup "$MODDIR/Kinetic" >> "$KIN_DIR/log.txt" 2>&1 &
+        # 持锁直到新进程能被 pidof 看到, 避免和 service.sh 的监督循环各拉起一份。
+        sleep 1
+    fi
+    [ "$_locked" -eq 1 ] && kinetic_lock_release "$KIN_DIR"
     if pidof Kinetic >/dev/null 2>&1; then
         echo "  ✓ 守护已重启 (PID=$(pidof Kinetic))"
     else

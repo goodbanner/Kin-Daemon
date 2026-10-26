@@ -14,6 +14,7 @@
 #include "ThermalDecision.hpp"
 #include "IdleUclamp.hpp"
 #include "PowerBoostNode.hpp"
+#include "FreqWriteOrder.hpp"
 #include "PackageName.hpp"
 #include "DeviceValidation.hpp"
 #include "GameList.hpp"
@@ -28,6 +29,7 @@
 #include <dirent.h>
 #include <unistd.h>
 #include <cstring>
+#include <cstdlib>
 #include <atomic>
 #include <mutex>
 #include <condition_variable>
@@ -499,15 +501,30 @@ public:
             govOk = ok;
         }
 
-        // 写失败时不更新去重缓存，否则同值重试会被永久跳过
+        // 写失败时不更新去重缓存，否则同值重试会被永久跳过。
+        // 新下限高于当前上限时先写上限, 否则这一拍的 min 会被内核拒绝并停在旧值。
         bool freqOk = true;
-        if (!MinFreq.empty()) {
+        const bool hasMin = !MinFreq.empty();
+        const bool hasMax = !MaxFreq.empty();
+        bool maxFirst = false;
+        if (hasMin && hasMax) {
+            char minNow[256], maxNow[256];
+            FastSnprintf(minNow, sizeof(minNow), MinFreqPath, Policy);
+            FastSnprintf(maxNow, sizeof(maxNow), MaxFreqPath, Policy);
+            maxFirst = kin::writeMaxBeforeMin(utils.readInt(minNow), utils.readInt(maxNow),
+                                              atoi(MinFreq.c_str()), atoi(MaxFreq.c_str()));
+        }
+        if (maxFirst) {
+            FastSnprintf(path, sizeof(path), MaxFreqPath, Policy);
+            if (!utils.FileWriteIfChangedBlocking(path, MaxFreq)) freqOk = false;
+            logger.Debug("CPU簇: %d 最大频率: %s", Policy, MaxFreq.c_str());
+        }
+        if (hasMin) {
             FastSnprintf(path, sizeof(path), MinFreqPath, Policy);
             if (!utils.FileWriteIfChangedBlocking(path, MinFreq)) freqOk = false;
             logger.Debug("CPU簇: %d 最小频率: %s", Policy, MinFreq.c_str());
         }
-
-        if (!MaxFreq.empty()) {
+        if (hasMax && !maxFirst) {
             FastSnprintf(path, sizeof(path), MaxFreqPath, Policy);
             if (!utils.FileWriteIfChangedBlocking(path, MaxFreq)) freqOk = false;
             logger.Debug("CPU簇: %d 最大频率: %s", Policy, MaxFreq.c_str());
@@ -2067,8 +2084,8 @@ public:
                         lastLogMs_ = nowMs();
                     }
                 }
-                if (fasEngaged && nowMs() - lastFasLogMs_ >= 1000) {
-                    // ~1Hz 节流: FAS 拍率已到 5Hz(掉帧期 ~8Hz), 每拍打 Info 一小时能刷几万行日志
+                if (fasEngaged && nowMs() - lastFasLogMs_ >= 10000) {
+                    // 10s 一条: FAS 拍率 5Hz, 1Hz 的 Info 一小时仍有三千多行, 把游戏日志淹没。
                     lastFasLogMs_ = nowMs();
                     logger.Info("FAS: 目标=%dfps 实测=%.1ffps 小核≤%dMHz 大核≤%dMHz",
                                 autoFas_.targetFps(), autoFas_.lastFpsX10() / 10.0,

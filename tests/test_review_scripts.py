@@ -105,6 +105,40 @@ class ModuleRegressionTests(unittest.TestCase):
         self.assertIn('nohup "$CTS_BIN"', source)
         self.assertIn('is_base "$m"', source)
 
+    def test_kinetic_start_lock_is_shared_and_exclusive(self):
+        service = (ROOT / "magisk/service.sh").read_text(encoding="utf-8")
+        action = (ROOT / "magisk/action.sh").read_text(encoding="utf-8")
+        self.assertIn("kinetic_lock.sh", service)
+        self.assertIn("kinetic_lock.sh", action)
+        self.assertNotIn("rm -rf", (ROOT / "magisk/kinetic_lock.sh").read_text(encoding="utf-8"))
+        with tempfile.TemporaryDirectory() as temp:
+            env = {"KIN_DIR": temp}
+            script = r'''
+set -eu
+. "$1"
+dir="$2"
+kinetic_lock_acquire "$dir"
+# 同一进程再次获取必须失败(锁还在)。
+if kinetic_lock_acquire "$dir"; then
+    echo "second acquire succeeded" >&2
+    exit 1
+fi
+kinetic_lock_release "$dir"
+mkdir "$dir/.kinetic.start.d"
+echo 999999 > "$dir/.kinetic.start.d/pid"
+kinetic_lock_acquire "$dir"
+# 活着的 pid 配上过期时间戳(重启后 pid 被复用)也必须能抢走, 否则守护再也拉不起来。
+kinetic_lock_release "$dir"
+mkdir "$dir/.kinetic.start.d"
+echo "$$ 0" > "$dir/.kinetic.start.d/pid"
+kinetic_lock_acquire "$dir"
+kinetic_lock_release "$dir"
+test ! -d "$dir/.kinetic.start.d"
+'''
+            subprocess.run(["bash", "-c", script, "test",
+                            str(ROOT / "magisk/kinetic_lock.sh"), temp],
+                           check=True, env={**os.environ, **env})
+
     def run_uninstall(self, fail_copy=False):
         source = (ROOT / "magisk/uninstall.sh").read_text(encoding="utf-8")
         start = source.index("if [ -d /storage/emulated/0/Android/Kin ]; then")

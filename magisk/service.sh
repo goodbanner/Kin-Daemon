@@ -165,13 +165,26 @@ if [ -f "$MODDIR/.cts_enabled" ] && [ -f "$MODDIR/Kinetic" ]; then
         chmod 0644 "$CTS_LIB/libc++_shared.so" 2>/dev/null
 
         is_base() { case "$1" in powersave|balance|performance|fast|auto) return 0 ;; *) return 1 ;; esac; }
+        [ -f "$MODDIR/kinetic_lock.sh" ] && . "$MODDIR/kinetic_lock.sh"
 
         last_good="balance"
         tick=0
         while true; do
             # 守护拉起: 每 ~10s(每 5 个 tick)检一次
             if [ $((tick % 5)) -eq 0 ] && ! pidof Kinetic >/dev/null 2>&1; then
-                LD_LIBRARY_PATH="$CTS_LIB:$LD_LIBRARY_PATH" nohup "$CTS_BIN" > "$CTS_DIR/log.txt" 2>&1 &
+                _locked=0
+                if command -v kinetic_lock_acquire >/dev/null 2>&1 && kinetic_lock_acquire "$CTS_DIR"; then
+                    _locked=1
+                fi
+                # 拿不到锁说明动作面板正在重启, 这一拍让给它, 下一拍再检查。
+                if [ "$_locked" -eq 1 ] || ! command -v kinetic_lock_acquire >/dev/null 2>&1; then
+                    if ! pidof Kinetic >/dev/null 2>&1; then
+                        LD_LIBRARY_PATH="$CTS_LIB:$LD_LIBRARY_PATH" nohup "$CTS_BIN" > "$CTS_DIR/log.txt" 2>&1 &
+                        # 锁要盖住进程出现在 pidof 之前的窗口, 否则另一路会再拉起一份。
+                        sleep 1
+                    fi
+                fi
+                [ "$_locked" -eq 1 ] && kinetic_lock_release "$CTS_DIR"
             fi
             # Validate mode.txt without overriding per-group CPU placement.
             m=$(cat "$MODE_FILE" 2>/dev/null | tr -d ' \t\r\n')

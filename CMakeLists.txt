@@ -195,6 +195,18 @@ if(BUILD_TESTING AND NOT ANDROID)
     target_include_directories(kin_test_wifi_power_save PRIVATE ${CMAKE_SOURCE_DIR}/include)
     add_test(NAME kin_wifi_power_save COMMAND kin_test_wifi_power_save)
 
+    add_executable(kin_test_cpu_temp_guard tests/test_cpu_temp_guard.cpp)
+    target_include_directories(kin_test_cpu_temp_guard PRIVATE ${CMAKE_SOURCE_DIR}/include)
+    add_test(NAME kin_cpu_temp_guard COMMAND kin_test_cpu_temp_guard)
+
+    add_executable(kin_test_battery_current tests/test_battery_current.cpp)
+    target_include_directories(kin_test_battery_current PRIVATE ${CMAKE_SOURCE_DIR}/include)
+    add_test(NAME kin_battery_current COMMAND kin_test_battery_current)
+
+    add_executable(kin_test_freq_write_order tests/test_freq_write_order.cpp)
+    target_include_directories(kin_test_freq_write_order PRIVATE ${CMAKE_SOURCE_DIR}/include)
+    add_test(NAME kin_freq_write_order COMMAND kin_test_freq_write_order)
+
     if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux")
         find_package(Python3 REQUIRED COMPONENTS Interpreter)
         add_test(NAME kin_build_pack

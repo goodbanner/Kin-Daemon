@@ -25,6 +25,8 @@
 #include "BatteryPolicy.hpp"
 #include "ThermalStatus.hpp"
 #include "ThermalDecision.hpp"
+#include "CpuTempGuard.hpp"
+#include "BatteryCurrent.hpp"
 #include "SmartLearning.hpp"
 #include <atomic>
 #include <mutex>
@@ -1223,11 +1225,10 @@ private:
     }
 
     // ── 功耗记录环(无共享可变状态的独立读取, 与情景线程并发安全)──
-    static int readCurrentMaRaw() {   // 电流绝对值 mA(不依赖共享单位闩, 供记录线程)
+    int readCurrentMaRaw() {   // 电流绝对值 mA; 与 FSM 共用单位确认, 避免两路读数差 1000 倍
         bool ok; long v = readRawLong("/sys/class/power_supply/battery/current_now", ok);
         if (!ok) { v = readRawLong("/sys/class/power_supply/bms/current_now", ok); if (!ok) return -1; }
-        long a = v < 0 ? -v : v;
-        return (int)(a >= 100000 ? a / 1000 : a);   // µA→mA(或已是 mA)
+        return kin::batteryCurrentMa(v, curUnit_, curLargeStreak_);
     }
     int readVoltageMv() {
         bool ok; long uv = readFdLong(11, "/sys/class/power_supply/battery/voltage_now", ok);
@@ -1476,32 +1477,22 @@ private:
             if (c > max1) { max2 = max1; max1 = c; }
             else if (c > max2) { max2 = c; }
         }
-        if (max1 < 0) return lastGoodTemp_;   // 本 tick 无有效读数: 沿用上次好值(不更新基线)
-        // 尖峰守卫(移植 ASB asb_metrics.h spike guard): 单 tick 跳升 ≥25℃ 且次高传感器不背书
-        //(max1 ≥ max2+25, 即孤立离群)→ 判为假尖峰, 保持上次好值且不推进基线(下 tick 仍与尖峰前比)。
-        // 若两路同时升高(真实快速升温, max1<max2+25)则照常接受 —— 与 ASB"两传感器一起升才算真"一致。
-        if (lastGoodTemp_ > 0 && max1 >= lastGoodTemp_ + 25 && (max2 < 0 || max1 >= max2 + 25)) {
-            // 单传感器(thermalCount_==1, max2 恒 -1)设备遇真实骤升时, 若一律拒绝且永不推进基线,
-            // 会把温度永久冻结在尖峰前的值 → 热否决/压频彻底失效(安全隐患)。改为: 连续两 tick 仍是
-            // 高读数(真实持续升温, 非瞬时毛刺)即接受; 瞬时毛刺下 tick 即回落, streak 清零仍被过滤。
-            if (++tempSpikeStreak_ < 2) {
-                logger_.Debug("自动模式: 温度假尖峰拒绝(读=%d 次高=%d 基线=%d)", max1, max2, lastGoodTemp_);
-                return lastGoodTemp_;
-            }
-            logger_.Debug("自动模式: 温度骤升连续两 tick, 视为真实升温接受(读=%d 基线=%d)", max1, lastGoodTemp_);
+        const int beforeBase = lastGoodTemp_;
+        const int beforeStreak = tempSpikeStreak_;
+        const kin::CpuTempGuard guard = kin::acceptCpuTemp(
+            max1, max2, lastGoodTemp_, tempSpikeStreak_, Config::AutoMode::vhot_temp);
+        tempSpikeStreak_ = guard.streak;
+        lastGoodTemp_ = guard.baseline;
+        if (max1 >= 0 && guard.published != max1) {
+            if (beforeBase > 0)
+                logger_.Debug("自动模式: 温度假尖峰拒绝(读=%d 次高=%d 基线=%d)", max1, max2, beforeBase);
+            else
+                logger_.Debug("自动模式: 冷启动孤立高温拒绝(读=%d 次高=%d 无基线)", max1, max2);
+        } else if (max1 >= 0 && beforeStreak > 0 && guard.published == max1 &&
+                   (beforeBase <= 0 || max1 >= beforeBase + 25)) {
+            logger_.Debug("自动模式: 温度骤升连续两 tick, 视为真实升温接受(读=%d 基线=%d)", max1, beforeBase);
         }
-        // 冷启动洞: 无基线(lastGoodTemp_<=0)时上面的守卫被跳过, 开机首读若有单路异常温度
-        //(thermal HAL 未稳/乱码 normTemp 落进 90~110 区)会被无条件采信(日志的 温=97/94)。
-        // 这里在无基线时也做孤立离群检验: 极热(≥vhot_temp)且次高传感器不背书 → 判可疑, 返回 -1(未知,
-        // 不播种基线)。两路同热(真实开机发热, max1<max2+25)仍照常接受, 不掩盖真热。
-        if (lastGoodTemp_ <= 0 && max1 >= Config::AutoMode::vhot_temp &&
-            (max2 < 0 || max1 >= max2 + 25)) {
-            logger_.Debug("自动模式: 冷启动孤立高温拒绝(读=%d 次高=%d 无基线)", max1, max2);
-            return -1;
-        }
-        tempSpikeStreak_ = 0;   // 接受本读数: 清尖峰连击计数
-        lastGoodTemp_ = max1;
-        return max1;
+        return guard.published;
     }
     // ── ASB v59 皮肤/外壳温 (only-if-exists; 择一最佳物理 zone + 死传感器校验) ──
     // 校验单个 zone: 三读全同且极端(>90 或 <5)= 呆滞死传感器 → 失效; 否则有效。
@@ -1662,10 +1653,16 @@ private:
     int readWeightedBusy() {
         if (!wProbed_) probeWeighted();
         // 逐核 /proc/stat 增量 busy%: 读整个 /proc/stat(含 cpu0..cpuN 行)
-        char b[1024];
+        // 长时间运行后每条 cpu 计数可达 ~200 字节。1024 会在 cpu4 之后截断,
+        // 大核(通常是高编号)掉出加权负载, 忙的时候仍被看成轻载。4096 盖住 8 核并留余量。
+        char b[4096];
         ssize_t n = preadFd(19, "/proc/stat", b, sizeof(b));   // slot 19(专用, 不与 slot 12 首行/slot 15 背光冲突)
         if (n <= 0) return -1;
-        b[n < (ssize_t)sizeof(b) ? n : (ssize_t)sizeof(b)-1] = '\0';
+        if ((size_t)n >= sizeof(b) - 1 && b[n - 1] != '\n') {
+            char* cut = strrchr(b, '\n');
+            if (!cut) return -1;
+            *cut = '\0';
+        }
         long busyC[8] = {0}; bool haveC[8] = {false};
         bool anyFirst = false, anyValid = false;
         char* line = b;
@@ -1775,10 +1772,12 @@ private:
         if (n <= 0) return false;
         return strstr(b, "Charging") != nullptr || strstr(b, "Full") != nullptr;
     }
-    // 电池放电电流绝对值(mA)。移植 ASB current_now 多路径 + 单位自适配:
-    // current_now 各机单位不一(µA / mA / 0.1mA), >=100000 视为 µA(÷1000), 否则视为 mA。
+    // 电池放电电流绝对值(mA)。移植 ASB current_now 多路径 + 单位自适配。
+    // >=100000 的读数按 µA 换算; 连续两拍才锁定, 之后的小读数也 ÷1000。
+    // 不因第一拍是 0 或待机小电流就把单位锁成 mA(那会把后续 µA 钳成 0, 电流闸门失效)。
     // 充电/读不到返回 -1, 调用方据此跳过电流闸门(与 ASB !ma_valid 旁路一致)。
-    int curUnitUa_ = 0;   // 0=未定, 1=µA(÷1000), 2=已是 mA(原值)
+    int curUnit_ = 0;         // 0=未锁定, 1=已确认 current_now 是 µA
+    int curLargeStreak_ = 0;  // 连续出现 >=100000 的拍数; 满 2 才锁定, 防一次毛刺
     int readBatteryCurrentMa() {
         if (!curPath_) {   // 候选列表见 Soc 适配层
             for (const char* const* pp = Soc::kCurrentNow; *pp; ++pp) {
@@ -1788,12 +1787,7 @@ private:
         }
         bool ok = false; long raw = readFdLong(10, curPath_, ok);   // slot 10
         if (!ok) return -1;
-        long a = raw < 0 ? -raw : raw;
-        if (curUnitUa_ == 0) {                       // 首次定标: 量级 >=10万 ⇒ µA
-            curUnitUa_ = (a >= 100000) ? 1 : 2;
-        }
-        long ma = (curUnitUa_ == 1) ? (a / 1000) : a;
-        return (int)(ma > 100000 ? 0 : ma);          // 异常超大值归零, 防误判
+        return kin::batteryCurrentMa(raw, curUnit_, curLargeStreak_);
     }
     int readScreenOn() {
         if (!screenPath_) {   // 候选列表见 Soc 适配层
