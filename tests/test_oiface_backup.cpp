@@ -15,6 +15,21 @@
 
 namespace {
 
+struct CaptureLog {
+    int infos = 0;
+    int warns = 0;
+    std::string infoText;
+    std::string warnText;
+    void info(const char* message) {
+        ++infos;
+        infoText = message ? message : "";
+    }
+    void warn(const char* message) {
+        ++warns;
+        warnText = message ? message : "";
+    }
+};
+
 struct FakeOiface {
     std::string enable = "1";
     bool running = false;
@@ -77,14 +92,18 @@ int main() {
     FakeOiface boot;
     boot.enable = "2";
     boot.running = true;
-    CHECK(kin::OifaceTakeover::recoverBackup(boot, bak.c_str()));
+    CaptureLog bootLog;
+    CHECK(kin::OifaceTakeover::recoverBackup(boot, bak.c_str(), bootLog) == kin::OifaceBackupResult::Restored);
     CHECK(boot.enable == "1");
     CHECK(!exists(bak));
     CHECK(!crashed.engaged());
+    CHECK(bootLog.infos == 1);
+    CHECK(bootLog.warns == 0);
+    CHECK(bootLog.infoText == kin::kOifaceBackupRestoredLog);
 
     FakeOiface again;
     again.enable = "0";
-    CHECK(!kin::OifaceTakeover::recoverBackup(again, bak.c_str()));
+    CHECK(kin::OifaceTakeover::recoverBackup(again, bak.c_str()) == kin::OifaceBackupResult::Absent);
     CHECK(again.enable == "0");
     CHECK(again.ops.empty());
 
@@ -104,7 +123,7 @@ int main() {
     CHECK(!exists(bak));
     FakeOiface after;
     after.enable = "7";
-    CHECK(!kin::OifaceTakeover::recoverBackup(after, bak.c_str()));
+    CHECK(kin::OifaceTakeover::recoverBackup(after, bak.c_str()) == kin::OifaceBackupResult::Absent);
     CHECK(after.enable == "7");
 
     // 备份写不进去就不改属性。
@@ -122,25 +141,119 @@ int main() {
     CHECK(blocked.enable == "1");
     CHECK(blocked.ops.empty());
 
-    // 读回失败则保留文件, 下次还能还原。垃圾内容只还原成空数字串, 不会把原文 setprop 出去。
+    // R1: 备份已在则沿用, 不用当前属性覆盖。当前值是 5, 覆盖的话文件会变成 5。
     {
         std::ofstream out(bak);
-        out << "1;reboot\n";
+        out << "1\n";
     }
-    FakeOiface dirty;
-    dirty.enable = "4";
-    dirty.accept = false;
-    CHECK(!kin::OifaceTakeover::recoverBackup(dirty, bak.c_str()));
-    CHECK(dirty.enable == "4");
-    CHECK(exists(bak));
-    CHECK(!dirty.ops.empty());
-    CHECK(dirty.ops[0] == "set:");
-    dirty.accept = true;
-    dirty.ops.clear();
-    CHECK(kin::OifaceTakeover::recoverBackup(dirty, bak.c_str()));
-    CHECK(dirty.enable.empty());
+    FakeOiface reuse;
+    reuse.enable = "5";
+    reuse.running = false;
+    reuse.backupPath = bak;
+    kin::OifaceTakeover reuseSession;
+    CHECK(reuseSession.enter(reuse, bak.c_str()));
+    CHECK(reuseSession.savedEnable() == "1");
+    CHECK(readFile(bak) == "1\n");
+    CHECK(reuse.backupAtSet == "1\n");
+    CHECK(reuse.enable == "2");
+    CHECK(reuse.ops[0] == "set:2");
+    reuseSession.exit(reuse);
+    CHECK(reuse.enable == "1");
+    CHECK(!reuse.running);
     CHECK(!exists(bak));
 
-    std::printf("PASS: oiface backup precedes setprop, exit deletes it, crash recover restores it\n");
+    // R1: 启动还原 setprop/读回失败则留文件; 之后再试一次可以成功。
+    {
+        std::ofstream out(bak);
+        out << "1\n";
+    }
+    FakeOiface retry;
+    retry.enable = "2";
+    retry.accept = false;
+    CaptureLog retryLog;
+    CHECK(kin::OifaceTakeover::recoverBackup(retry, bak.c_str(), retryLog) == kin::OifaceBackupResult::Kept);
+    CHECK(retry.enable == "2");
+    CHECK(exists(bak));
+    CHECK(readFile(bak) == "1\n");
+    CHECK(retry.ops.size() == 1);
+    CHECK(retry.ops[0] == "set:1");
+    CHECK(retryLog.warns == 0);
+    CHECK(retryLog.infos == 0);
+    retry.accept = true;
+    retry.ops.clear();
+    CHECK(kin::OifaceTakeover::recoverBackup(retry, bak.c_str(), retryLog) == kin::OifaceBackupResult::Restored);
+    CHECK(retry.enable == "1");
+    CHECK(!exists(bak));
+    CHECK(retryLog.infos == 1);
+    CHECK(retryLog.warns == 0);
+    CHECK(retryLog.infoText == kin::kOifaceBackupRestoredLog);
+
+    // R1: 启动还原失败后, 下一次退出沿用原备份再还原, 仍然不覆盖。
+    {
+        std::ofstream out(bak);
+        out << "1\n";
+    }
+    FakeOiface laterExit;
+    laterExit.enable = "2";
+    laterExit.accept = false;
+    CHECK(kin::OifaceTakeover::recoverBackup(laterExit, bak.c_str()) == kin::OifaceBackupResult::Kept);
+    laterExit.accept = true;
+    laterExit.running = false;
+    laterExit.backupPath = bak;
+    laterExit.ops.clear();
+    kin::OifaceTakeover later;
+    CHECK(later.enter(laterExit, bak.c_str()));
+    CHECK(readFile(bak) == "1\n");
+    CHECK(later.savedEnable() == "1");
+    CHECK(laterExit.enable == "2");
+    later.exit(laterExit);
+    CHECK(laterExit.enable == "1");
+    CHECK(!laterExit.running);
+    CHECK(!exists(bak));
+
+    // R1: 退出时读回失败也留着文件, 下一次启动再还原。
+    FakeOiface exitFail;
+    exitFail.enable = "3";
+    exitFail.running = false;
+    exitFail.backupPath = bak;
+    kin::OifaceTakeover exitSession;
+    CHECK(exitSession.enter(exitFail, bak.c_str()));
+    CHECK(readFile(bak) == "3\n");
+    exitFail.accept = false;
+    exitSession.exit(exitFail);
+    CHECK(!exitSession.engaged());
+    CHECK(exitFail.enable == "2");
+    CHECK(exists(bak));
+    CHECK(readFile(bak) == "3\n");
+    FakeOiface nextBoot;
+    nextBoot.enable = "2";
+    CHECK(kin::OifaceTakeover::recoverBackup(nextBoot, bak.c_str()) == kin::OifaceBackupResult::Restored);
+    CHECK(nextBoot.enable == "3");
+    CHECK(!exists(bak));
+
+    // R2: 空内容和无效内容都不 setprop, 删除文件, 只打一条警告。
+    auto discard = [&](const std::string& body) {
+        {
+            std::ofstream out(bak, std::ios::binary);
+            out << body;
+        }
+        FakeOiface discarded;
+        discarded.enable = "4";
+        CaptureLog log;
+        const auto result = kin::OifaceTakeover::recoverBackup(discarded, bak.c_str(), log);
+        CHECK(result == kin::OifaceBackupResult::Discarded);
+        CHECK(discarded.ops.empty());
+        CHECK(discarded.enable == "4");
+        CHECK(!exists(bak));
+        CHECK(log.warns == 1);
+        CHECK(log.infos == 0);
+        CHECK(log.warnText == kin::kOifaceBackupInvalidLog);
+        return 0;
+    };
+    if (discard("")) return 1;
+    if (discard("\n")) return 1;
+    if (discard("1;reboot\n")) return 1;
+
+    std::printf("PASS: oiface backup is reused, failed restore retries, invalid backup is deleted\n");
     return 0;
 }

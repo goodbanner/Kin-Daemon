@@ -1257,11 +1257,17 @@ public:
         oiface_.enter(ops, kin::kOifaceBackupPath);
     }
 
-    // 上次接管没走正常退出时, 备份文件还在。无论本次是否允许保活 oiface, 都先把原值写回去。
+    // 上次接管没走正常退出时, 备份文件还在。无论本次是否允许保活 oiface, 都先按文件处理:
+    // 有效则写回属性; 写回或读回失败则留着文件; 空的或无效则删除并警告, 不 setprop。
     void recoverOifaceBackup() {
+        struct Log {
+            Schedule* self;
+            void info(const char* message) { if (message && message[0]) self->logger.Info(message); }
+            void warn(const char* message) { if (message && message[0]) self->logger.Warn(message); }
+        };
         OifaceShell ops{this};
-        if (!kin::OifaceTakeover::recoverBackup(ops, kin::kOifaceBackupPath)) return;
-        logger.Info("启动恢复oiface备份");
+        Log log{this};
+        kin::OifaceTakeover::recoverBackup(ops, kin::kOifaceBackupPath, log);
     }
 
     void oifaceExit() {

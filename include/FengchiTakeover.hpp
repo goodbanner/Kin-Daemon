@@ -17,6 +17,16 @@ inline std::atomic<int> fengchiHandsOff{0};
 
 // 进入接管前把原始 oiface 值落到 Kin 数据目录。崩溃后下次启动先按这个文件还原。
 inline constexpr const char* kOifaceBackupPath = "/sdcard/Android/Kin/fengchi_oiface.bak";
+// 启动把备份写回属性成功时打这一行。内容为空或不是纯数字时打警告, 且不 setprop。
+inline constexpr const char* kOifaceBackupRestoredLog = "启动恢复oiface备份";
+inline constexpr const char* kOifaceBackupInvalidLog = "oiface备份无效已删除";
+
+enum class OifaceBackupResult {
+    Absent,     // 文件不存在
+    Restored,   // 已 setprop 且读回一致, 文件已删除
+    Kept,       // 内容有效, 但 setprop 或读回失败, 文件保留
+    Discarded,  // 内容为空或无效, 未 setprop, 文件已删除
+};
 
 enum class FengchiPhase { Idle, Active };
 
@@ -57,21 +67,35 @@ inline FengchiEdge stepFengchi(FengchiPhase phase, bool gameHeavyForeground) {
 // 调用方负责把读到的属性收成纯数字再送进来; 这里再次只接受最多 8 位数字。
 class OifaceTakeover {
 public:
-    // backupPath 非空时, 先把原始值原子写入该文件, 成功后才 setprop。写入失败则不改属性。
+    // backupPath 非空且文件还不存在时, 先把原始值原子写入该文件, 成功后才 setprop。
+    // 文件已经在(上次还原失败留下的)则直接沿用, 不覆盖。写入失败或已有内容不可用时不改属性。
     // 返回 false 表示没有进入接管(属性保持原样)。backupPath 为空则只改内存和属性, 供不落盘的测试使用。
     template <class Ops>
     bool enter(Ops& ops, const char* backupPath = nullptr) {
         if (engaged_) return true;
-        savedEnable_ = sanitizeEnable(ops.readEnable());
         savedRunning_ = ops.readRunning();
         backupPath_.clear();
-        if (backupPath && backupPath[0]) {
-            if (!writeBackupAtomic(backupPath, savedEnable_)) {
+        if (backupPath && backupPath[0] && backupFileExists(backupPath)) {
+            std::string raw;
+            const std::string existing = readWholeFile(backupPath, raw) ? sanitizeEnable(raw) : std::string();
+            // 已有文件一律不覆盖。空的或无效的不能当作原值, 也不许 setprop。
+            if (existing.empty()) {
                 savedEnable_.clear();
                 savedRunning_ = false;
                 return false;
             }
+            savedEnable_ = existing;
             backupPath_ = backupPath;
+        } else {
+            savedEnable_ = sanitizeEnable(ops.readEnable());
+            if (backupPath && backupPath[0]) {
+                if (!writeBackupAtomic(backupPath, savedEnable_)) {
+                    savedEnable_.clear();
+                    savedRunning_ = false;
+                    return false;
+                }
+                backupPath_ = backupPath;
+            }
         }
         ops.setEnable("2");
         ops.start();
@@ -79,30 +103,46 @@ public:
         return true;
     }
 
+    // 读回与记下的原值一致才删除备份。setprop 或读回失败则留着文件, 下次退出或下次启动再试。
     template <class Ops>
     void exit(Ops& ops) {
         if (!engaged_) return;
         ops.setEnable(savedEnable_.c_str());
         if (savedRunning_) ops.start();
         else ops.stop();
-        if (!backupPath_.empty()) {
+        if (!backupPath_.empty() && sanitizeEnable(ops.readEnable()) == savedEnable_) {
             unlink(backupPath_.c_str());
             backupPath_.clear();
         }
         engaged_ = false;
     }
 
-    // 上次进程在接管中退出, 备份文件还在。先按文件里的原始值 setprop, 读回一致后再删除。
-    // 读回不一致则留着文件, 下次启动再试。文件不存在返回 false。
-    template <class Ops>
-    static bool recoverBackup(Ops& ops, const char* path) {
+    // 文件不存在: Absent。内容为空或不是纯数字: 不 setprop, 删除文件, 打一条警告, 返回 Discarded。
+    // 内容有效: setprop 后读回一致才删除(Restored); 失败则保留文件(Kept), 供下次退出或启动再试。
+    template <class Ops, class Log>
+    static OifaceBackupResult recoverBackup(Ops& ops, const char* path, Log&& log) {
         std::string raw;
-        if (!readWholeFile(path, raw)) return false;
+        if (!readWholeFile(path, raw)) return OifaceBackupResult::Absent;
         const std::string value = sanitizeEnable(raw);
+        if (value.empty()) {
+            unlink(path);
+            log.warn(kOifaceBackupInvalidLog);
+            return OifaceBackupResult::Discarded;
+        }
         ops.setEnable(value.c_str());
-        if (sanitizeEnable(ops.readEnable()) != value) return false;
+        if (sanitizeEnable(ops.readEnable()) != value) return OifaceBackupResult::Kept;
         unlink(path);
-        return true;
+        log.info(kOifaceBackupRestoredLog);
+        return OifaceBackupResult::Restored;
+    }
+
+    template <class Ops>
+    static OifaceBackupResult recoverBackup(Ops& ops, const char* path) {
+        struct Silent {
+            void info(const char*) {}
+            void warn(const char*) {}
+        };
+        return recoverBackup(ops, path, Silent{});
     }
 
     bool engaged() const { return engaged_; }
@@ -152,6 +192,10 @@ private:
         if (close(fd) != 0) { unlink(tmp); return false; }
         if (rename(tmp, path) != 0) { unlink(tmp); return false; }
         return true;
+    }
+
+    static bool backupFileExists(const char* path) {
+        return path && path[0] && access(path, F_OK) == 0;
     }
 
     static bool readWholeFile(const char* path, std::string& out) {
