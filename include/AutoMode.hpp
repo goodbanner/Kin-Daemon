@@ -44,6 +44,19 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
+namespace kin {
+
+inline constexpr long kManualStatusBucketSec = 5;
+
+// 前台包名没变时只刷新非 auto 状态帧。这里没有 enter/apply 入口,
+// 调用方即使传入带那些方法的对象, 也不会重新进风驰或重下画像。
+template <class Hooks>
+inline void onUnchangedForeground(Hooks& hooks) {
+    hooks.publish();
+}
+
+}  // namespace kin
+
 class AutoModeCtl {
 public:
     struct Metrics {
@@ -400,16 +413,20 @@ public:
                           resolved, "inactive", false);
     }
 
-    // 非 auto 的前台/画像变化帧。不打开 1Hz, 也不清掉 writeInactiveStatus 的闩。
-    // auto 实时采样期间直接丢弃。同一组 mode/fg_pkg/profile/policy_reason/oiface/batt/cur_ma/temp 不重复写。
+    // 非 auto 的前台帧。不打开 1Hz, 也不清掉 writeInactiveStatus 的闩。
+    // auto 实时采样期间直接丢弃。同一组 mode/fg_pkg/profile/policy_reason/oiface/batt/cur_ma/temp
+    // 再加 5 秒时间桶不重复写: 前台不变时评估线程仍会来刷新, 但时间戳最多 5 秒动一次。
     // FSM 数值和频率字段保持 PR#2 的 -1。batt/cur_ma/temp 写调用方刚采样的实时值, 传感器未知时才是 -1。
     // 契约键: fsm=INACTIVE, mode, fg_pkg, profile, policy_reason, oiface=0/1。
     // 另外保留 resolved=<与 mode 相同的 token>, 供仍在读 resolved 的一侧使用。policy_reason 只写一次。
+    // nowSec < 0 时用当前时间。测试传入固定秒, 以便不睡眠就能跨过 5 秒桶。
     void writeManualForeground(const char* mode, const char* fgPkg, const char* profile,
                                const char* policyReason, int oiface,
-                               int batt, int curMa, int temp) {
+                               int batt, int curMa, int temp, long nowSec = -1) {
         std::lock_guard<std::recursive_mutex> lk(mtx_);
         if (autoStatusLive_) return;
+        if (nowSec < 0) nowSec = static_cast<long>(time(nullptr));
+        const long bucket = nowSec / kin::kManualStatusBucketSec;
         char modeTok[40];
         char pkgTok[224];
         char profTok[40];
@@ -422,7 +439,7 @@ public:
         const std::string sig = std::string(modeTok) + "\n" + pkgTok + "\n" + profTok + "\n" +
                                  reasonTok + "\n" + (oi ? "1" : "0") + "\n" +
                                  std::to_string(batt) + "\n" + std::to_string(curMa) + "\n" +
-                                 std::to_string(temp);
+                                 std::to_string(temp) + "\n" + std::to_string(bucket);
         if (manualStatusSig_ == sig) return;
         manualStatusSig_ = sig;
         std::string status;
@@ -446,7 +463,7 @@ public:
         status += "schema_version=2\nseq=";
         status += std::to_string(++fsmStatusSeq_);
         status += "\ntimestamp=";
-        status += std::to_string(static_cast<long long>(time(nullptr)));
+        status += std::to_string(nowSec);
         status += "\nowner=kin_daemon\nreason=manual_foreground\nevent=foreground\n";
         writeFile(statusPath_.c_str(), status.c_str(), status.size());
     }

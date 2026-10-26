@@ -1310,6 +1310,28 @@ public:
         return edge;
     }
 
+    // 只采样并写状态帧。不调用 syncFengchi / applyWithProfile。
+    void publishManualForPkg(const std::string& pkg) {
+        if (pkg.empty() || pkg == "null") {
+            publishManualForeground("", -1, false);
+            return;
+        }
+        const auto decision = Config::AppProfile::decideForeground(pkg.c_str(), false);
+        int explicitIdx = -1;
+        const bool gameHeavy = !decision.release && explicitGameHeavy(pkg.c_str(), &explicitIdx);
+        publishManualForeground(pkg, decision.release ? -1 : explicitIdx, gameHeavy);
+    }
+
+    // 前台未变。Hooks 只有 publish, 编译期就进不了风驰、也重不下画像。
+    void refreshUnchangedForeground(const std::string& pkg) {
+        struct Hooks {
+            Schedule* self;
+            const std::string* pkg;
+            void publish() { self->publishManualForPkg(*pkg); }
+        } hooks{this, &pkg};
+        kin::onUnchangedForeground(hooks);
+    }
+
     void publishManualForeground(const std::string& pkg, int explicitIdx, bool gameHeavy) {
         if (autoActive_.load()) return;
         const char* profile = "";
@@ -1588,7 +1610,8 @@ public:
         autoActive_.store(false);
         // 离开 auto 仍先写恰好一帧失效快照(刷新 batt/cur_ma/temp/timestamp)。
         // 这一帧之后的前台帧由 writeManualForeground 另写, 不恢复 1Hz, 也不拆掉这道闩。
-        // 清 lastTopApp, 避免下一次前台评估因包名未变而跳过 AC-5 那一帧。
+        // 清 lastTopApp, 让离开 auto 后的第一次评估真正下发画像。
+        // 之后包名不变的评估拍只刷新状态帧, 不再跳过。
         if (wasAuto) {
             lastTopApp.clear();
             const char* inactiveMode = (conf.mode == "auto") ? "balance" : conf.mode.c_str();
@@ -3129,10 +3152,16 @@ public:
                 bool drop = false;
                 if (!fresh) {
                     drop = !utils.isPackageRunning(heldPkg.c_str());
-                    if (!drop) return;
+                    if (!drop) {
+                        refreshUnchangedForeground(heldPkg);
+                        return;
+                    }
                 } else {
                     std::string cur = getForegroundPkg(true);
-                    if (cur.empty() || cur == "null" || cur == heldPkg) return;
+                    if (cur.empty() || cur == "null" || cur == heldPkg) {
+                        refreshUnchangedForeground(heldPkg);
+                        return;
+                    }
                     drop = true;
                 }
                 if (drop) {
@@ -3142,9 +3171,15 @@ public:
                 }
             } else if (utils.isPackageRunning(heldPkg.c_str())) {
                 heldMissStreak_ = 0;  // 进程在 → 清空连续未命中计数
-                if (!fresh) return;   // 空闲复查: 进程在就维持, 不取前台
+                if (!fresh) {         // 空闲复查: 进程在就维持, 不取前台, 只刷新状态帧
+                    refreshUnchangedForeground(heldPkg);
+                    return;
+                }
                 std::string cur = getForegroundPkg(true);
-                if (cur.empty() || cur == "null" || cur == heldPkg) return;   // 还在游戏/取不到 → 维持
+                if (cur.empty() || cur == "null" || cur == heldPkg) {
+                    refreshUnchangedForeground(heldPkg);
+                    return;   // 还在游戏/取不到 → 维持
+                }
                 int m = Config::AppProfile::isBlacklisted(cur.c_str())
                           ? -1 : Config::AppProfile::findMatchingModel(cur.c_str(), false);
                 // 切到普通 App / 黑名单(launcher/systemui/本App)但游戏仍在 → 维持游戏档, 不掉
@@ -3163,6 +3198,7 @@ public:
                 if (++heldMissStreak_ < kHeldMissMax) {
                     logger.Debug("保活: %s 进程查不到(%d/%d), 暂不解除(疑似 /proc 瞬断)",
                                  labelForLog(heldPkg).c_str(), heldMissStreak_, kHeldMissMax);
+                    refreshUnchangedForeground(heldPkg);
                     return;
                 }
                 heldMissStreak_ = 0;
@@ -3181,7 +3217,11 @@ public:
             return;
         }
 
-        if (pkg == lastTopApp) return;
+        // 包名未变: 每个评估拍都重采样状态帧, 但不进风驰、不重下画像。
+        if (pkg == lastTopApp) {
+            refreshUnchangedForeground(pkg);
+            return;
+        }
         lastTopApp = pkg;
 
         // 黑名单前台(launcher/systemui/输入法等)或无匹配画像 → matched=-1

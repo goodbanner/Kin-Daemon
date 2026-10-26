@@ -170,12 +170,60 @@ int main() {
     if (expectEq(dirty, "cpu_max_big", "-1", 432)) return 432;
     if (expectEq(dirty, "alpha", "-1", 433)) return 433;
 
+    // 前台第一次出现: 允许进入风驰并下发画像。之后包名不变只刷新状态帧。
+    int enters = 0;
+    int applies = 0;
+    struct StayHooks {
+        int* enters;
+        int* applies;
+        AutoModeCtl* ctl;
+        long now = 0;
+        void publish() {
+            ctl->writeManualForeground("balance", "com.tencent.tmgp.sgame", "game_heavy",
+                                       "fengchi_takeover", 1, 80, 600, 42, now);
+        }
+        void enterFengchi() { ++*enters; }
+        void applyProfile() { ++*applies; }
+    } stay{&enters, &applies, &ctl, 1000};
+    stay.enterFengchi();
+    stay.applyProfile();
+    stay.publish();
+    const std::string stayed = readFile(path);
+    if (expectEq(stayed, "timestamp", "1000", 46)) return 46;
+    if (expectEq(stayed, "fg_pkg", "com.tencent.tmgp.sgame", 47)) return 47;
+    if (enters != 1 || applies != 1) {
+        std::printf("FAIL first foreground did not record a single enter/apply\n");
+        return 48;
+    }
+    stay.now = 1004;  // 同一 5 秒桶
+    kin::onUnchangedForeground(stay);
+    if (readFile(path) != stayed) {
+        std::printf("FAIL same 5s bucket rewrote the unchanged foreground\n");
+        return 49;
+    }
+    if (enters != 1 || applies != 1) {
+        std::printf("FAIL unchanged foreground re-entered or re-applied\n");
+        return 50;
+    }
+    stay.now = 1005;  // 下一桶
+    kin::onUnchangedForeground(stay);
+    const std::string refreshed = readFile(path);
+    if (expectEq(refreshed, "timestamp", "1005", 51)) return 51;
+    if (expectEq(refreshed, "fg_pkg", "com.tencent.tmgp.sgame", 52)) return 52;
+    if (expectEq(refreshed, "batt", "80", 53)) return 53;
+    if (expectEq(refreshed, "cpu_max_little", "-1", 54)) return 54;
+    if (expectEq(refreshed, "alpha", "-1", 55)) return 55;
+    if (enters != 1 || applies != 1) {
+        std::printf("FAIL bucket refresh re-entered or re-applied\n");
+        return 56;
+    }
+
     ctl.armAutoStatus();
     ctl.writeFsmStatus(metrics(70, 300, 35), 400, "IDLE", 1200, 1600, decision, false, false);
     const std::string resumed = readFile(path);
     if (expectEq(resumed, "fsm", "IDLE", 44)) return 44;
     if (expectEq(resumed, "resolved", "fsm", 45)) return 45;
 
-    std::printf("PASS: manual frames keep FSM numerics invalid and write live batt/cur_ma/temp\n");
+    std::printf("PASS: manual frames refresh timestamp while foreground stays, without re-enter\n");
     return 0;
 }
