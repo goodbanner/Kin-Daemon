@@ -78,6 +78,7 @@ private:
     Utils utils;
 
     // 自动模式(mode=auto): autoActive_ 为应用当前模式时发布的门闸, autoModeTask 据此接管/休眠。
+    // 离开 auto 的边沿在 applyCurrentMode 写一帧 auto_status 失效快照, 之后停更, 直到再次进入。
     // autoMode_ 须在 logger 之后声明(成员初始化序), 它持 logger 引用。
     std::atomic<bool> autoActive_{false};
     std::atomic<unsigned long long> configGeneration_{0};
@@ -1411,6 +1412,7 @@ public:
             logger.Warn("情景模式为空，跳过应用配置");
             return;
         }
+        const bool wasAuto = autoActive_.load();
         // 仅在模式真正变化时打 INFO; 配置重载(applyAllConfig)重复进来不刷屏。
         const bool logMode = (conf.mode != lastModeLogged_);
         lastModeLogged_ = conf.mode;
@@ -1418,20 +1420,27 @@ public:
 
         // 自动模式: auto 自成一档。FSM 实时调频, 不加载任何基础档 —— 只放开下限+governor,
         // 上限交 FSM 持续写。
-        if (conf.mode == "auto") {
-            if (Config::AutoMode::enable) {
-                autoActive_.store(true);
-                if (logMode) logger.Info("智能档已接管 (FSM 实时调频, 不挂基础档)");
-                primeAutoFsm();
-            } else {
-                autoActive_.store(false);
-                logger.Warn("mode=auto 但 AutoMode.enable=false → 退回基础档 balance");
-                applyWithProfile();
-            }
+        if (conf.mode == "auto" && Config::AutoMode::enable) {
+            autoActive_.store(true);
+            autoMode_.armAutoStatus();
+            if (logMode) logger.Info("智能档已接管 (FSM 实时调频, 不挂基础档)");
+            primeAutoFsm();
             return;
         }
 
         autoActive_.store(false);
+        // 离开 auto 写恰好一帧失效快照(刷新 batt/cur_ma/temp/timestamp), 然后停更。
+        // enable=false 时 mode.txt 仍是 auto, 实际退回的基础档是 balance。
+        // 非 auto 之间换档(balance→powersave)不再写, 避免把遥测重新刷成"还在更新"。
+        if (wasAuto) {
+            const char* inactiveMode = (conf.mode == "auto") ? "balance" : conf.mode.c_str();
+            autoMode_.writeInactiveStatus(autoMode_.sample(), inactiveMode);
+        }
+        if (conf.mode == "auto") {
+            logger.Warn("mode=auto 但 AutoMode.enable=false → 退回基础档 balance");
+            applyWithProfile();
+            return;
+        }
         if (conf.mode == "fast" && OfficialMode::enable) {
             Reset();
             return;
@@ -1501,6 +1510,8 @@ public:
         bool stickyAliveCache = true; // 节流窗口内复用的存活结果
         while (!shouldExit_.load()) {
             if (!autoActive_.load()) {
+                // 非 auto 不刷新 auto_status, 也不把 FSM cap 当成仍在生效。
+                // 离开 auto 的那一帧失效快照已在 applyCurrentMode 写过, 这里只休眠。
                 lastResolved.clear(); lastFsmState = -1; lastGpuMax = -1; fsmPrimed = false;
                 fengchiActive = false;   // 退 auto: 风驰态归零(下次进 auto 不残留)
                 lastLoggedFgPkg_ = "\x01"; lastLoggedFgCat_ = -2; lastLogMs_ = 0;
@@ -2100,6 +2111,7 @@ public:
                 } else {
                     dnd_.release();
                 }
+                // cpu_max_* 写入单位是 MHz(kHz/1000)。非 auto 时 publisher 会丢弃本调用。
                 autoMode_.writeFsmStatus(mx, alpha, autoFsm_.stateName(),
                                          capsToWrite.maxL / 1000, capsToWrite.maxB / 1000,
                                          policyResolver.result(), fasEngaged, fengchiActive);

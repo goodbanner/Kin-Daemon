@@ -109,6 +109,11 @@ if(BUILD_TESTING AND NOT ANDROID)
     target_link_libraries(kin_test_write_status PRIVATE Threads::Threads)
     add_test(NAME kin_write_status COMMAND kin_test_write_status)
 
+    add_executable(kin_test_auto_status_invalidate tests/test_auto_status_invalidate.cpp)
+    target_include_directories(kin_test_auto_status_invalidate PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/tests)
+    target_link_libraries(kin_test_auto_status_invalidate PRIVATE Threads::Threads)
+    add_test(NAME kin_auto_status_invalidate COMMAND kin_test_auto_status_invalidate)
+
     add_executable(kin_test_config_validation tests/test_config_validation.cpp)
     target_include_directories(kin_test_config_validation PRIVATE ${CMAKE_SOURCE_DIR}/include)
     add_test(NAME kin_config_validation COMMAND kin_test_config_validation)

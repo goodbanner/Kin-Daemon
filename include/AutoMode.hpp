@@ -38,6 +38,7 @@
 #include <cstdlib>
 #include <cctype>
 #include <ctime>
+#include <string_view>
 #include <time.h>      // clock_gettime / CLOCK_MONOTONIC (POSIX)
 #include <fcntl.h>
 #include <unistd.h>
@@ -363,60 +364,38 @@ public:
         return base;
     }
 
-    // FSM 模式下的实时状态(含 FSM 状态名与本 tick 频率上限)
+    // FSM 模式下的实时状态(含 FSM 状态名与本 tick 频率上限)。
+    // 仅在 armAutoStatus() 之后生效; 离开 auto 后 writeInactiveStatus 落一帧即停, 这里直接丢弃。
+    // cpu_max_little / cpu_max_big 的单位是 MHz(调度侧 kHz/1000), 不是 kHz。
     void writeFsmStatus(const Metrics& m, int alpha, const char* fsmState, int maxL, int maxB,
                         const kin::PolicyDecision& decision, bool fasEngaged, bool romManaged) {
-        // 状态文件仅供 App 显示(App ~1Hz 轮询)。FAS/游戏档 tick 可达 ~4Hz, 每次都 open+write+close
-        // /sdcard(FUSE/sdcardfs)开销大且白白唤醒 → 限到 ~1Hz 写, 与读端节奏对齐。
-        {
-            struct timespec ts;
-            clock_gettime(CLOCK_MONOTONIC, &ts);
-            const long nowMs = ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
-            if (nowMs - lastFsmStatusMs_ < 950) return;
-            lastFsmStatusMs_ = nowMs;
-        }
-        char buf[832];
-        const int bucket = clampi(m.bucket, 0, 11);
-        int n = snprintf(buf, sizeof(buf),
-            "resolved=fsm\nfsm=%s\nbucket=%d\ndaypart=%d\nalpha=%d\nalpha_raw=%d\nconf=%d\n"
-            "cpu_max_little=%d\ncpu_max_big=%d\ntemp=%d\nbatt=%d\ngpu=%d\nload1=%.2f\n"
-            "cpu_busy=%d\ncur_ma=%d\npower_w=%d\ncharging=%d\nscreen=%d\nlowbat=%d\n"
-            "night_sleep=%d\nnight_wake=%d\nnight_samples=%d\n"
-            "headroom=%d\nheadroom_valid=%d\nsoft_clamp=%d\nhard_clamp=%d\nvendor_clamp=%d\nvendor_clamp_1h=%d\n"
-            "anticlamp_attack=%d\nanticlamp_attack_total=%ld\n"
-            "explore=%d\nbase_cost=%d\nconsistency=%d\n",
-            fsmState ? fsmState : "?", bucket, m.daypart, alpha,
-            alphaRaw_[bucket],
-            Config::AutoMode::last_conf.load(), maxL, maxB,
-            m.tempC, m.battPct, m.gpuPct, m.load1,
-            m.cpuBusy, m.currentMa, m.powerW, m.charging ? 1 : 0, m.screenOn, batteryPolicy_.engaged() ? 1 : 0,
-            nightSleepMin_, nightWakeMin_, nightSamples_,
-            m.headroom, m.headroomValid, m.softClamp, m.hardClamp, m.vendorClamp, clamp1hCount_,
-            0, 0L, // Legacy attack telemetry: vendor caps are read-only.
-            explDir_, baseCostMa_[bucket],
-            (dtSamples_[bucket] >= 3 ? consistencyX1000(bucket) : 1000));
-        if (n > 0 && (size_t)n < sizeof(buf)) {
-            // 这些字段使用固定枚举值，避免把未经校验的外部文本带入状态协议。
-            std::string status(buf, (size_t)n);
-            status += "schema_version=2\n";
-            status += "seq=" + std::to_string(++fsmStatusSeq_) + "\n";
-            status += "timestamp=" + std::to_string((long long)time(nullptr)) + "\n";
-            status += "owner=kin_daemon\nreason=smart_policy\nevent=steady\n";
-            status += "foreground_package=" + curAppName_ + "\n";
-            status += "foreground_category=" + std::to_string(curAppCategory_) + "\n";
-            status += "foreground_source=" + curFgSource_ + "\n";
-            status += kin::policyStatusFields(decision, fasEngaged, romManaged,
-                                               utilsLastWriteStatus_, "fsm_cpu_batch",
-                                               utilsLastWriteNodes_, utilsLastWriteFailedNodes_);
-            status += "battery_state=";
-            status += batteryPolicy_.state(m.battPct, m.charging,
-                Config::AutoMode::auto_battery_enable, Config::AutoMode::crit_batt);
-            status += "\nthermal_state=";
-            status += kin::thermalStatus(thermalDecisionC(m), m.skinC, m.headroom,
-                                         m.headroomValid, m.hardClamp);
-            status += "\n";
-            writeFile(kStatusPath, status.c_str(), status.size());
-        }
+        publishAutoStatus(m, alpha, fsmState && fsmState[0] ? fsmState : "?", maxL, maxB,
+                          decision, fasEngaged, romManaged, "fsm", "steady", true);
+    }
+
+    // 进入(或仍处于) auto: 恢复 writeFsmStatus。重复调用(配置热重载)不清掉节流。
+    void armAutoStatus() {
+        std::lock_guard<std::recursive_mutex> lk(mtx_);
+        const bool resume = !autoStatusLive_;
+        autoStatusLive_ = true;
+        inactiveStatusWritten_ = false;
+        if (!resume) return;
+        // 重新进入时下一拍立即写, 不受离开前那一帧的 1Hz 节流拖住。
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        const long nowMs = ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+        lastFsmStatusMs_ = nowMs - kStatusMinIntervalMs;
+    }
+
+    // 离开 auto 的唯一失效帧: resolved=<非 auto 档>, fsm=INACTIVE, 刷新 batt/cur_ma/temp/timestamp。
+    // 频率上限写 -1(没有生效中的 FSM cap)。绕过 1Hz 节流, 保证紧挨着上一帧 live 也能落地。
+    // 同一段非 auto 期间再调用(含 writeFsmStatus)不再改文件。
+    void writeInactiveStatus(const Metrics& m, const char* mode) {
+        char resolved[40];
+        sanitizeResolvedMode(mode, resolved, sizeof(resolved));
+        kin::PolicyDecision inactive;
+        publishAutoStatus(m, -1, "INACTIVE", -1, -1, inactive, false, false,
+                          resolved, "inactive", false);
     }
 
     // 启动时输出只读能力摘要，供 App 区分设备不支持与运行时失败。
@@ -489,6 +468,8 @@ private:
     static constexpr const char* kStatePath  = "/sdcard/Android/Kin/.kin/auto_state.txt";
     static constexpr const char* kAiDir      = "/sdcard/Android/Kin/AI";
     static constexpr const char* kStatusPath = "/sdcard/Android/Kin/AI/auto_status.txt";   // App 读, 收进 AI/
+    std::string statusPath_ = kStatusPath;   // 生产路径; 主机回归测试可改到临时文件
+    friend struct AutoModeStatusTest;
     static constexpr const char* kCapabilitiesPath = "/sdcard/Android/Kin/AI/capabilities.txt";
     static constexpr const char* kAppheatPath = "/sdcard/Android/Kin/.kin/auto_appheat.txt";
     static constexpr const char* kNightPath   = "/sdcard/Android/Kin/.kin/auto_night.txt";
@@ -1285,6 +1266,9 @@ private:
     // 节点消失/读失败即关闭该 slot 下次重开(热插拔/路径变动安全)。slot 固定分配, 见各读取函数。
     bool fdInit_ = false;
     long lastFsmStatusMs_ = 0;   // writeFsmStatus ~1Hz 写节流的上次写入时刻(CLOCK_MONOTONIC ms)
+    static constexpr long kStatusMinIntervalMs = 950;
+    bool autoStatusLive_ = false;          // true: 允许写 resolved=fsm 的实时帧
+    bool inactiveStatusWritten_ = false;   // 本段非 auto 已写过唯一失效帧
     unsigned long fsmStatusSeq_ = 0;
     std::string curAppName_;
     std::string curFgSource_ = "unknown";
@@ -1392,6 +1376,102 @@ private:
         ok = (n > 0);
         return ok ? strtol(b, nullptr, 10) : 0;
     }
+    // mode 只允许短 token。auto/fsm/空/含空白或换行一律写成 unknown, 避免失效帧被伪装成仍在 auto。
+    static void sanitizeResolvedMode(const char* mode, char* out, size_t cap) {
+        if (cap == 0) return;
+        out[0] = '\0';
+        if (!mode || !mode[0]) {
+            snprintf(out, cap, "unknown");
+            return;
+        }
+        size_t n = 0;
+        for (const char* p = mode; *p; ++p) {
+            const unsigned char c = (unsigned char)*p;
+            const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                            (c >= '0' && c <= '9') || c == '_' || c == '-';
+            if (!ok || n >= 32 || n + 1 >= cap) {
+                snprintf(out, cap, "unknown");
+                return;
+            }
+            out[n++] = (char)c;
+        }
+        out[n] = '\0';
+        if (std::strcmp(out, "auto") == 0 || std::strcmp(out, "fsm") == 0)
+            snprintf(out, cap, "unknown");
+    }
+
+    // liveFrame=true: auto 实时帧, 受 1Hz 节流且在非 auto 时丢弃。
+    // liveFrame=false: 离开 auto 的失效帧, 绕过节流, 本段非 auto 只写一次。
+    // 两路共用 mtx_, 避免切模式与在途 tick 互相覆盖。
+    void publishAutoStatus(const Metrics& m, int alpha, const char* fsmState, int maxL, int maxB,
+                           const kin::PolicyDecision& decision, bool fasEngaged, bool romManaged,
+                           const char* resolved, const char* event, bool liveFrame) {
+        std::lock_guard<std::recursive_mutex> lk(mtx_);
+        ensureInit();
+        if (liveFrame) {
+            if (!autoStatusLive_) return;
+            // 状态文件仅供 App 显示(App ~1Hz 轮询)。FAS/游戏档 tick 可达 ~4Hz, 每次都 open+write+close
+            // /sdcard(FUSE/sdcardfs)开销大且白白唤醒 → 限到 ~1Hz 写, 与读端节奏对齐。
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            const long nowMs = ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+            if (lastFsmStatusMs_ != 0 && nowMs - lastFsmStatusMs_ < kStatusMinIntervalMs) return;
+            lastFsmStatusMs_ = nowMs;
+        } else {
+            autoStatusLive_ = false;
+            if (inactiveStatusWritten_) return;
+            inactiveStatusWritten_ = true;
+        }
+        char buf[832];
+        const int bucket = clampi(m.bucket, 0, 11);
+        // cpu_max_* 单位是 MHz。失效帧写 -1, 表示当前没有 FSM 目标上限。
+        int n = snprintf(buf, sizeof(buf),
+            "resolved=%s\nfsm=%s\nbucket=%d\ndaypart=%d\nalpha=%d\nalpha_raw=%d\nconf=%d\n"
+            "cpu_max_little=%d\ncpu_max_big=%d\ntemp=%d\nbatt=%d\ngpu=%d\nload1=%.2f\n"
+            "cpu_busy=%d\ncur_ma=%d\npower_w=%d\ncharging=%d\nscreen=%d\nlowbat=%d\n"
+            "night_sleep=%d\nnight_wake=%d\nnight_samples=%d\n"
+            "headroom=%d\nheadroom_valid=%d\nsoft_clamp=%d\nhard_clamp=%d\nvendor_clamp=%d\nvendor_clamp_1h=%d\n"
+            "anticlamp_attack=%d\nanticlamp_attack_total=%ld\n"
+            "explore=%d\nbase_cost=%d\nconsistency=%d\n",
+            resolved ? resolved : "unknown", fsmState ? fsmState : "?", bucket, m.daypart, alpha,
+            alphaRaw_[bucket],
+            Config::AutoMode::last_conf.load(), maxL, maxB,
+            m.tempC, m.battPct, m.gpuPct, m.load1,
+            m.cpuBusy, m.currentMa, m.powerW, m.charging ? 1 : 0, m.screenOn, batteryPolicy_.engaged() ? 1 : 0,
+            nightSleepMin_, nightWakeMin_, nightSamples_,
+            m.headroom, m.headroomValid, m.softClamp, m.hardClamp, m.vendorClamp, clamp1hCount_,
+            0, 0L, // Legacy attack telemetry: vendor caps are read-only.
+            explDir_, baseCostMa_[bucket],
+            (dtSamples_[bucket] >= 3 ? consistencyX1000(bucket) : 1000));
+        if (n > 0 && (size_t)n < sizeof(buf)) {
+            // 这些字段使用固定枚举值，避免把未经校验的外部文本带入状态协议。
+            std::string status(buf, (size_t)n);
+            status += "schema_version=2\n";
+            status += "seq=" + std::to_string(++fsmStatusSeq_) + "\n";
+            status += "timestamp=" + std::to_string((long long)time(nullptr)) + "\n";
+            status += "owner=kin_daemon\nreason=smart_policy\nevent=";
+            status += (event && event[0]) ? event : "steady";
+            status += "\n";
+            status += "foreground_package=" + curAppName_ + "\n";
+            status += "foreground_category=" + std::to_string(curAppCategory_) + "\n";
+            status += "foreground_source=" + curFgSource_ + "\n";
+            status += kin::policyStatusFields(
+                decision, fasEngaged, romManaged,
+                liveFrame ? utilsLastWriteStatus_ : kin::WriteStatus::Unknown,
+                liveFrame ? "fsm_cpu_batch" : "inactive",
+                liveFrame ? std::string_view(utilsLastWriteNodes_) : std::string_view{},
+                liveFrame ? std::string_view(utilsLastWriteFailedNodes_) : std::string_view{});
+            status += "battery_state=";
+            status += batteryPolicy_.state(m.battPct, m.charging,
+                Config::AutoMode::auto_battery_enable, Config::AutoMode::crit_batt);
+            status += "\nthermal_state=";
+            status += kin::thermalStatus(thermalDecisionC(m), m.skinC, m.headroom,
+                                         m.headroomValid, m.hardClamp);
+            status += "\n";
+            writeFile(statusPath_.c_str(), status.c_str(), status.size());
+        }
+    }
+
     static void writeFile(const char* path, const char* data, size_t len) {
         if (!path || !data || len == 0) return;
         // 状态文件使用同目录临时文件+完整写入+fsync+rename，避免 App 读到半份快照。

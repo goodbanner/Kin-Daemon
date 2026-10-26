@@ -8,7 +8,8 @@
 - The daemon writes through a same-directory temporary file, completes the write, calls `fsync`, then renames it over the target.
 - Readers must tolerate missing files, unknown keys, empty values, and older schema versions.
 - A missing capability is reported as unavailable; it must not prevent unrelated scheduling.
-- `auto_status.txt` is sampled at approximately 1 Hz and must not be interpreted as a hardware write acknowledgement.
+- While `mode=auto`, `auto_status.txt` is sampled at approximately 1 Hz and must not be interpreted as a hardware write acknowledgement.
+- When the daemon leaves auto it writes exactly one invalidate snapshot, then stops updating the file until auto is entered again. That frame sets `resolved` to the new non-auto mode (for example `balance`), `fsm=INACTIVE`, `cpu_max_little=-1`, `cpu_max_big=-1`, and refreshes `batt`, `cur_ma`, `temp`, and `timestamp`. The file is not deleted. Further non-auto ticks must not publish another snapshot or refresh FSM caps. `alpha=-1` on that frame means there is no live FSM decision.
 
 ## auto_status keys
 
@@ -34,7 +35,7 @@ Existing keys retain their historical meaning. The App parser accepts the follow
 | `daypart` | integer | Smart day-part index |
 | `alpha` / `alpha_raw` | x1000 | Smart power-saving tendency and raw bucket value |
 | `conf` | x1000 | Smart confidence |
-| `cpu_max_little` / `cpu_max_big` | kHz | Current target CPU caps |
+| `cpu_max_little` / `cpu_max_big` | MHz | Current target CPU caps. The daemon writes MHz (`kHz/1000`). `-1` means no active FSM cap (the leave-auto invalidate frame). |
 | `temp` | Celsius | Decision temperature |
 | `headroom` | percent | Vendor thermal headroom; valid only when `headroom_valid=1` |
 | `gpu` / `load1` / `cpu_busy` / `cur_ma` | mixed | Runtime telemetry |
