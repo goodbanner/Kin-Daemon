@@ -184,31 +184,31 @@ int main() {
         }
         void enterFengchi() { ++*enters; }
         void applyProfile() { ++*applies; }
-    } stay{&enters, &applies, &ctl, 1000};
+    } stay{&enters, &applies, &ctl, 3000};
     stay.enterFengchi();
     stay.applyProfile();
     stay.publish();
     const std::string stayed = readFile(path);
-    if (expectEq(stayed, "timestamp", "1000", 46)) return 46;
+    if (expectEq(stayed, "timestamp", "3000", 46)) return 46;
     if (expectEq(stayed, "fg_pkg", "com.tencent.tmgp.sgame", 47)) return 47;
     if (enters != 1 || applies != 1) {
         std::printf("FAIL first foreground did not record a single enter/apply\n");
         return 48;
     }
-    stay.now = 1004;  // 同一 5 秒桶
+    stay.now = 3002;  // 同一 3 秒桶 (3000/3 == 3002/3)
     kin::onUnchangedForeground(stay);
     if (readFile(path) != stayed) {
-        std::printf("FAIL same 5s bucket rewrote the unchanged foreground\n");
+        std::printf("FAIL same 3s bucket rewrote the unchanged foreground\n");
         return 49;
     }
     if (enters != 1 || applies != 1) {
         std::printf("FAIL unchanged foreground re-entered or re-applied\n");
         return 50;
     }
-    stay.now = 1005;  // 下一桶
+    stay.now = 3003;  // 下一桶 (3003/3)
     kin::onUnchangedForeground(stay);
     const std::string refreshed = readFile(path);
-    if (expectEq(refreshed, "timestamp", "1005", 51)) return 51;
+    if (expectEq(refreshed, "timestamp", "3003", 51)) return 51;
     if (expectEq(refreshed, "fg_pkg", "com.tencent.tmgp.sgame", 52)) return 52;
     if (expectEq(refreshed, "batt", "80", 53)) return 53;
     if (expectEq(refreshed, "cpu_max_little", "-1", 54)) return 54;
