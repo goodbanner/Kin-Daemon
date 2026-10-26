@@ -1,7 +1,7 @@
 # 应用画像: 包名 模式
 * balance
 
-com.tencent.tmgp.cod game_heavy
+# com.tencent.tmgp.* 不绑定画像, 跟随全局模式。只有用户把具体包显式写成 game_heavy 才进入风驰。
 com.miHoYo.Yuanshen game_heavy
 com.miHoYo.ys.mi game_heavy
 com.miHoYo.hkrpg game_heavy
@@ -27,10 +27,8 @@ com.papegames.lyswx game_heavy
 com.kurogame.haru.hianime game_heavy
 com.miHoYo.cloudgames.ys game_heavy
 com.miHoYo.enterprise.NGHSoD game_heavy
-com.tencent.tmgp.WePop game_heavy
 com.netease.x19 game_heavy
 com.netease.mrzh game_heavy
-com.tencent.tmgp.jdéjà game_heavy
 com.garena.game.kgvn game_heavy
 com.dts.freefireth game_heavy
 com.activision.callofduty.shooter game_heavy
@@ -47,30 +45,19 @@ com.netease.party game_heavy
 com.pubg.imobile game_heavy
 com.soulgamechst.majsoul game_heavy
 com.tencent.lolm game_heavy
-com.tencent.tmgp.cf game_heavy
-com.tencent.tmgp.codev game_heavy
-com.tencent.tmgp.dfm game_heavy
-com.tencent.tmgp.nz game_heavy
-com.tencent.tmgp.pubgmhd game_heavy
-com.tencent.tmgp.sgame game_heavy
-com.tencent.tmgp.speedmobile game_heavy
 
 com.happyelements.AndroidAnimal game_lite
 com.lemon.sjyz game_lite
 com.popcap.pvz2cthd game_lite
-com.tencent.tmgp.jjds game_lite
 com.ywqc.xxnq game_lite
 com.netease.dwrg.lite game_lite
-com.tencent.tmgp.qz game_lite
 com.kiloo.subwaysurf game_lite
 com.tencent.gwgo game_lite
 com.easygame2022.sheepmatchcn game_lite
-com.tencent.tmgp.carrot3dj game_lite
 com.qqgame.hlddz game_lite
 com.tencent.peng game_lite
 com.popcap.pvz2cthdxm game_lite
 com.m4399.gamecenter game_lite
-com.tencent.tmgp.gnyx game_lite
 com.pubg.krmobile game_lite
 com.rekoo.pubgm game_lite
 com.vng.pubgmobile game_lite

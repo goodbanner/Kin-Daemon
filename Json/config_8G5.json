@@ -247,11 +247,6 @@
             "model_name": "game_heavy",
             "is_game": true,
             "packages": [
-                "com.tencent.tmgp.pubgmhd",
-                "com.tencent.tmgp.sgame",
-                "com.tencent.tmgp.cod",
-                "com.tencent.tmgp.dfm",
-                "com.tencent.tmgp.speedmobile",
                 "com.miHoYo.Yuanshen",
                 "com.miHoYo.ys.mi",
                 "com.miHoYo.hkrpg",
@@ -280,9 +275,6 @@
                 "com.roblox.client",
                 "com.soulgamechst.majsoul",
                 "com.tencent.lolm",
-                "com.tencent.tmgp.cf",
-                "com.tencent.tmgp.codev",
-                "com.tencent.tmgp.nz",
                 "jp.konami.pesam"
             ],
             "freq_min_c0": "537600",

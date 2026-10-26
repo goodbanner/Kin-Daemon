@@ -3,6 +3,7 @@
 #include <iostream>
 #include <fstream>
 #include <string>
+#include <cstring>
 #include <atomic>
 #include <mutex>
 #include <unordered_map>
@@ -240,12 +241,12 @@ namespace Config {
         // ── 风驰游戏态 oiface 保活(ColorOS/OxygenOS 系统组件) ──
         // oiface 是 OPPO/OnePlus(风驰内核)游戏调度链的关键系统组件: 它负责游戏场景识别与
         // 性能调度协同, 缺失则风驰游戏态的调度优化失效(频率能拉满但调度协同断链)。
-        // 风驰游戏态(game_heavy + GAMING)【进入沿】时, 若 oiface 未存活则强拉:
-        //   1) setprop persist.sys.oiface.enable 2  (开启并设为游戏态触发)
-        //   2) start oiface                          (init 服务拉起)
-        // 【退出风驰时不还原】—— 用户明确要求 oiface 保持存活(退出游戏也不断链,
-        //    下次进游戏即时可用, 无需重新拉起的延迟)。仅"退 auto 模式"时下次进入会重拉(幂等)。
-        //   oiface_keepalive_enable: 总开关; 非 OPPO/OnePlus 机型无此服务可关(避免无效 start 噪音)
+        // 风驰游戏态(前台显式 game_heavy, 任何全局模式)【进入沿】时拉起 oiface:
+        //   1) 先读 persist.sys.oiface.enable 与 init.svc.oiface
+        //   2) setprop persist.sys.oiface.enable 2, 然后 start oiface
+        // 【退出风驰时还原】进入前的属性值, 并按当时服务是否 running 执行 start 或 stop。
+        //   oiface_keepalive_enable: 总开关; 关掉则本机不碰 oiface, 状态帧里 oiface=0。
+        //   非 OPPO/OnePlus 机型无此服务时可关(避免无效 start 噪音)。
         inline bool     oiface_keepalive_enable = true;
 
         inline bool     fas_enable     = true;   // 游戏时启用帧感知调频
@@ -427,8 +428,15 @@ namespace Config {
         // 多线程读、单线程写，必须 atomic
         inline std::atomic<int> currentMatch{-1};
 
-        // 迭代式通配符匹配，避免递归爆栈
+        // 规则以 '.' 结尾时是字面前缀(点也算进前缀), 不再走通配符。
+        // "com.tencent.tmgp." 匹配 "com.tencent.tmgp.sgame", 不匹配 "com.tencent.tmgpx"。
+        // 即便规则里还有 '*'/'?', 只要它以 '.' 结尾就按字面前缀处理。
+        // 其它规则仍是迭代式通配符: '*' 任意串, '?' 一个字符, 无通配符即精确匹配。
         inline bool matchPackage(const char* pattern, const char* pkg) {
+            if (!pattern || !pkg) return false;
+            const size_t plen = std::strlen(pattern);
+            if (plen > 0 && pattern[plen - 1] == '.')
+                return std::strncmp(pkg, pattern, plen) == 0;
             const char* star = nullptr;   // 上次 '*' 的位置
             const char* mark = nullptr;   // pkg 在那次 '*' 后的起点
             while (*pkg) {
@@ -498,6 +506,12 @@ namespace Config {
                 if (idx >= 0) return idx;
             }
             return -1;
+        }
+
+        // 游戏库/类别命中但没有自己的 perapp 或 config 包名规则时, 不合成画像。
+        // 显式匹配才有画像下标; 否则调用方跟随全局模式, 不得默认套 game_lite。
+        inline int profileIfExplicit(int explicitMatch) {
+            return explicitMatch >= 0 ? explicitMatch : -1;
         }
     }
 

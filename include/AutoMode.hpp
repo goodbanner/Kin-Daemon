@@ -44,6 +44,19 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
+namespace kin {
+
+inline constexpr long kManualStatusBucketSec = 3;
+
+// 前台包名没变时只刷新非 auto 状态帧。这里没有 enter/apply 入口,
+// 调用方即使传入带那些方法的对象, 也不会重新进风驰或重下画像。
+template <class Hooks>
+inline void onUnchangedForeground(Hooks& hooks) {
+    hooks.publish();
+}
+
+}  // namespace kin
+
 class AutoModeCtl {
 public:
     struct Metrics {
@@ -366,6 +379,7 @@ public:
 
     // FSM 模式下的实时状态(含 FSM 状态名与本 tick 频率上限)。
     // 仅在 armAutoStatus() 之后生效; 离开 auto 后 writeInactiveStatus 落一帧即停, 这里直接丢弃。
+    // 非 auto 的前台帧走 writeManualForeground, 不从这里恢复 1Hz 采样。
     // cpu_max_little / cpu_max_big 的单位是 MHz(调度侧 kHz/1000), 不是 kHz。
     void writeFsmStatus(const Metrics& m, int alpha, const char* fsmState, int maxL, int maxB,
                         const kin::PolicyDecision& decision, bool fasEngaged, bool romManaged) {
@@ -379,6 +393,7 @@ public:
         const bool resume = !autoStatusLive_;
         autoStatusLive_ = true;
         inactiveStatusWritten_ = false;
+        manualStatusSig_.clear();
         if (!resume) return;
         // 重新进入时下一拍立即写, 不受离开前那一帧的 1Hz 节流拖住。
         struct timespec ts;
@@ -396,6 +411,62 @@ public:
         kin::PolicyDecision inactive;
         publishAutoStatus(m, -1, "INACTIVE", -1, -1, inactive, false, false,
                           resolved, "inactive", false);
+    }
+
+    // 非 auto 的前台帧。不打开 1Hz, 也不清掉 writeInactiveStatus 的闩。
+    // auto 实时采样期间直接丢弃。同一组 mode/fg_pkg/profile/policy_reason/oiface/batt/cur_ma/temp
+    // 再加 3 秒时间桶不重复写: 前台不变时评估线程仍会来刷新。非 auto 空闲拍是 4s,
+    // 大于 3s, 所以每一拍都会落到新桶, 相邻帧间隔就是这一拍, 不超过 7s。
+    // FSM 数值和频率字段保持 PR#2 的 -1。batt/cur_ma/temp 写调用方刚采样的实时值, 传感器未知时才是 -1。
+    // 契约键: fsm=INACTIVE, mode, fg_pkg, profile, policy_reason, oiface=0/1。
+    // 另外保留 resolved=<与 mode 相同的 token>, 供仍在读 resolved 的一侧使用。policy_reason 只写一次。
+    // nowSec < 0 时用当前时间。测试传入固定秒, 以便不睡眠就能跨过 3 秒桶。
+    void writeManualForeground(const char* mode, const char* fgPkg, const char* profile,
+                               const char* policyReason, int oiface,
+                               int batt, int curMa, int temp, long nowSec = -1) {
+        std::lock_guard<std::recursive_mutex> lk(mtx_);
+        if (autoStatusLive_) return;
+        if (nowSec < 0) nowSec = static_cast<long>(time(nullptr));
+        const long bucket = nowSec / kin::kManualStatusBucketSec;
+        char modeTok[40];
+        char pkgTok[224];
+        char profTok[40];
+        char reasonTok[40];
+        sanitizeResolvedMode(mode, modeTok, sizeof(modeTok));
+        sanitizePkgToken(fgPkg, pkgTok, sizeof(pkgTok));
+        sanitizeStatusToken(profile, profTok, sizeof(profTok), true);
+        sanitizeStatusToken(policyReason, reasonTok, sizeof(reasonTok), false);
+        const int oi = (oiface == 1) ? 1 : 0;
+        const std::string sig = std::string(modeTok) + "\n" + pkgTok + "\n" + profTok + "\n" +
+                                 reasonTok + "\n" + (oi ? "1" : "0") + "\n" +
+                                 std::to_string(batt) + "\n" + std::to_string(curMa) + "\n" +
+                                 std::to_string(temp) + "\n" + std::to_string(bucket);
+        if (manualStatusSig_ == sig) return;
+        manualStatusSig_ = sig;
+        std::string status;
+        status.reserve(640);
+        status += "resolved=";
+        status += modeTok;
+        status += "\nmode=";
+        status += modeTok;
+        status += "\nfsm=INACTIVE\nfg_pkg=";
+        status += pkgTok;
+        status += "\nprofile=";
+        status += profTok;
+        status += "\npolicy_reason=";
+        status += reasonTok;
+        status += "\noiface=";
+        status += oi ? "1" : "0";
+        status += "\nalpha=-1\ncpu_max_little=-1\ncpu_max_big=-1\n";
+        status += "batt=" + std::to_string(batt) + "\n";
+        status += "cur_ma=" + std::to_string(curMa) + "\n";
+        status += "temp=" + std::to_string(temp) + "\n";
+        status += "schema_version=2\nseq=";
+        status += std::to_string(++fsmStatusSeq_);
+        status += "\ntimestamp=";
+        status += std::to_string(nowSec);
+        status += "\nowner=kin_daemon\nreason=manual_foreground\nevent=foreground\n";
+        writeFile(statusPath_.c_str(), status.c_str(), status.size());
     }
 
     // 启动时输出只读能力摘要，供 App 区分设备不支持与运行时失败。
@@ -1269,6 +1340,7 @@ private:
     static constexpr long kStatusMinIntervalMs = 950;
     bool autoStatusLive_ = false;          // true: 允许写 resolved=fsm 的实时帧
     bool inactiveStatusWritten_ = false;   // 本段非 auto 已写过唯一失效帧
+    std::string manualStatusSig_;          // 非 auto 前台帧去重; 进入 auto 时清空
     unsigned long fsmStatusSeq_ = 0;
     std::string curAppName_;
     std::string curFgSource_ = "unknown";
@@ -1398,6 +1470,48 @@ private:
         out[n] = '\0';
         if (std::strcmp(out, "auto") == 0 || std::strcmp(out, "fsm") == 0)
             snprintf(out, cap, "unknown");
+    }
+
+    // 包名只允许 [A-Za-z0-9._]。任何其它字符整段丢弃, 避免把壳元字符写进状态文件。
+    static void sanitizePkgToken(const char* in, char* out, size_t cap) {
+        if (cap == 0) return;
+        out[0] = '\0';
+        if (!in || !in[0]) return;
+        size_t n = 0;
+        for (const char* p = in; *p; ++p) {
+            const unsigned char c = static_cast<unsigned char>(*p);
+            const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                            (c >= '0' && c <= '9') || c == '_' || c == '.';
+            if (!ok || n >= 200 || n + 1 >= cap) {
+                out[0] = '\0';
+                return;
+            }
+            out[n++] = static_cast<char>(c);
+        }
+        out[n] = '\0';
+    }
+
+    // 画像名 / policy_reason。allowEmpty 为真时空串保持为空(跟随全局); 非法字符写成 unknown。
+    static void sanitizeStatusToken(const char* in, char* out, size_t cap, bool allowEmpty) {
+        if (cap == 0) return;
+        out[0] = '\0';
+        if (!in || !in[0]) {
+            if (!allowEmpty) snprintf(out, cap, "unknown");
+            return;
+        }
+        size_t n = 0;
+        for (const char* p = in; *p; ++p) {
+            const unsigned char c = static_cast<unsigned char>(*p);
+            const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                            (c >= '0' && c <= '9') || c == '_' || c == '-';
+            if (!ok || n >= 32 || n + 1 >= cap) {
+                if (allowEmpty) out[0] = '\0';
+                else snprintf(out, cap, "unknown");
+                return;
+            }
+            out[n++] = static_cast<char>(c);
+        }
+        out[n] = '\0';
     }
 
     // liveFrame=true: auto 实时帧, 受 1Hz 节流且在非 auto 时丢弃。
